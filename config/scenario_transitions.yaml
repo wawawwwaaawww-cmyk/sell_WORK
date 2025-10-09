@@ -39,7 +39,7 @@ states:
       - trigger: "callback:bonus:claim"
         target: "BONUS_DELIVERY"
       - trigger: "callback:survey:start"
-        target: "SURVEY_ENTRY"
+        target: "SURVEY_Q1"
       - trigger: "callback:strategy:discuss"
         target: "STRATEGY_DISCUSSION"
 
@@ -69,7 +69,7 @@ states:
               callback: "manager:request"
     transitions:
       - trigger: "callback:survey:start"
-        target: "SURVEY_ENTRY"
+        target: "SURVEY_Q1"
       - trigger: "callback:strategy:discuss"
         target: "STRATEGY_DISCUSSION"
       - trigger: "callback:manager:request"
@@ -97,7 +97,7 @@ states:
       - trigger: "callback:strategy:path:growth"
         target: "GROWTH_PATH"
       - trigger: "callback:survey:start"
-        target: "SURVEY_ENTRY"
+        target: "SURVEY_Q1"
 
   SAFETY_PATH:
     description: "Надёжные стратегии + CTA консультации."
@@ -138,23 +138,6 @@ states:
     transitions:
       - trigger: "callback:consult:schedule"
         target: "CONSULT_CTA"
-      - trigger: "callback:strategy:discuss"
-        target: "STRATEGY_DISCUSSION"
-
-  SURVEY_ENTRY:
-    description: "Подготовка к анкете."
-    entry:
-      steps:
-        - action: "send_message"
-          template: "Отвечай честно, это поможет подобрать программу."
-          buttons:
-            - text: "Начать"
-              callback: "survey:start"
-            - text: "Назад"
-              callback: "strategy:discuss"
-    transitions:
-      - trigger: "callback:survey:start"
-        target: "SURVEY_Q1"
       - trigger: "callback:strategy:discuss"
         target: "STRATEGY_DISCUSSION"
 
