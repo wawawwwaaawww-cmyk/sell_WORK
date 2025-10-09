@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 SCHEDULER_REGISTRY: Dict[str, AsyncIOScheduler] = {}
 DEFAULT_SCHEDULER_ID = "scheduler_service_main"
 _notification_service: Optional[NotificationService] = None
+LEGACY_JOB_SIGNATURES: List[bytes] = [
+    b"SchedulerService._send_daily_lead_reminders",
+    b"SchedulerService._send_appointment_reminders",
+    b"SchedulerService._follow_up_inactive_users",
+    b"SchedulerService._process_ab_tests",
+    b"SchedulerService._cleanup_orphan_jobs",
+]
 
 
 def get_notification_service() -> NotificationService:
@@ -67,6 +74,7 @@ class SchedulerService:
             return
 
         try:
+            self._purge_legacy_jobs()
             self.scheduler.add_job(
                 send_daily_lead_reminders,
                 IntervalTrigger(hours=24, timezone=self.timezone),
@@ -121,6 +129,40 @@ class SchedulerService:
             logger.info("Scheduler stopped")
         except Exception as exc:
             logger.error("Error stopping scheduler", exc_info=exc)
+
+    def _purge_legacy_jobs(self) -> None:
+        """Remove jobs serialized with legacy bound methods."""
+        jobstore = self.scheduler._jobstores.get("default")  # type: ignore[attr-defined]
+        if not isinstance(jobstore, SQLAlchemyJobStore):
+            return
+
+        try:
+            legacy_job_ids: List[str] = []
+            jobstore.jobs_t.create(jobstore.engine, checkfirst=True)  # type: ignore[attr-defined]
+            with jobstore.engine.begin() as connection:  # type: ignore[attr-defined]
+                rows = connection.execute(
+                    select(jobstore.jobs_t.c.id, jobstore.jobs_t.c.job_state)
+                ).all()
+
+            for job_id, job_state in rows:
+                if job_state and any(signature in job_state for signature in LEGACY_JOB_SIGNATURES):
+                    legacy_job_ids.append(job_id)
+
+            if not legacy_job_ids:
+                return
+
+            with jobstore.engine.begin() as connection:  # type: ignore[attr-defined]
+                delete_stmt = jobstore.jobs_t.delete().where(
+                    jobstore.jobs_t.c.id.in_(legacy_job_ids)
+                )
+                connection.execute(delete_stmt)
+
+            logger.warning(
+                "Purged legacy scheduler jobs serialized with service instances",
+                removed_job_ids=legacy_job_ids,
+            )
+        except Exception as exc:
+            logger.error("Failed to purge legacy scheduler jobs", exc_info=exc)
 
     async def schedule_appointment_reminder(self, appointment_id: int, reminder_time: datetime):
         """Schedule an appointment reminder."""
