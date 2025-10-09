@@ -22,6 +22,19 @@ from app.services.broadcast_service import BroadcastService
 logger = logging.getLogger(__name__)
 
 
+SCHEDULER_REGISTRY: Dict[str, AsyncIOScheduler] = {}
+DEFAULT_SCHEDULER_ID = "scheduler_service_main"
+_notification_service: Optional[NotificationService] = None
+
+
+def get_notification_service() -> NotificationService:
+    """Get a cached notification service instance."""
+    global _notification_service
+    if _notification_service is None:
+        _notification_service = NotificationService()
+    return _notification_service
+
+
 class SchedulerService:
     """Service for managing scheduled tasks."""
 
@@ -43,7 +56,8 @@ class SchedulerService:
         else:
             self.scheduler = AsyncIOScheduler(timezone=tz)
 
-        self.notification_service = NotificationService()
+        self.scheduler_id = DEFAULT_SCHEDULER_ID
+        SCHEDULER_REGISTRY[self.scheduler_id] = self.scheduler
         self.timezone = tz
 
     def start(self):
@@ -54,37 +68,38 @@ class SchedulerService:
 
         try:
             self.scheduler.add_job(
-                self._send_daily_lead_reminders,
+                send_daily_lead_reminders,
                 IntervalTrigger(hours=24, timezone=self.timezone),
                 id="daily_lead_reminders",
                 replace_existing=True,
             )
 
             self.scheduler.add_job(
-                self._send_appointment_reminders,
+                send_appointment_reminders,
                 IntervalTrigger(minutes=30, timezone=self.timezone),
                 id="appointment_reminders",
                 replace_existing=True,
             )
 
             self.scheduler.add_job(
-                self._follow_up_inactive_users,
+                follow_up_inactive_users,
                 IntervalTrigger(hours=6, timezone=self.timezone),
                 id="inactive_user_followup",
                 replace_existing=True,
             )
 
             self.scheduler.add_job(
-                self._process_ab_tests,
+                process_ab_tests,
                 IntervalTrigger(hours=1, timezone=self.timezone),
                 id="ab_test_processing",
                 replace_existing=True,
             )
 
             self.scheduler.add_job(
-                self._cleanup_orphan_jobs,
+                cleanup_orphan_jobs,
                 IntervalTrigger(hours=12, timezone=self.timezone),
                 id="scheduler_job_cleanup",
+                kwargs={"scheduler_id": self.scheduler_id},
                 replace_existing=True,
             )
 
@@ -102,6 +117,7 @@ class SchedulerService:
 
         try:
             self.scheduler.shutdown()
+            SCHEDULER_REGISTRY.pop(self.scheduler_id, None)
             logger.info("Scheduler stopped")
         except Exception as exc:
             logger.error("Error stopping scheduler", exc_info=exc)
@@ -127,7 +143,7 @@ class SchedulerService:
                 run_date = localized_reminder.astimezone(self.timezone)
 
                 job = self.scheduler.add_job(
-                    self._send_appointment_reminder,
+                    send_appointment_reminder,
                     trigger=DateTrigger(run_date=run_date, timezone=self.timezone),
                     args=[appointment_id],
                     id=f"appointment_reminder_{appointment_id}",
@@ -159,7 +175,7 @@ class SchedulerService:
                 run_date = followup_time.astimezone(self.timezone)
 
             job = self.scheduler.add_job(
-                self._send_lead_followup,
+                send_lead_followup,
                 trigger=DateTrigger(run_date=run_date, timezone=self.timezone),
                 args=[lead_id],
                 id=f"lead_followup_{lead_id}",
@@ -189,235 +205,259 @@ class SchedulerService:
         except Exception as exc:
             logger.warning("Failed to cancel job", job_id=job_id, error=str(exc))
 
-    async def _send_daily_lead_reminders(self):
-        """Send daily reminders about pending leads to managers."""
-        try:
-            async for db in get_db():
-                result = await db.execute(
-                    select(Lead, User.telegram_id, User.first_name, User.last_name)
-                    .join(User)
-                    .where(Lead.status == "new")
-                )
-                pending_leads = result.all()
+# Background job implementations
 
-                if not pending_leads:
-                    return
 
-                leads_by_manager: Dict[Optional[int], List] = {}
-                for lead, telegram_id, first_name, last_name in pending_leads:
-                    manager_id = lead.assigned_manager_id
-                    leads_by_manager.setdefault(manager_id, [])
-                    full_name = f"{first_name or ''} {last_name or ''}".strip() or str(telegram_id)
-                    leads_by_manager[manager_id].append((lead, telegram_id, full_name))
+async def send_daily_lead_reminders() -> None:
+    """Send daily reminders about pending leads to managers."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            result = await db.execute(
+                select(Lead, User.telegram_id, User.first_name, User.last_name)
+                .join(User)
+                .where(Lead.status == "new")
+            )
+            pending_leads = result.all()
 
-                for manager_id, leads in leads_by_manager.items():
-                    if manager_id:
-                        await self.notification_service.send_lead_reminder(manager_id, leads)
-                break
+            if not pending_leads:
+                return
 
-        except Exception as exc:
-            logger.error("Error sending daily lead reminders", exc_info=exc)
+            leads_by_manager: Dict[Optional[int], List] = {}
+            for lead, telegram_id, first_name, last_name in pending_leads:
+                manager_id = lead.assigned_manager_id
+                leads_by_manager.setdefault(manager_id, [])
+                full_name = f"{first_name or ''} {last_name or ''}".strip() or str(telegram_id)
+                leads_by_manager[manager_id].append((lead, telegram_id, full_name))
 
-    async def _send_appointment_reminders(self):
-        """Send appointment reminders to users."""
-        try:
-            async for db in get_db():
-                now_utc = datetime.now(timezone.utc)
+            for manager_id, leads in leads_by_manager.items():
+                if manager_id:
+                    await notification_service.send_lead_reminder(manager_id, leads)
+            break
 
-                result = await db.execute(
-                    select(Appointment, User.telegram_id)
-                    .join(User)
-                    .where(Appointment.status == "scheduled")
-                )
-                appointments = result.all()
+    except Exception as exc:
+        logger.error("Error sending daily lead reminders", exc_info=exc)
 
-                for appointment, telegram_id in appointments:
-                    appointment_tz = pytz.timezone(appointment.tz or settings.scheduler_timezone or "UTC")
-                    scheduled_local = appointment_tz.localize(
-                        datetime.combine(appointment.date, appointment.slot)
-                    )
-                    time_until_hours = (
-                        scheduled_local - now_utc.astimezone(appointment_tz)
-                    ).total_seconds() / 3600
 
-                    if 0 < time_until_hours <= 2:
-                        await self.notification_service.send_consultation_reminder(
-                            telegram_id,
-                            scheduled_local,
-                        )
-                break
-
-        except Exception as exc:
-            logger.error("Error sending consultation reminders", exc_info=exc)
-
-    async def _follow_up_inactive_users(self):
-        """Follow up with users who haven't been active."""
-        try:
+async def send_appointment_reminders() -> None:
+    """Send appointment reminders to users."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
             now_utc = datetime.now(timezone.utc)
-            inactive_since = now_utc - timedelta(days=3)
-            inactive_before = now_utc - timedelta(days=7)
 
-            async for db in get_db():
-                result = await db.execute(
-                    select(User.telegram_id, User.segment, User.updated_at)
-                    .where(
-                        and_(
-                            User.updated_at <= inactive_since,
-                            User.updated_at >= inactive_before,
-                            User.is_blocked.is_(False),
-                        )
-                    )
+            result = await db.execute(
+                select(Appointment, User.telegram_id)
+                .join(User)
+                .where(Appointment.status == "scheduled")
+            )
+            appointments = result.all()
+
+            for appointment, telegram_id in appointments:
+                appointment_tz = pytz.timezone(
+                    appointment.tz or settings.scheduler_timezone or "UTC"
                 )
-                inactive_users = result.all()
-
-                for telegram_id, segment, _ in inactive_users:
-                    await self.notification_service.send_reengagement_message(
-                        telegram_id, segment or "warm"
-                    )
-                break
-
-        except Exception as exc:
-            logger.error("Error following up inactive users", exc_info=exc)
-
-    async def _send_appointment_reminder(self, appointment_id: int):
-        """Send individual appointment reminder."""
-        try:
-            async for db in get_db():
-                result = await db.execute(
-                    select(Appointment, User.telegram_id)
-                    .join(User)
-                    .where(Appointment.id == appointment_id)
+                scheduled_local = appointment_tz.localize(
+                    datetime.combine(appointment.date, appointment.slot)
                 )
-                appointment_data = result.first()
+                time_until_hours = (
+                    scheduled_local - now_utc.astimezone(appointment_tz)
+                ).total_seconds() / 3600
 
-                if appointment_data:
-                    appointment, telegram_id = appointment_data
-                    appointment_tz = pytz.timezone(appointment.tz or settings.scheduler_timezone or "UTC")
-                    reminder_datetime = appointment_tz.localize(
-                        datetime.combine(appointment.date, appointment.slot)
-                    )
-                    await self.notification_service.send_consultation_reminder(
+                if 0 < time_until_hours <= 2:
+                    await notification_service.send_consultation_reminder(
                         telegram_id,
-                        reminder_datetime,
+                        scheduled_local,
                     )
-                    appointment.reminder_job_id = None
-                    await db.flush()
-                    await db.commit()
-                break
+            break
 
-        except Exception as exc:
-            logger.error(
-                "Error sending appointment reminder", appointment_id=appointment_id, exc_info=exc
-            )
+    except Exception as exc:
+        logger.error("Error sending consultation reminders", exc_info=exc)
 
-    async def _send_lead_followup(self, lead_id: int):
-        """Send individual lead follow-up."""
-        try:
-            async for db in get_db():
-                result = await db.execute(
-                    select(Lead, User.telegram_id, User.first_name, User.last_name)
-                    .join(User)
-                    .where(Lead.id == lead_id)
+
+async def follow_up_inactive_users() -> None:
+    """Follow up with users who haven't been active."""
+    try:
+        notification_service = get_notification_service()
+        now_utc = datetime.now(timezone.utc)
+        inactive_since = now_utc - timedelta(days=3)
+        inactive_before = now_utc - timedelta(days=7)
+
+        async for db in get_db():
+            result = await db.execute(
+                select(User.telegram_id, User.segment, User.updated_at)
+                .where(
+                    and_(
+                        User.updated_at <= inactive_since,
+                        User.updated_at >= inactive_before,
+                        User.is_blocked.is_(False),
+                    )
                 )
-                lead_data = result.first()
-
-                if lead_data:
-                    lead, telegram_id, first_name, last_name = lead_data
-                    full_name = f"{first_name or ''} {last_name or ''}".strip() or str(telegram_id)
-
-                    if lead.assigned_manager_id:
-                        await self.notification_service.send_lead_followup(
-                            lead.assigned_manager_id,
-                            lead,
-                            telegram_id,
-                            full_name,
-                        )
-                break
-
-        except Exception as exc:
-            logger.error(
-                "Error sending lead follow-up", lead_id=lead_id, exc_info=exc
             )
+            inactive_users = result.all()
 
-    async def _process_ab_tests(self):
-        """Check running A/B tests and finalize deliveries."""
-        try:
-            async for db in get_db():
-                ab_service = ABTestingService(db)
-                running_tests = await ab_service.repository.get_running_tests()
+            for telegram_id, segment, _ in inactive_users:
+                await notification_service.send_reengagement_message(
+                    telegram_id, segment or "warm"
+                )
+            break
 
-                if not running_tests:
-                    break
+    except Exception as exc:
+        logger.error("Error following up inactive users", exc_info=exc)
 
-                if not settings.telegram_bot_token:
-                    logger.warning(
-                        "Skipping winner broadcast: bot token not configured"
+
+async def send_appointment_reminder(appointment_id: int) -> None:
+    """Send individual appointment reminder."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            result = await db.execute(
+                select(Appointment, User.telegram_id)
+                .join(User)
+                .where(Appointment.id == appointment_id)
+            )
+            appointment_data = result.first()
+
+            if appointment_data:
+                appointment, telegram_id = appointment_data
+                appointment_tz = pytz.timezone(
+                    appointment.tz or settings.scheduler_timezone or "UTC"
+                )
+                reminder_datetime = appointment_tz.localize(
+                    datetime.combine(appointment.date, appointment.slot)
+                )
+                await notification_service.send_consultation_reminder(
+                    telegram_id,
+                    reminder_datetime,
+                )
+                appointment.reminder_job_id = None
+                await db.flush()
+                await db.commit()
+            break
+
+    except Exception as exc:
+        logger.error(
+            "Error sending appointment reminder", appointment_id=appointment_id, exc_info=exc
+        )
+
+
+async def send_lead_followup(lead_id: int) -> None:
+    """Send individual lead follow-up."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            result = await db.execute(
+                select(Lead, User.telegram_id, User.first_name, User.last_name)
+                .join(User)
+                .where(Lead.id == lead_id)
+            )
+            lead_data = result.first()
+
+            if lead_data:
+                lead, telegram_id, first_name, last_name = lead_data
+                full_name = f"{first_name or ''} {last_name or ''}".strip() or str(telegram_id)
+
+                if lead.assigned_manager_id:
+                    await notification_service.send_lead_followup(
+                        lead.assigned_manager_id,
+                        lead,
+                        telegram_id,
+                        full_name,
                     )
-                    break
+            break
 
-                broadcast_service = BroadcastService(self.notification_service.bot, db)
+    except Exception as exc:
+        logger.error("Error sending lead follow-up", lead_id=lead_id, exc_info=exc)
 
-                for test in running_tests:
-                    try:
-                        if not await ab_service.should_complete_test(test.id):
-                            continue
 
-                        success, detail, analysis = await ab_service.complete_test(test.id)
-                        if not success:
-                            logger.warning(
-                                "A/B test completion failed",
-                                test_id=test.id,
-                                detail=detail,
-                            )
-                            continue
+async def process_ab_tests() -> None:
+    """Check running A/B tests and finalize deliveries."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            ab_service = ABTestingService(db)
+            running_tests = await ab_service.repository.get_running_tests()
 
-                        await db.commit()
-
-                        if not analysis.get("winner"):
-                            logger.info(
-                                "A/B test completed without winner",
-                                test_id=test.id,
-                            )
-                            continue
-
-                        send_result = await broadcast_service.send_winner_broadcast(test.id)
-                        if send_result.get("error"):
-                            logger.warning(
-                                "Winner broadcast delivery failed",
-                                test_id=test.id,
-                                error=send_result["error"],
-                            )
-                        else:
-                            logger.info(
-                                "Winner broadcast delivered",
-                                test_id=test.id,
-                                stats=send_result,
-                            )
-                    except Exception as job_exc:
-                        logger.error(
-                            "Error during A/B test processing",
-                            test_id=getattr(test, "id", None),
-                            exc_info=job_exc,
-                        )
+            if not running_tests:
                 break
 
-        except Exception as exc:
-            logger.error("Error processing A/B tests", exc_info=exc)
+            if not settings.telegram_bot_token:
+                logger.warning(
+                    "Skipping winner broadcast: bot token not configured"
+                )
+                break
 
-    async def _cleanup_orphan_jobs(self):
-        """Remove finished or stale scheduler jobs."""
-        try:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=1)
-            for job in list(self.scheduler.get_jobs()):
-                next_run = job.next_run_time
-                if next_run is None or next_run.astimezone(timezone.utc) < cutoff:
-                    try:
-                        self.scheduler.remove_job(job.id)
-                    except JobLookupError:
-                        logger.debug("Cleanup skipped: job not found", job_id=job.id)
-        except Exception as exc:
-            logger.warning("Error during scheduler cleanup", exc_info=exc)
+            broadcast_service = BroadcastService(notification_service.bot, db)
 
+            for test in running_tests:
+                try:
+                    if not await ab_service.should_complete_test(test.id):
+                        continue
+
+                    success, detail, analysis = await ab_service.complete_test(test.id)
+                    if not success:
+                        logger.warning(
+                            "A/B test completion failed",
+                            test_id=test.id,
+                            detail=detail,
+                        )
+                        continue
+
+                    await db.commit()
+
+                    if not analysis.get("winner"):
+                        logger.info(
+                            "A/B test completed without winner",
+                            test_id=test.id,
+                        )
+                        continue
+
+                    send_result = await broadcast_service.send_winner_broadcast(test.id)
+                    if send_result.get("error"):
+                        logger.warning(
+                            "Winner broadcast delivery failed",
+                            test_id=test.id,
+                            error=send_result["error"],
+                        )
+                    else:
+                        logger.info(
+                            "Winner broadcast delivered",
+                            test_id=test.id,
+                            stats=send_result,
+                        )
+                except Exception as job_exc:
+                    logger.error(
+                        "Error during A/B test processing",
+                        test_id=getattr(test, "id", None),
+                        exc_info=job_exc,
+                    )
+            break
+
+    except Exception as exc:
+        logger.error("Error processing A/B tests", exc_info=exc)
+
+
+async def cleanup_orphan_jobs(scheduler_id: str) -> None:
+    """Remove finished or stale scheduler jobs."""
+    try:
+        scheduler = SCHEDULER_REGISTRY.get(scheduler_id)
+        if scheduler is None:
+            logger.warning(
+                "Cleanup skipped: scheduler not registered",
+                scheduler_id=scheduler_id,
+            )
+            return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        for job in list(scheduler.get_jobs()):
+            next_run = job.next_run_time
+            if next_run is None or next_run.astimezone(timezone.utc) < cutoff:
+                try:
+                    scheduler.remove_job(job.id)
+                except JobLookupError:
+                    logger.debug("Cleanup skipped: job not found", job_id=job.id)
+    except Exception as exc:
+        logger.warning("Error during scheduler cleanup", exc_info=exc)
 
 
 # Global scheduler instance
