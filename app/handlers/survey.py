@@ -93,11 +93,9 @@ async def start_survey(callback: CallbackQuery, user: User, user_service: UserSe
             ))
         keyboard.adjust(1)
         
-        survey_text = f"""📋 **Анкета для подбора программы**
+        survey_text = f"""📋 Давайте заполним анкету для подбора программы
 
-{question["text"]}
-
-*Вопрос 1 из 5*"""
+{question["text"]}"""
         
         await _render_survey_step(
             callback,
@@ -181,9 +179,6 @@ async def show_next_question(
         await callback.answer("Ошибка загрузки следующего вопроса")
         return
     
-    # Determine question number
-    question_num = int(question_code[1:])
-    
     # Create keyboard
     keyboard = InlineKeyboardBuilder()
     for answer_code, option in question["options"].items():
@@ -195,9 +190,7 @@ async def show_next_question(
     
     survey_text = f"""{confirmation}
 
-{question["text"]}
-
-*Вопрос {question_num} из 5*"""
+{question["text"]}"""
     
     await _render_survey_step(
         callback,
