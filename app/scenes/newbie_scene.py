@@ -1,4 +1,4 @@
-"""Newbie scene for cold segment users (0-5 points)."""
+"""Newbie scene for cold segment users (0-4 points)."""
 
 from typing import Dict, Optional
 
@@ -72,7 +72,7 @@ class NewbieScene(BaseScene):
             state.attempts_count > 3
         ):
             # Check if user has progressed enough to move to trader scene
-            if user.lead_score > 5:
+            if user.lead_score > 4:
                 return "trader"
                 
         # If user needs immediate help, escalate
@@ -88,7 +88,7 @@ class NewbieScene(BaseScene):
             "system_addition": """
 СЦЕНАРИЙ: НОВИЧОК В КРИПТОВАЛЮТАХ
 
-Пользователь - новичок в криптовалютах (0-5 баллов). Требует терпеливого обучения.
+Пользователь - новичок в криптовалютах (0-4 балла). Требует терпеливого обучения.
 
 ТВОЯ РОЛЬ:
 - Терпеливый наставник и учитель

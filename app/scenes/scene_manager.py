@@ -63,17 +63,17 @@ class SceneManager:
 
         # Scene selection rules (legacy path)
         self.scene_rules = {
-            # Cold segment (0-5 points) -> Newbie scene
-            (UserSegment.COLD, lambda score: score <= 5): "newbie",
+            # Cold segment (0-4 points) -> Newbie scene
+            (UserSegment.COLD, lambda score: score <= 4): "newbie",
 
-            # Warm segment (6-10 points) -> Trader scene
-            (UserSegment.WARM, lambda score: 6 <= score <= 10): "trader",
+            # Warm segment (5-9 points) -> Trader scene
+            (UserSegment.WARM, lambda score: 5 <= score <= 9): "trader",
 
-            # Hot segment (11+ points) -> Investor scene
-            (UserSegment.HOT, lambda score: score >= 11): "investor",
+            # Hot segment (10+ points) -> Investor scene
+            (UserSegment.HOT, lambda score: score >= 10): "investor",
 
             # Special cases
-            (None, lambda score: score > 15): "skeptic",  # Very high score but no segment
+            (None, lambda score: score > 13): "skeptic",  # Очень высокий балл без сегмента
         }
 
     @property

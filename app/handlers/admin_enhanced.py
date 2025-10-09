@@ -277,9 +277,9 @@ async def broadcast_create_step2(message: Message, state: FSMContext, **kwargs):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Все пользователи", callback_data="broadcast_segment_all")],
-        [InlineKeyboardButton(text="❄️ Холодные (0-5 баллов)", callback_data="broadcast_segment_cold")],
-        [InlineKeyboardButton(text="🔥 Тёплые (6-10 баллов)", callback_data="broadcast_segment_warm")],
-        [InlineKeyboardButton(text="🌶️ Горячие (11+ баллов)", callback_data="broadcast_segment_hot")],
+        [InlineKeyboardButton(text="❄️ Холодные (0-4 балла)", callback_data="broadcast_segment_cold")],
+        [InlineKeyboardButton(text="🔥 Тёплые (5-9 баллов)", callback_data="broadcast_segment_warm")],
+        [InlineKeyboardButton(text="🌶️ Горячие (10+ баллов)", callback_data="broadcast_segment_hot")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")]
     ])
     

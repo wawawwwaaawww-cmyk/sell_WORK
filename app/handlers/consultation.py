@@ -1,6 +1,6 @@
 """Consultation scheduling handlers."""
 
-from datetime import date, time
+from datetime import date, time, datetime
 from typing import Dict, Any
 
 import structlog
@@ -88,7 +88,7 @@ async def offer_consultation(callback: CallbackQuery, user: User, **kwargs):
             ))
         
         keyboard.add(InlineKeyboardButton(
-            text="📝 Другая дата",
+            text="❌ Нет подходящей даты",
             callback_data="consult:custom_date"
         ))
         keyboard.add(InlineKeyboardButton(
@@ -143,6 +143,8 @@ async def select_consultation_date(callback: CallbackQuery, user: User, **kwargs
 
 {consultation_service.get_time_slots_text()}
 
+Если ни один вариант не подходит — нажми кнопку ниже и напиши удобное время.
+
 Все время указано по Москве 🇷🇺"""
         
         keyboard = InlineKeyboardBuilder()
@@ -153,7 +155,11 @@ async def select_consultation_date(callback: CallbackQuery, user: User, **kwargs
                 text=f"⏰ {formatted_time}",
                 callback_data=f"consult:time:{date_str}:{slot.isoformat()}"
             ))
-        
+
+        keyboard.add(InlineKeyboardButton(
+            text="❌ Нет подходящего времени",
+            callback_data=f"consult:custom_time:{date_str}"
+        ))
         keyboard.add(InlineKeyboardButton(
             text="🔙 Выбрать другую дату",
             callback_data="consult:offer"
@@ -253,6 +259,208 @@ async def select_consultation_time(callback: CallbackQuery, user: User, user_ser
         await callback.answer("Произошла ошибка при записи")
 
 
+@router.callback_query(F.data.startswith("consult:custom_time:"))
+async def request_custom_time(callback: CallbackQuery, user: User, state: FSMContext, **kwargs):
+    """Request custom time input from the user."""
+    try:
+        parts = callback.data.split(":")
+        if len(parts) < 3:
+            await callback.answer("Некорректные данные слота")
+            return
+
+        date_str = parts[2]
+        await state.set_state(ConsultationStates.waiting_custom_time)
+        await state.update_data(custom_date=date_str)
+
+        custom_time_text = """⏰ **Напиши удобное время для консультации**
+
+Формат: ЧЧ:ММ (например: 14:00)
+
+⚠️ **Важно:**
+• Доступные окна: 12:00, 14:00, 16:00, 18:00 МСК
+• Если время занято — предложу выбрать другое
+• Чтобы вернуться к списку слотов, нажми кнопку ниже или напиши «Отмена»
+
+Введи время:"""
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.add(InlineKeyboardButton(
+            text="🔙 Вернуться к слотам",
+            callback_data=f"consult:date:{date_str}"
+        ))
+
+        await callback.message.edit_text(
+            custom_time_text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+
+        logger.info(
+            "Custom time requested",
+            user_id=user.id,
+            selected_date=date_str
+        )
+
+        await callback.answer()
+
+    except Exception as e:
+        logger.error("Error requesting custom time", error=str(e), user_id=user.id, exc_info=True)
+        await callback.answer("Произошла ошибка")
+
+
+@router.message(ConsultationStates.waiting_custom_time)
+async def handle_custom_time(
+    message: Message,
+    user: User,
+    state: FSMContext,
+    user_service: UserService,
+    **kwargs
+):
+    """Handle custom time input for a consultation."""
+    try:
+        session = kwargs.get("session")
+        data = await state.get_data()
+        date_str = data.get("custom_date")
+
+        if not date_str:
+            await message.answer("❌ Не удалось определить выбранную дату. Попробуй выбрать слот ещё раз.")
+            await state.clear()
+            return
+
+        text_value = message.text.strip()
+        if text_value.lower() == "отмена":
+            await state.clear()
+
+            consultation_service = ConsultationService(session)
+            selected_date = date.fromisoformat(date_str)
+            available_slots = await consultation_service.get_available_slots_for_date(selected_date)
+
+            if not available_slots:
+                await message.answer(
+                    "❌ На эту дату нет свободных слотов. Выбери другую дату через кнопку записи."
+                )
+                return
+
+            formatted_date = selected_date.strftime("%d.%m.%Y (%A)")
+            time_text = f"""📅 **Дата выбрана: {formatted_date}**
+
+⏰ **Выбери удобное время:**
+
+{consultation_service.get_time_slots_text()}
+
+Если ни один вариант не подходит — нажми кнопку ниже и напиши удобное время.
+
+Все время указано по Москве 🇷🇺"""
+
+            keyboard = InlineKeyboardBuilder()
+            for slot in available_slots:
+                formatted_time = consultation_service.format_slot_time(slot)
+                keyboard.add(InlineKeyboardButton(
+                    text=f"⏰ {formatted_time}",
+                    callback_data=f"consult:time:{selected_date.isoformat()}:{slot.isoformat()}"
+                ))
+
+            keyboard.add(InlineKeyboardButton(
+                text="❌ Нет подходящего времени",
+                callback_data=f"consult:custom_time:{selected_date.isoformat()}"
+            ))
+            keyboard.add(InlineKeyboardButton(
+                text="🔙 Выбрать другую дату",
+                callback_data="consult:offer"
+            ))
+            keyboard.adjust(1)
+
+            await message.answer(
+                time_text,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="Markdown"
+            )
+
+            return
+
+        try:
+            selected_time = datetime.strptime(text_value, "%H:%M").time()
+        except ValueError:
+            await message.answer("❌ Неверный формат времени. Используй формат ЧЧ:ММ (например: 14:00).")
+            return
+
+        consultation_service = ConsultationService(session)
+
+        if selected_time not in consultation_service.available_slots:
+            await message.answer(
+                "❌ Пока доступны только слоты 12:00, 14:00, 16:00 и 18:00 МСК. Выбери один из них или напиши другое время."
+            )
+            return
+
+        selected_date = date.fromisoformat(date_str)
+
+        success, appointment, result_message = await consultation_service.book_consultation(
+            user_id=user.id,
+            consultation_date=selected_date,
+            slot=selected_time
+        )
+
+        if success and appointment:
+            await state.clear()
+
+            await user_service.advance_funnel_stage(user, FunnelStage.CONSULTATION)
+
+            details = consultation_service.format_appointment_details(appointment)
+
+            confirmation_text = f"""✅ **Консультация успешно запланирована!**
+
+{details}
+
+🎉 **Что дальше:**
+📱 За 15 минут до встречи пришлю напоминание
+💬 Эксперт свяжется с тобой точно в назначенное время
+📝 Подготовь вопросы для максимальной пользы
+
+💡 *Если планы изменятся — можешь перенести встречу заранее*
+
+Увидимся на консультации! 👋"""
+
+            keyboard = InlineKeyboardBuilder()
+            keyboard.add(InlineKeyboardButton(
+                text="📅 Перенести консультацию",
+                callback_data="consult:reschedule"
+            ))
+            keyboard.add(InlineKeyboardButton(
+                text="💬 Задать вопросы до встречи",
+                callback_data="llm:pre_consult_questions"
+            ))
+            keyboard.adjust(1)
+
+            await message.answer(
+                confirmation_text,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="Markdown"
+            )
+
+            event_service = EventService(kwargs.get("session"))
+            await event_service.log_consultation_booked(
+                user_id=user.id,
+                date=selected_date.isoformat(),
+                time=selected_time.isoformat()
+            )
+
+            logger.info(
+                "Consultation booked via custom time",
+                user_id=user.id,
+                date=selected_date.isoformat(),
+                time=selected_time.isoformat()
+            )
+
+        else:
+            await message.answer(
+                f"❌ **Ошибка при записи**\n\n{result_message}\n\nПопробуй выбрать другое время или обратись к менеджеру.",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error("Error handling custom time", error=str(e), user_id=user.id, exc_info=True)
+        await message.answer("Произошла ошибка при выборе времени")
+
 @router.callback_query(F.data == "consult:custom_date")
 async def request_custom_date(callback: CallbackQuery, state: FSMContext, **kwargs):
     """Request custom date input."""
@@ -267,6 +475,7 @@ async def request_custom_date(callback: CallbackQuery, state: FSMContext, **kwar
 • Консультации проводятся только в будние дни
 • Доступное время: 12:00, 14:00, 16:00, 18:00 МСК
 • Нельзя записаться на сегодня
+• Если передумал — отправь «Отмена»
 
 Введи дату:"""
         
@@ -318,44 +527,50 @@ async def handle_custom_date(message: Message, user: User, state: FSMContext, **
             )
             return
         
-        # Clear state
+        # Clear state after receiving valid date
         await state.clear()
-        
+
         # Show time slots for selected date
         consultation_service = ConsultationService(session)
         available_slots = await consultation_service.get_available_slots_for_date(selected_date)
-        
+
         if not available_slots:
             await message.answer(
                 f"❌ К сожалению, на {selected_date.strftime('%d.%m.%Y')} нет свободных слотов. Выбери другую дату."
             )
             return
-        
+
         formatted_date = selected_date.strftime("%d.%m.%Y (%A)")
-        
+
         time_text = f"""📅 **Дата выбрана: {formatted_date}**
 
 ⏰ **Выбери удобное время:**
 
 {consultation_service.get_time_slots_text()}
 
+Если ни один вариант не подходит — нажми кнопку ниже и напиши удобное время.
+
 Все время указано по Москве 🇷🇺"""
-        
+
         keyboard = InlineKeyboardBuilder()
-        
+
         for slot in available_slots:
             formatted_time = consultation_service.format_slot_time(slot)
             keyboard.add(InlineKeyboardButton(
                 text=f"⏰ {formatted_time}",
                 callback_data=f"consult:time:{selected_date.isoformat()}:{slot.isoformat()}"
             ))
-        
+
+        keyboard.add(InlineKeyboardButton(
+            text="❌ Нет подходящего времени",
+            callback_data=f"consult:custom_time:{selected_date.isoformat()}"
+        ))
         keyboard.add(InlineKeyboardButton(
             text="🔙 Выбрать другую дату",
             callback_data="consult:offer"
         ))
         keyboard.adjust(1)
-        
+
         await message.answer(
             time_text,
             reply_markup=keyboard.as_markup(),

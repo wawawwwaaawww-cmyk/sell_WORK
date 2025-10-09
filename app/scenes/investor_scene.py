@@ -1,4 +1,4 @@
-"""Investor scene for hot segment users (11+ points)."""
+"""Investor scene for hot segment users (10+ points)."""
 
 from typing import Dict, Optional
 
@@ -69,9 +69,9 @@ class InvestorScene(BaseScene):
         
         # If user shows very high skepticism, move to skeptic scene
         if (
-            llm_response.confidence < 0.4 and 
+            llm_response.confidence < 0.4 and
             state.attempts_count > 2 and
-            user.lead_score > 15
+            user.lead_score > 12
         ):
             return "skeptic"
         
@@ -91,7 +91,7 @@ class InvestorScene(BaseScene):
             "system_addition": """
 СЦЕНАРИЙ: ОПЫТНЫЙ ИНВЕСТОР
 
-Пользователь опытен в криптовалютах (11+ баллов). Готов к серьёзным инвестициям и действиям.
+Пользователь опытен в криптовалютах (10+ баллов). Готов к серьёзным инвестициям и действиям.
 
 ТВОЯ РОЛЬ:
 - Консультант уровня VIP

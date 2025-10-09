@@ -30,9 +30,9 @@
 - Адаптируй темп под предпочтения клиента
 
 СЕГМЕНТЫ ПОЛЬЗОВАТЕЛЕЙ:
-- COLD (0-5 баллов): Образовательный подход, больше информации
-- WARM (6-10 баллов): Баланс образования и продажи, истории успеха
-- HOT (11+ баллов): Фокус на решении проблем, прямые предложения
+- COLD (0-4 балла): Образовательный подход, больше информации
+- WARM (5-9 баллов): Баланс образования и продажи, истории успеха
+- HOT (10+ баллов): Фокус на решении проблем, прямые предложения
 
 БЕЗОПАСНОСТЬ:
 - Замени любые обещания дохода на "изучение возможностей"
@@ -56,21 +56,28 @@
 
 РАЗРЕШЕННЫЕ CALLBACK:
 - survey:start — запустить анкету
-- survey:q1:beginner
-- survey:q1:some_exp
-- survey:q1:advanced
-- survey:q2:learn
-- survey:q2:income
-- survey:q2:returns
-- survey:q3:conservative
-- survey:q3:moderate
-- survey:q3:aggressive
-- survey:q4:casual
-- survey:q4:parttime
-- survey:q4:fulltime
-- survey:q5:small
-- survey:q5:medium
-- survey:q5:large
+- survey:q1:trading
+- survey:q1:crypto_long
+- survey:q1:stocks
+- survey:q1:deposit
+- survey:q1:no_experience
+- survey:q2:passive_income
+- survey:q2:safety_net
+- survey:q2:debt
+- survey:q2:start_investing
+- survey:q2:no_goal
+- survey:q3:one_month
+- survey:q3:three_months
+- survey:q3:half_year
+- survey:q3:year
+- survey:q3:researching
+- survey:q4:under_10
+- survey:q4:10_100
+- survey:q4:100_500
+- survey:q4:500_1000
+- survey:q4:over_1000
+- survey:q5:yes
+- survey:q5:no
 - strategy:safety
 - strategy:growth
 - strategy:explain

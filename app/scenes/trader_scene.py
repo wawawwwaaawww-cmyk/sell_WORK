@@ -1,4 +1,4 @@
-"""Trader scene for warm segment users (6-10 points)."""
+"""Trader scene for warm segment users (5-9 points)."""
 
 from typing import Dict, Optional
 
@@ -67,9 +67,9 @@ class TraderScene(BaseScene):
         
         # If user shows high engagement and readiness, move to investor scene
         if (
-            llm_response.confidence > 0.8 and 
+            llm_response.confidence > 0.8 and
             llm_response.next_action in ["offer_consult", "offer_payment"] and
-            user.lead_score > 8
+            user.lead_score > 7
         ):
             return "investor"
         
@@ -89,7 +89,7 @@ class TraderScene(BaseScene):
             "system_addition": """
 СЦЕНАРИЙ: РАЗВИВАЮЩИЙСЯ ТРЕЙДЕР
 
-Пользователь имеет базовые знания в криптовалютах (6-10 баллов). Готов к более серьёзному подходу.
+Пользователь имеет базовые знания в криптовалютах (5-9 баллов). Готов к более серьёзному подходу.
 
 ТВОЯ РОЛЬ:
 - Стратегический консультант

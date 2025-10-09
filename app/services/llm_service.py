@@ -53,7 +53,7 @@ class PolicyLayer:
         
         # Hot segment prioritizes offers
         if user_segment == UserSegment.HOT:
-            if response.get("next_action") == "ask" and context.user.lead_score > 12:
+            if response.get("next_action") == "ask" and context.user.lead_score > 10:
                 response["next_action"] = "offer_consult"
                 
         # Cold segment needs more education
@@ -63,7 +63,7 @@ class PolicyLayer:
         
         # Warm segment balances education and sales
         elif user_segment == UserSegment.WARM:
-            if response.get("next_action") == "offer_payment" and context.user.lead_score < 8:
+            if response.get("next_action") == "offer_payment" and context.user.lead_score < 7:
                 response["next_action"] = "offer_consult"
         
         return response

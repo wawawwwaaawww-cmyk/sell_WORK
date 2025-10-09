@@ -56,9 +56,9 @@ class StrategyScene(BaseScene):
         
         # If user completed survey, determine scene based on score
         if user.lead_score > 0:
-            if user.lead_score <= 5:
+            if user.lead_score <= 4:
                 return "newbie"
-            elif user.lead_score <= 10:
+            elif user.lead_score <= 9:
                 return "trader"
             else:
                 return "investor"

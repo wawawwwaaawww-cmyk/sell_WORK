@@ -74,9 +74,9 @@ class SkepticScene(BaseScene):
             state.attempts_count > 3
         ):
             # Determine scene based on user level
-            if user.lead_score > 10:
+            if user.lead_score > 9:
                 return "investor"
-            elif user.lead_score > 5:
+            elif user.lead_score > 4:
                 return "trader"
             else:
                 return "newbie"

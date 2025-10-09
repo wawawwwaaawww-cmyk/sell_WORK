@@ -182,7 +182,7 @@ class LeadService:
             return False
         
         # Hot segment users with high engagement
-        if user.segment == "hot" and user.lead_score >= 12:
+        if user.segment == "hot" and user.lead_score >= 11:
             return True
         
         # User has booked consultation

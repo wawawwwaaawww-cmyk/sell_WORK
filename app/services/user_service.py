@@ -71,9 +71,9 @@ class UserService:
     
     async def calculate_segment_from_score(self, lead_score: int) -> UserSegment:
         """Calculate user segment based on lead score."""
-        if lead_score <= 5:
+        if lead_score <= 4:
             return UserSegment.COLD
-        elif lead_score <= 10:
+        elif lead_score <= 9:
             return UserSegment.WARM
         else:
             return UserSegment.HOT

@@ -134,15 +134,15 @@ async def handle_survey_answer(callback: CallbackQuery, user: User, user_service
         
         # Save answer
         survey_service = SurveyService(session)
-        await survey_service.save_answer(user.id, question_code, answer_code)
-        
+        answer_record = await survey_service.save_answer(user.id, question_code, answer_code)
+
         # Log event
         event_service = EventService(session)
         await event_service.log_survey_answer(
             user_id=user.id,
             question=question_code,
             answer=answer_code,
-            points=0  # Points calculated in service
+            points=answer_record.points
         )
         
         # Get confirmation text
@@ -241,8 +241,15 @@ async def complete_survey(
         except Exception as log_error:
             logger.warning("Failed to log survey completion", error=str(log_error), user_id=user.id)
         
+        answers_map = summary.get("answers", {})
+        program_info = summary.get("program")
+        confirmation_text = confirmation
+
+        if program_info:
+            confirmation_text = confirmation.replace("{program_result}", program_info["key_result"])
+
         # Create results text
-        results_text = f"""{confirmation}
+        results_text = f"""{confirmation_text}
 
 🎉 **Анкета завершена!**
 
@@ -250,43 +257,69 @@ async def complete_survey(
 {summary["profile_summary"]}
 
 🎯 **Категория:** {summary["segment_description"]}
-📈 **Балл готовности:** {summary["total_score"]}/15
+📈 **Балл готовности:** {summary["total_score"]}/13
 
 💡 *На основе твоих ответов я подберу оптимальную программу обучения!*
 
 Давай обсудим следующие шаги? 🚀"""
-        
+
         # Create keyboard for next actions
         keyboard = InlineKeyboardBuilder()
-        
-        if summary["segment"] == "hot":
+
+        final_answer = answers_map.get("q5")
+        program_callback = None
+        if program_info:
+            program_callback = f"survey:program:{program_info['code']}"
+
+        if final_answer == "yes":
             keyboard.add(InlineKeyboardButton(
-                text="📞 Записаться на консультацию",
+                text="📅 Подобрать время",
                 callback_data=Callbacks.CONSULT_OFFER
             ))
+            if program_callback:
+                keyboard.add(InlineKeyboardButton(
+                    text="📘 Узнать про программу",
+                    callback_data=program_callback
+                ))
+        elif final_answer == "no":
             keyboard.add(InlineKeyboardButton(
-                text="💬 Обсудить программы",
-                callback_data="llm:discuss_programs"
-            ))
-        elif summary["segment"] == "warm":
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Подобрать программу",
-                callback_data="llm:discuss_programs"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="📞 Консультация с экспертом",
+                text="📞 Бесплатная консультация",
                 callback_data=Callbacks.CONSULT_OFFER
             ))
-        else:  # cold
-            keyboard.add(InlineKeyboardButton(
-                text="📚 Получить материалы для изучения",
-                callback_data="materials:educational"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Задать вопросы",
-                callback_data="llm:ask_questions"
-            ))
-        
+            if program_callback:
+                keyboard.add(InlineKeyboardButton(
+                    text="📘 Посмотреть программу",
+                    callback_data=program_callback
+                ))
+        else:
+            if summary["segment"] == "hot":
+                keyboard.add(InlineKeyboardButton(
+                    text="📞 Записаться на консультацию",
+                    callback_data=Callbacks.CONSULT_OFFER
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="💬 Обсудить программы",
+                    callback_data="llm:discuss_programs"
+                ))
+            elif summary["segment"] == "warm":
+                keyboard.add(InlineKeyboardButton(
+                    text="💬 Подобрать программу",
+                    callback_data="llm:discuss_programs"
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="📞 Консультация с экспертом",
+                    callback_data=Callbacks.CONSULT_OFFER
+                ))
+            else:  # cold
+                keyboard.add(InlineKeyboardButton(
+                    text="📚 Получить материалы для изучения",
+                    callback_data="materials:educational"
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="💬 Задать вопросы",
+                    callback_data="llm:ask_questions"
+                ))
+
         keyboard.adjust(1)
         
         await _render_survey_step(
@@ -296,7 +329,12 @@ async def complete_survey(
             text=results_text,
             reply_markup=keyboard.as_markup(),
             parse_mode="Markdown",
-            metadata={"context": "survey_complete", "segment": summary["segment"], "score": summary["total_score"]},
+            metadata={
+                "context": "survey_complete",
+                "segment": summary["segment"],
+                "score": summary["total_score"],
+                "program": program_info["code"] if program_info else None,
+            },
         )
         
         await callback.answer("✅ Анкета завершена!")
@@ -376,6 +414,70 @@ async def handle_llm_interaction(callback: CallbackQuery, user: User, **kwargs):
         logger.error("Error in LLM interaction", error=str(e), user_id=user.id, exc_info=True)
         # Use a simple text answer as a fallback, as the original callback is already answered
         await callback.message.answer("Произошла ошибка. Попробуйте еще раз.")
+
+
+@router.callback_query(F.data.startswith("survey:program:"))
+async def handle_program_details(callback: CallbackQuery, user: User, **kwargs):
+    """Show detailed information about the recommended program."""
+    try:
+        await callback.answer()
+
+        session = kwargs.get("session")
+        survey_service = SurveyService(session)
+        summary = await survey_service.generate_summary(user.id)
+        program_info = summary.get("program")
+
+        if not program_info:
+            await callback.message.answer(
+                "❌ Не удалось получить информацию о программе. Попробуйте позже."
+            )
+            return
+
+        requested_code = callback.data.split(":")[-1]
+        logger.info(
+            "Program details requested",
+            user_id=user.id,
+            requested_code=requested_code,
+            recommended=program_info.get("code") if program_info else None,
+        )
+        if requested_code != program_info.get("code"):
+            program_info = survey_service.determine_program_recommendation(
+                summary.get("answers", {}),
+                summary.get("total_score", 0)
+            )
+
+        details_text = f"""📘 <b>{program_info['name']}</b>
+
+{program_info['description']}
+
+🤝 Готов обсудить варианты участия или задать вопросы?"""
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.add(InlineKeyboardButton(
+            text="📅 Записаться на созвон",
+            callback_data=Callbacks.CONSULT_OFFER
+        ))
+        keyboard.add(InlineKeyboardButton(
+            text="💬 Задать вопросы",
+            callback_data="llm:ask_questions"
+        ))
+        keyboard.adjust(1)
+
+        await callback.message.answer(
+            details_text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="HTML"
+        )
+
+        logger.info(
+            "Program details shown",
+            user_id=user.id,
+            program_code=program_info.get("code")
+        )
+
+    except Exception as e:
+        logger.error("Error showing program details", error=str(e), user_id=user.id, exc_info=True)
+        await callback.message.answer("Произошла ошибка при показе программы")
 
 
 def register_handlers(dp):
