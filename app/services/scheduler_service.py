@@ -54,8 +54,8 @@ class SchedulerService:
                 jobstores["default"] = SQLAlchemyJobStore(url=settings.database_url_sync)
             except Exception as exc:
                 logger.warning(
-                    "Failed to configure SQLAlchemyJobStore, falling back to in-memory store",
-                    error=str(exc),
+                    "Failed to configure SQLAlchemyJobStore, falling back to in-memory store (error=%s)",
+                    exc,
                 )
 
         if jobstores:
@@ -112,7 +112,10 @@ class SchedulerService:
             )
 
             self.scheduler.start()
-            logger.info("Scheduler started successfully", timezone=str(self.timezone))
+            logger.info(
+                "Scheduler started successfully (timezone=%s)",
+                self.timezone,
+            )
 
         except Exception as exc:
             logger.error("Error starting scheduler", exc_info=exc)
@@ -158,8 +161,8 @@ class SchedulerService:
                 connection.execute(delete_stmt)
 
             logger.warning(
-                "Purged legacy scheduler jobs serialized with service instances",
-                removed_job_ids=legacy_job_ids,
+                "Purged legacy scheduler jobs serialized with service instances (removed_job_ids=%s)",
+                legacy_job_ids,
             )
         except Exception as exc:
             logger.error("Failed to purge legacy scheduler jobs", exc_info=exc)
@@ -198,14 +201,18 @@ class SchedulerService:
                 break
 
             logger.info(
-                "Scheduled appointment reminder",
-                appointment_id=appointment_id,
-                run_at=str(run_date),
-                job_id=job.id,
+                "Scheduled appointment reminder (appointment_id=%s, run_at=%s, job_id=%s)",
+                appointment_id,
+                run_date,
+                job.id,
             )
 
         except Exception as exc:
-            logger.error("Error scheduling appointment reminder", appointment_id=appointment_id, exc_info=exc)
+            logger.error(
+                "Error scheduling appointment reminder (appointment_id=%s)",
+                appointment_id,
+                exc_info=exc,
+            )
             raise
 
     async def schedule_lead_followup(self, lead_id: int, followup_time: datetime):
@@ -225,14 +232,18 @@ class SchedulerService:
             )
 
             logger.info(
-                "Scheduled lead follow-up",
-                lead_id=lead_id,
-                run_at=str(run_date),
-                job_id=job.id,
+                "Scheduled lead follow-up (lead_id=%s, run_at=%s, job_id=%s)",
+                lead_id,
+                run_date,
+                job.id,
             )
 
         except Exception as exc:
-            logger.error("Error scheduling lead follow-up", lead_id=lead_id, exc_info=exc)
+            logger.error(
+                "Error scheduling lead follow-up (lead_id=%s)",
+                lead_id,
+                exc_info=exc,
+            )
             raise
 
 
@@ -243,9 +254,13 @@ class SchedulerService:
         try:
             self.scheduler.remove_job(job_id)
         except JobLookupError:
-            logger.debug("Scheduler job not found", job_id=job_id)
+            logger.debug("Scheduler job not found (job_id=%s)", job_id)
         except Exception as exc:
-            logger.warning("Failed to cancel job", job_id=job_id, error=str(exc))
+            logger.warning(
+                "Failed to cancel job (job_id=%s, error=%s)",
+                job_id,
+                exc,
+            )
 
 # Background job implementations
 
@@ -409,7 +424,11 @@ async def send_lead_followup(lead_id: int) -> None:
             break
 
     except Exception as exc:
-        logger.error("Error sending lead follow-up", lead_id=lead_id, exc_info=exc)
+        logger.error(
+            "Error sending lead follow-up (lead_id=%s)",
+            lead_id,
+            exc_info=exc,
+        )
 
 
 async def process_ab_tests() -> None:
@@ -439,9 +458,9 @@ async def process_ab_tests() -> None:
                     success, detail, analysis = await ab_service.complete_test(test.id)
                     if not success:
                         logger.warning(
-                            "A/B test completion failed",
-                            test_id=test.id,
-                            detail=detail,
+                            "A/B test completion failed (test_id=%s, detail=%s)",
+                            test.id,
+                            detail,
                         )
                         continue
 
@@ -449,28 +468,28 @@ async def process_ab_tests() -> None:
 
                     if not analysis.get("winner"):
                         logger.info(
-                            "A/B test completed without winner",
-                            test_id=test.id,
+                            "A/B test completed without winner (test_id=%s)",
+                            test.id,
                         )
                         continue
 
                     send_result = await broadcast_service.send_winner_broadcast(test.id)
                     if send_result.get("error"):
                         logger.warning(
-                            "Winner broadcast delivery failed",
-                            test_id=test.id,
-                            error=send_result["error"],
+                            "Winner broadcast delivery failed (test_id=%s, error=%s)",
+                            test.id,
+                            send_result["error"],
                         )
                     else:
                         logger.info(
-                            "Winner broadcast delivered",
-                            test_id=test.id,
-                            stats=send_result,
+                            "Winner broadcast delivered (test_id=%s, stats=%s)",
+                            test.id,
+                            send_result,
                         )
                 except Exception as job_exc:
                     logger.error(
-                        "Error during A/B test processing",
-                        test_id=getattr(test, "id", None),
+                        "Error during A/B test processing (test_id=%s)",
+                        getattr(test, "id", None),
                         exc_info=job_exc,
                     )
             break
@@ -485,8 +504,8 @@ async def cleanup_orphan_jobs(scheduler_id: str) -> None:
         scheduler = SCHEDULER_REGISTRY.get(scheduler_id)
         if scheduler is None:
             logger.warning(
-                "Cleanup skipped: scheduler not registered",
-                scheduler_id=scheduler_id,
+                "Cleanup skipped: scheduler not registered (scheduler_id=%s)",
+                scheduler_id,
             )
             return
 
@@ -497,7 +516,7 @@ async def cleanup_orphan_jobs(scheduler_id: str) -> None:
                 try:
                     scheduler.remove_job(job.id)
                 except JobLookupError:
-                    logger.debug("Cleanup skipped: job not found", job_id=job.id)
+                    logger.debug("Cleanup skipped: job not found (job_id=%s)", job.id)
     except Exception as exc:
         logger.warning("Error during scheduler cleanup", exc_info=exc)
 
