@@ -1,0 +1,486 @@
+version: 1
+metadata:
+  updated_at: "2025-09-23"
+  owner: "Codex"
+  description: "State transition map derived from docs/SCENARIO_ENGINE_PLAN.md and ТЗ."
+  default_prompt_path: "prompts"
+
+global:
+  guards:
+    - name: "safety_policy"
+      prompt: "safety_policies.txt"
+      apply_to_states: "*"
+  metrics:
+    - name: "scene_transition_total"
+      labels: ["from", "to"]
+    - name: "consultation_booked_total"
+      labels: ["segment", "channel"]
+    - name: "payment_offer_shown_total"
+      labels: ["segment", "tariff"]
+
+states:
+  START:
+    description: "Welcome message on /start, deliver bonus CTA."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "system_manager.txt"
+          context:
+            funnel_stage: "new"
+            intent: "greeting"
+          fallback_buttons:
+            - text: "🎁 Получить бонус"
+              callback: "bonus:claim"
+            - text: "🎯 Пройти тест"
+              callback: "survey:start"
+    transitions:
+      - trigger: "command:/start"
+        target: "BONUS_DELIVERY"
+      - trigger: "callback:bonus:claim"
+        target: "BONUS_DELIVERY"
+      - trigger: "callback:survey:start"
+        target: "SURVEY_ENTRY"
+      - trigger: "callback:strategy:discuss"
+        target: "STRATEGY_DISCUSSION"
+
+  BONUS_DELIVERY:
+    description: "Выдача бонусов и логирование события."
+    entry:
+      steps:
+        - action: "deliver_bonus"
+        - action: "log_event"
+          event_type: "bonus_delivered"
+    transitions:
+      - trigger: "bonus_delivered"
+        target: "READINESS_CHECK"
+
+  READINESS_CHECK:
+    description: "Спрашиваем готовность пройти анкету или обсудить стратегии."
+    entry:
+      steps:
+        - action: "send_message"
+          template: "Готов продолжить? Выбери, что удобнее сейчас."
+          buttons:
+            - text: "🚀 Готов пройти тест"
+              callback: "survey:start"
+            - text: "🤔 Хочу обсудить стратегии"
+              callback: "strategy:discuss"
+            - text: "👤 Менеджер"
+              callback: "manager:request"
+    transitions:
+      - trigger: "callback:survey:start"
+        target: "SURVEY_ENTRY"
+      - trigger: "callback:strategy:discuss"
+        target: "STRATEGY_DISCUSSION"
+      - trigger: "callback:manager:request"
+        target: "MANAGER_HOT_HANDOFF"
+
+  STRATEGY_DISCUSSION:
+    description: "Ветка для пользователей, которые хотят обсудить стратегии вместо анкеты."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "materials_selector.txt"
+          context:
+            mode: "strategy_overview"
+        - action: "offer_options"
+          buttons:
+            - text: "🛡️ Надёжность"
+              callback: "strategy:path:safety"
+            - text: "📈 Рост"
+              callback: "strategy:path:growth"
+            - text: "🎯 Пройти тест"
+              callback: "survey:start"
+    transitions:
+      - trigger: "callback:strategy:path:safety"
+        target: "SAFETY_PATH"
+      - trigger: "callback:strategy:path:growth"
+        target: "GROWTH_PATH"
+      - trigger: "callback:survey:start"
+        target: "SURVEY_ENTRY"
+
+  SAFETY_PATH:
+    description: "Надёжные стратегии + CTA консультации."
+    entry:
+      steps:
+        - action: "send_materials"
+          segment: "cold"
+          funnel_stage: "strategy"
+          limit: 3
+        - action: "send_message"
+          template: "Готовы обсудить подробности с экспертом?"
+          buttons:
+            - text: "📞 Назначить консультацию"
+              callback: "consult:schedule"
+            - text: "↩️ Назад"
+              callback: "strategy:discuss"
+    transitions:
+      - trigger: "callback:consult:schedule"
+        target: "CONSULT_CTA"
+      - trigger: "callback:strategy:discuss"
+        target: "STRATEGY_DISCUSSION"
+
+  GROWTH_PATH:
+    description: "Стратегии на рост + CTA консультации."
+    entry:
+      steps:
+        - action: "send_materials"
+          segment: "warm"
+          funnel_stage: "strategy"
+          limit: 3
+        - action: "send_message"
+          template: "Можем выбрать слот с экспертом и обсудить ростовые стратегии."
+          buttons:
+            - text: "📞 Выбрать слот"
+              callback: "consult:schedule"
+            - text: "↩️ Назад"
+              callback: "strategy:discuss"
+    transitions:
+      - trigger: "callback:consult:schedule"
+        target: "CONSULT_CTA"
+      - trigger: "callback:strategy:discuss"
+        target: "STRATEGY_DISCUSSION"
+
+  SURVEY_ENTRY:
+    description: "Подготовка к анкете."
+    entry:
+      steps:
+        - action: "send_message"
+          template: "Отвечай честно, это поможет подобрать программу."
+          buttons:
+            - text: "Начать"
+              callback: "survey:start"
+            - text: "Назад"
+              callback: "strategy:discuss"
+    transitions:
+      - trigger: "callback:survey:start"
+        target: "SURVEY_Q1"
+      - trigger: "callback:strategy:discuss"
+        target: "STRATEGY_DISCUSSION"
+
+  SURVEY_Q1:
+    type: "survey"
+    question: 1
+    suppress_fallback: true
+    entry:
+      steps:
+        - action: "ask_survey_question"
+          question_id: 1
+    transitions:
+      - trigger: "survey_answer:q1"
+        target: "SURVEY_Q2"
+
+  SURVEY_Q2:
+    type: "survey"
+    question: 2
+    suppress_fallback: true
+    entry:
+      steps:
+        - action: "ask_survey_question"
+          question_id: 2
+    transitions:
+      - trigger: "survey_answer:q2"
+        target: "SURVEY_Q3"
+
+  SURVEY_Q3:
+    type: "survey"
+    question: 3
+    suppress_fallback: true
+    entry:
+      steps:
+        - action: "ask_survey_question"
+          question_id: 3
+    transitions:
+      - trigger: "survey_answer:q3"
+        target: "SURVEY_Q4"
+
+  SURVEY_Q4:
+    type: "survey"
+    question: 4
+    suppress_fallback: true
+    entry:
+      steps:
+        - action: "ask_survey_question"
+          question_id: 4
+    transitions:
+      - trigger: "survey_answer:q4"
+        target: "SURVEY_Q5"
+
+  SURVEY_Q5:
+    type: "survey"
+    question: 5
+    suppress_fallback: true
+    entry:
+      steps:
+        - action: "ask_survey_question"
+          question_id: 5
+    transitions:
+      - trigger: "survey_complete"
+        target: "SEGMENT_SUMMARY"
+
+  SEGMENT_SUMMARY:
+    description: "LLM-сводка результатов анкеты."
+    entry:
+      steps:
+        - action: "calculate_segment"
+        - action: "send_llm_response"
+          prompt: "summarizer.txt"
+          context_from: "survey_results"
+    transitions:
+      - trigger: "segment_calculated"
+        target: "SEGMENT_ROUTER"
+
+  SEGMENT_ROUTER:
+    description: "Определение ветки по сегменту/скорингу."
+    transitions:
+      - trigger: "segment:cold"
+        target: "NEWBIE_PATH"
+      - trigger: "segment:warm"
+        target: "TRADER_PATH"
+      - trigger: "segment:hot"
+        target: "INVESTOR_PATH"
+      - trigger: "segment:escalate"
+        target: "SKEPTIC_RECOVERY"
+
+  NEWBIE_PATH:
+    description: "Ветка для cold сегмента."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "materials_selector.txt"
+          context:
+            segment: "cold"
+            stage: "education"
+        - action: "send_materials"
+          segment: "cold"
+          funnel_stage: "engaged"
+          limit: 3
+        - action: "send_llm_response"
+          prompt: "followups.txt"
+          context:
+            intent: "bonus_reminder"
+    transitions:
+      - trigger: "cta:consult"
+        target: "CONSULT_CTA"
+      - trigger: "cta:materials_more"
+        target: "NEWBIE_PATH"
+
+  TRADER_PATH:
+    description: "Ветка для warm сегмента."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "sales_spin_aida.txt"
+          context:
+            segment: "warm"
+            focus: "portfolio"
+        - action: "send_materials"
+          segment: "warm"
+          funnel_stage: "engaged"
+          limit: 3
+        - action: "send_llm_response"
+          prompt: "consult_offer.txt"
+          context:
+            urgency: "medium"
+    transitions:
+      - trigger: "cta:consult"
+        target: "CONSULT_CTA"
+      - trigger: "cta:objection"
+        target: "OBJECTION_LOOP"
+
+  OBJECTION_LOOP:
+    description: "Работа с возражениями."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "followups.txt"
+          context:
+            intent: "handle_objection"
+    transitions:
+      - trigger: "objection_resolved"
+        target: "CONSULT_CTA"
+      - trigger: "objection_unresolved"
+        target: "MANAGER_HOT_HANDOFF"
+
+  INVESTOR_PATH:
+    description: "Ветка для hot сегмента."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "consult_offer.txt"
+          context:
+            urgency: "high"
+            limited_slots: true
+        - action: "send_llm_response"
+          prompt: "payment_offer.txt"
+          context:
+            stage: "prepayment"
+    transitions:
+      - trigger: "cta:consult"
+        target: "CONSULT_CTA"
+      - trigger: "cta:payment"
+        target: "PAYMENT_PREP"
+
+  SKEPTIC_RECOVERY:
+    description: "Дополнительное прогревание для пользователей с возражениями."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "safety_policies.txt"
+          context:
+            intent: "trust_rebuild"
+        - action: "send_materials"
+          segment: "warm"
+          funnel_stage: "skeptic"
+          limit: 2
+    transitions:
+      - trigger: "cta:consult"
+        target: "CONSULT_CTA"
+      - trigger: "escalate_manager"
+        target: "MANAGER_HOT_HANDOFF"
+
+  CONSULT_CTA:
+    description: "Единая точка выхода к консультации/менеджеру/оплате."
+    entry:
+      steps:
+        - action: "send_message"
+          template: "Что делаем дальше?"
+          buttons:
+            - text: "🗓 Выбрать слот"
+              callback: "consult:schedule"
+            - text: "👤 Связаться с менеджером"
+              callback: "manager:request"
+            - text: "💳 Получить предложение"
+              callback: "offer:payment"
+    transitions:
+      - trigger: "callback:consult:schedule"
+        target: "CONSULT_SCHEDULER"
+      - trigger: "callback:manager:request"
+        target: "MANAGER_HOT_HANDOFF"
+      - trigger: "callback:offer:payment"
+        target: "PAYMENT_PREP"
+
+  CONSULT_SCHEDULER:
+    description: "Выбор даты и времени консультации."
+    entry:
+      steps:
+        - action: "propose_slots"
+          count_days: 2
+          slots: ["12:00", "14:00", "16:00", "18:00"]
+    transitions:
+      - trigger: "consult_slot_chosen"
+        target: "CONSULT_CONFIRMATION"
+      - trigger: "consult_slot_declined"
+        target: "FOLLOWUP_SEQUENCE"
+
+  CONSULT_CONFIRMATION:
+    description: "Подтверждение консультации и напоминания."
+    entry:
+      steps:
+        - action: "schedule_consultation"
+        - action: "log_event"
+          event_type: "consultation_booked"
+        - action: "schedule_reminder"
+          before_minutes: 15
+    transitions:
+      - trigger: "consultation_booked"
+        target: "FOLLOWUP_SEQUENCE"
+
+  MANAGER_HOT_HANDOFF:
+    description: "Создание лида и уведомление менеджеров."
+    entry:
+      steps:
+        - action: "create_lead"
+        - action: "post_manager_notification"
+          channel: "telegram"
+        - action: "log_event"
+          event_type: "lead_created"
+    transitions:
+      - trigger: "manager_claimed"
+        target: "FOLLOWUP_SEQUENCE"
+      - trigger: "lead_unclaimed"
+        target: "FOLLOWUP_SEQUENCE"
+
+  PAYMENT_PREP:
+    description: "Формирование предложения и сбор условий."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "payment_offer.txt"
+          context:
+            mode: "collect_terms"
+        - action: "collect_payment_preferences"
+    transitions:
+      - trigger: "payment_link_requested"
+        target: "PAYMENT_LINK"
+      - trigger: "payment_deferred"
+        target: "FOLLOWUP_SEQUENCE"
+
+  PAYMENT_LINK:
+    description: "Генерация и отправка ссылки на оплату."
+    entry:
+      steps:
+        - action: "generate_payment_link"
+        - action: "send_message"
+          template: "Ссылка на оплату готова, даю вам {link}."
+    transitions:
+      - trigger: "payment_status:paid"
+        target: "POST_PAYMENT_SUCCESS"
+      - trigger: "payment_status:failed"
+        target: "POST_PAYMENT_FAILURE"
+
+  POST_PAYMENT_SUCCESS:
+    description: "Сообщение об успешной оплате и дальнейшие шаги."
+    entry:
+      steps:
+        - action: "send_message"
+          template: "Оплата прошла успешно! Поздравляем, ближайшее письмо уже у вас на почте."
+        - action: "log_event"
+          event_type: "payment_success"
+        - action: "trigger_onboarding"
+    transitions:
+      - trigger: "onboarding_started"
+        target: "FOLLOWUP_SEQUENCE"
+
+  POST_PAYMENT_FAILURE:
+    description: "Напоминание и помощь при проблемах с оплатой."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "followups.txt"
+          context:
+            intent: "payment_failed"
+        - action: "log_event"
+          event_type: "payment_failed"
+    transitions:
+      - trigger: "cta:retry_payment"
+        target: "PAYMENT_LINK"
+      - trigger: "escalate_manager"
+        target: "MANAGER_HOT_HANDOFF"
+
+  FOLLOWUP_SEQUENCE:
+    description: "Дальнейшая работа с пользователем (drip, A/B тесты)."
+    entry:
+      steps:
+        - action: "schedule_followup"
+          cadence: "P2D"
+        - action: "enqueue_ab_test"
+          experiment: "retargeting_v1"
+    transitions:
+      - trigger: "followup_completed"
+        target: "RETARGETING"
+
+  RETARGETING:
+    description: "Автоматические прогревы и возврат в активную сцену."
+    entry:
+      steps:
+        - action: "send_llm_response"
+          prompt: "followups.txt"
+          context:
+            intent: "retarget"
+        - action: "evaluate_reengagement"
+    transitions:
+      - trigger: "user_reengaged"
+        target: "SEGMENT_ROUTER"
+      - trigger: "user_inactive"
+        target: "RETARGETING"

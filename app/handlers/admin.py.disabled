@@ -1,0 +1,339 @@
+"""Admin handlers with enhanced broadcast, A/B testing, and content management."""
+
+import logging
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+from aiogram import Router, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_, desc
+from sqlalchemy.orm import selectinload
+
+from ..db import get_db
+from ..models import (
+    User, Lead, Event, Payment, ABTest, ABVariant, ABResult, Broadcast, Material,
+    UserSegment, ABTestStatus, ABTestMetric, MaterialType, AdminRole
+)
+from ..repositories.broadcast_repository import BroadcastRepository, ABTestRepository
+from ..repositories.admin_repository import AdminRepository
+from ..repositories.product_repository import ProductRepository
+from ..services.materials_service import MaterialService
+from ..config import settings
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+# Admin user IDs from config
+ADMIN_IDS = settings.admin_ids_list
+
+class AdminStates(StatesGroup):
+    # Broadcast states
+    waiting_for_broadcast_text = State()
+    waiting_for_broadcast_segment = State()
+    waiting_for_broadcast_buttons = State()
+    
+    # A/B test states
+    waiting_for_ab_test_name = State()
+    waiting_for_ab_test_population = State()
+    waiting_for_ab_test_variant_a = State()
+    waiting_for_ab_test_variant_b = State()
+    waiting_for_ab_test_variant_a_buttons = State()
+    waiting_for_ab_test_variant_b_buttons = State()
+    
+    # Material states
+    waiting_for_material_title = State()
+    waiting_for_material_type = State()
+    waiting_for_material_content = State()
+    waiting_for_material_url = State()
+    waiting_for_material_tags = State()
+    waiting_for_material_segments = State()
+    
+    # Product states
+    waiting_for_product_name = State()
+    waiting_for_product_price = State()
+    waiting_for_product_description = State()
+    
+    # Lead management states
+    waiting_for_lead_response = State()
+
+def admin_required(func):
+    """Decorator to check if user is admin."""
+    async def wrapper(message_or_query, *args, **kwargs):
+        user_id = message_or_query.from_user.id
+        
+        # Get session from kwargs or create one
+        session = kwargs.get('session')
+        if not session:
+            async with get_db() as session:
+                admin_repo = AdminRepository(session)
+                is_admin = await admin_repo.is_admin(user_id)
+        else:
+            admin_repo = AdminRepository(session)
+            is_admin = await admin_repo.is_admin(user_id)
+            
+        if not is_admin:
+            if isinstance(message_or_query, Message):
+                await message_or_query.answer("❌ У вас нет прав администратора.")
+            else:
+                await message_or_query.answer("❌ У вас нет прав администратора.", show_alert=True)
+            return
+        return await func(message_or_query, *args, **kwargs)
+    return wrapper
+
+
+def role_required(required_role: AdminRole):
+    """Decorator to check if admin has required role."""
+    def decorator(func):
+        async def wrapper(message_or_query, *args, **kwargs):
+            user_id = message_or_query.from_user.id
+            
+            session = kwargs.get('session')
+            if not session:
+                async with get_db() as session:
+                    admin_repo = AdminRepository(session)
+                    has_permission = await admin_repo.has_permission(user_id, required_role)
+            else:
+                admin_repo = AdminRepository(session)
+                has_permission = await admin_repo.has_permission(user_id, required_role)
+                
+            if not has_permission:
+                if isinstance(message_or_query, Message):
+                    await message_or_query.answer(f"❌ Требуется роль: {required_role.value}")
+                else:
+                    await message_or_query.answer(f"❌ Требуется роль: {required_role.value}", show_alert=True)
+                return
+            return await func(message_or_query, *args, **kwargs)
+        return wrapper
+    return decorator
+
+@router.message(Command("admin"))
+@admin_required
+async def admin_panel(message: Message):
+    """Show enhanced admin panel."""
+    async with get_db() as session:
+        admin_repo = AdminRepository(session)
+        capabilities = await admin_repo.get_admin_capabilities(message.from_user.id)
+        
+        buttons = []
+        
+        # Analytics (all admins)
+        buttons.append([InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_analytics")])
+        
+        # Leads management (all admins)
+        buttons.append([InlineKeyboardButton(text="👥 Лиды", callback_data="admin_leads")])
+        
+        # Content management (editors and above)
+        if capabilities.get("can_manage_broadcasts"):
+            buttons.append([
+                InlineKeyboardButton(text="📢 Рассылки", callback_data="admin_broadcasts"),
+                InlineKeyboardButton(text="🧪 A/B тесты", callback_data="admin_ab_tests")
+            ])
+            buttons.append([
+                InlineKeyboardButton(text="📚 Материалы", callback_data="admin_materials"),
+                InlineKeyboardButton(text="💰 Продукты", callback_data="admin_products")
+            ])
+        
+        # User management (admins and above)
+        if capabilities.get("can_manage_users"):
+            buttons.append([InlineKeyboardButton(text="👤 Пользователи", callback_data="admin_users")])
+        
+        # Payment management (admins and above)
+        if capabilities.get("can_manage_payments"):
+            buttons.append([InlineKeyboardButton(text="💳 Платежи", callback_data="admin_payments")])
+        
+        # Admin management (owners only)
+        if capabilities.get("can_manage_admins"):
+            buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        
+        role = capabilities.get("role", "unknown")
+        
+        await message.answer(
+            f"🔧 <b>Панель администратора</b>\n\n"
+            f"👤 Ваша роль: <b>{role}</b>\n\n"
+            "Выберите нужный раздел:",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+@router.callback_query(F.data == "admin_stats")
+@admin_required
+async def show_stats(callback: CallbackQuery):
+    """Show system statistics."""
+    try:
+        async with get_db() as db:
+            # Users stats
+            total_users = await db.scalar(select(func.count(User.id)))
+            active_users = await db.scalar(
+                select(func.count(User.id)).where(
+                    User.last_activity > datetime.now() - timedelta(days=7)
+                )
+            )
+            
+            # Segment distribution
+            cold_users = await db.scalar(
+                select(func.count(User.id)).where(User.segment == "cold")
+            )
+            warm_users = await db.scalar(
+                select(func.count(User.id)).where(User.segment == "warm")
+            )
+            hot_users = await db.scalar(
+                select(func.count(User.id)).where(User.segment == "hot")
+            )
+            
+            # Leads stats
+            total_leads = await db.scalar(select(func.count(Lead.id)))
+            pending_leads = await db.scalar(
+                select(func.count(Lead.id)).where(Lead.status == "pending")
+            )
+            
+            # Payments stats
+            total_payments = await db.scalar(select(func.count(Payment.id)))
+            successful_payments = await db.scalar(
+                select(func.count(Payment.id)).where(Payment.status == "completed")
+            )
+            
+            # Revenue
+            total_revenue_result = await db.scalar(
+                select(func.sum(Payment.amount)).where(Payment.status == "completed")
+            )
+            total_revenue = total_revenue_result or 0
+            
+            stats_text = f"""
+📊 <b>Статистика системы</b>
+
+👥 <b>Пользователи:</b>
+• Всего: {total_users}
+• Активные за неделю: {active_users}
+
+🎯 <b>Сегменты:</b>
+• Холодные: {cold_users}
+• Теплые: {warm_users}
+• Горячие: {hot_users}
+
+🎯 <b>Лиды:</b>
+• Всего: {total_leads}
+• В обработке: {pending_leads}
+
+💳 <b>Платежи:</b>
+• Всего: {total_payments}
+• Успешные: {successful_payments}
+• Выручка: {total_revenue:,.2f} ₽
+"""
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+            ])
+            
+            await callback.message.edit_text(stats_text, reply_markup=keyboard, parse_mode="HTML")
+            
+    except Exception as e:
+        logger.error(f"Error showing stats: {e}")
+        await callback.answer("❌ Ошибка при загрузке статистики", show_alert=True)
+
+@router.callback_query(F.data == "admin_broadcast")
+@admin_required
+async def broadcast_menu(callback: CallbackQuery, state: FSMContext):
+    """Show broadcast menu."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Новая рассылка", callback_data="broadcast_new")],
+        [InlineKeyboardButton(text="📊 История рассылок", callback_data="broadcast_history")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+    ])
+    
+    await callback.message.edit_text(
+        "📢 <b>Управление рассылками</b>\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "broadcast_new")
+@admin_required
+async def new_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Start creating new broadcast."""
+    await state.set_state(AdminStates.waiting_for_broadcast_text)
+    await callback.message.edit_text(
+        "📝 <b>Новая рассылка</b>\n\n"
+        "Отправьте текст для рассылки:",
+        parse_mode="HTML"
+    )
+
+@router.message(AdminStates.waiting_for_broadcast_text)
+@admin_required
+async def process_broadcast_text(message: Message, state: FSMContext):
+    """Process broadcast text."""
+    broadcast_text = message.text
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Отправить всем", callback_data="broadcast_all")],
+        [InlineKeyboardButton(text="❄️ Холодным", callback_data="broadcast_cold")],
+        [InlineKeyboardButton(text="🔥 Теплым", callback_data="broadcast_warm")],
+        [InlineKeyboardButton(text="🔥 Горячим", callback_data="broadcast_hot")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast")]
+    ])
+    
+    await state.update_data(broadcast_text=broadcast_text)
+    await message.answer(
+        f"📝 <b>Превью сообщения:</b>\n\n{broadcast_text}\n\n"
+        "🎯 Кому отправить?",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("broadcast_"))
+@admin_required
+async def send_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Send broadcast to selected segment."""
+    action = callback.data.split("_")[1]
+    
+    if action in ["all", "cold", "warm", "hot"]:
+        data = await state.get_data()
+        broadcast_text = data.get("broadcast_text")
+        
+        if not broadcast_text:
+            await callback.answer("❌ Ошибка: текст не найден", show_alert=True)
+            return
+        
+        try:
+            broadcast_service = BroadcastService()
+            segment = None if action == "all" else action
+            
+            broadcast_id = await broadcast_service.create_broadcast(
+                text=broadcast_text,
+                segment=segment,
+                admin_id=callback.from_user.id
+            )
+            
+            await broadcast_service.send_broadcast(broadcast_id)
+            
+            await callback.message.edit_text(
+                f"✅ Рассылка запущена!\n\n"
+                f"🎯 Сегмент: {action}\n"
+                f"🆔 ID: {broadcast_id}",
+                parse_mode="HTML"
+            )
+            
+            await state.clear()
+            
+        except Exception as e:
+            logger.error(f"Error sending broadcast: {e}")
+            await callback.answer("❌ Ошибка при отправке рассылки", show_alert=True)
+
+@router.callback_query(F.data == "admin_back")
+@admin_required
+async def admin_back(callback: CallbackQuery, state: FSMContext):
+    """Go back to admin panel."""
+    await state.clear()
+    await admin_panel(callback)
+
+
+def register_handlers(dp):
+    """Register admin handlers."""
+    dp.include_router(router)
