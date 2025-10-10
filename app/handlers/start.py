@@ -1,7 +1,6 @@
 """Start command and welcome flow handlers."""
 
 import asyncio
-import os
 from typing import Optional
 
 import structlog
@@ -16,6 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.config import settings
 from app.handlers.survey import start_survey_via_message
 from app.models import User
+from app.services.bonus_content_manager import BonusContentManager
 from app.services.logging_service import ConversationLoggingService
 from app.services.priority_analysis_service import (ConfirmationIntent,
                                                     PriorityAnalysisService,
@@ -122,12 +122,12 @@ async def send_bonus_file(callback: CallbackQuery, **kwargs):
     try:
         await callback.answer("🎁 Отправляю ваш бонус...")
 
-        bonus_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'bonus', 'bonus.pdf'))
+        bonus_file_path, bonus_caption = BonusContentManager.load_published_bonus()
         document = FSInputFile(bonus_file_path)
 
         await callback.message.answer_document(
             document,
-            caption="Бонус текст"
+            caption=bonus_caption
         )
         logger.info("Bonus file sent", user_id=callback.from_user.id)
 

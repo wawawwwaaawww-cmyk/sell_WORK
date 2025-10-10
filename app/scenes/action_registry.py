@@ -292,7 +292,8 @@ async def _send_materials(context: ActionContext, params: Mapping[str, Any]) -> 
 
 
 async def _offer_options(context: ActionContext, params: Mapping[str, Any]) -> ActionOutcome:
-    template = str(params.get("template", "Выберите дальнейшее действие:"))
+    template_param = params.get("template")
+    template = str(template_param) if template_param is not None else None
     raw_buttons = params.get("buttons") or []
     buttons: List[Dict[str, str]] = []
     for button in raw_buttons:

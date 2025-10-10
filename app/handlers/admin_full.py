@@ -4,14 +4,21 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from html import escape
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -37,6 +44,7 @@ from ..services.analytics_formatter import (
     format_report_for_telegram,
     format_broadcast_metrics,
 )
+from ..services.bonus_content_manager import BonusContentManager
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -57,52 +65,61 @@ class AdminStates(StatesGroup):
     waiting_for_product_edit_price = State()
     waiting_for_product_edit_description = State()
 
+    # Bonus management states
+    waiting_for_bonus_file = State()
+    waiting_for_bonus_description = State()
+
 
 
 
 def admin_required(func):
     """Decorator to check if user is admin."""
+
+    @wraps(func)
     async def wrapper(message_or_query, *args, **kwargs):
         user_id = message_or_query.from_user.id
-        
+
         async for session in get_db():
             admin_repo = AdminRepository(session)
             is_admin = await admin_repo.is_admin(user_id)
             break
-            
+
         if not is_admin:
             if isinstance(message_or_query, Message):
                 await message_or_query.answer("❌ У вас нет прав администратора.")
             else:
                 await message_or_query.answer("❌ У вас нет прав администратора.", show_alert=True)
             return
-        
-        # Filter out problematic kwargs passed by middleware
-        return await func(message_or_query, *args)
+
+        return await func(message_or_query, *args, **kwargs)
+
     return wrapper
 
 
 def role_required(required_role: AdminRole):
     """Decorator to check if admin has required role."""
+
     def decorator(func):
+        @wraps(func)
         async def wrapper(message_or_query, *args, **kwargs):
             user_id = message_or_query.from_user.id
-            
+
             async for session in get_db():
                 admin_repo = AdminRepository(session)
                 has_permission = await admin_repo.has_permission(user_id, required_role)
                 break
-                
+
             if not has_permission:
                 if isinstance(message_or_query, Message):
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}")
                 else:
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}", show_alert=True)
                 return
-            
-            # Filter out problematic kwargs passed by middleware
-            return await func(message_or_query, *args)
+
+            return await func(message_or_query, *args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -307,15 +324,17 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
     return text, builder.as_markup()
 @router.message(Command("admin"))
 @admin_required
-async def admin_panel(message: Message):
-    """Show full admin panel."""
+async def admin_panel(message_or_query: Union[Message, CallbackQuery]):
+    """Show full admin panel for command or callback invocations."""
+    user_id = message_or_query.from_user.id
+
     async for session in get_db():
         admin_repo = AdminRepository(session)
-        capabilities = await admin_repo.get_admin_capabilities(message.from_user.id)
+        capabilities = await admin_repo.get_admin_capabilities(user_id)
         break
-        
+
     buttons = []
-    
+
     # Analytics (all admins)
     buttons.append([InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_analytics")])
 
@@ -324,10 +343,11 @@ async def admin_panel(message: Message):
 
     # Leads management (all admins)
     buttons.append([InlineKeyboardButton(text="👥 Лиды", callback_data="admin_leads")])
-    
+
     # Broadcast management (editors and above)
     if capabilities.get("can_manage_broadcasts"):
         buttons.append([InlineKeyboardButton(text="📢 Рассылки", callback_data="admin_broadcasts")])
+        buttons.append([InlineKeyboardButton(text="🎁 Бонус", callback_data="admin_bonus")])
 
     # Materials management (editors and above)
     if capabilities.get("can_manage_materials"):
@@ -344,22 +364,44 @@ async def admin_panel(message: Message):
     # Product management (admins and above)
     if capabilities.get("can_manage_products"):
         buttons.append([InlineKeyboardButton(text="💰 Продукты", callback_data="admin_products")])
-    
+
     # Admin management (owners only)
     if capabilities.get("can_manage_admins"):
         buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
-    
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    role = capabilities.get("role", "unknown")
-    
-    await message.answer(
-        f"🔧 <b>Панель администратора</b>\n\n"
-        f"👤 Ваша роль: <b>{role}</b>\n\n"
-        "Выберите нужный раздел:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
+
+    role_value = capabilities.get("role") or "unknown"
+    role_display = str(role_value).upper()
+
+    panel_text = (
+        "🔧 <b>Панель администратора</b>\n\n"
+        f"👤 Ваша роль: <b>{role_display}</b>\n\n"
+        "Выберите нужный раздел:"
     )
+
+    if isinstance(message_or_query, CallbackQuery):
+        target_message = message_or_query.message
+        if target_message:
+            await target_message.edit_text(
+                panel_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        else:
+            await message_or_query.bot.send_message(
+                chat_id=message_or_query.from_user.id,
+                text=panel_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        await message_or_query.answer()
+    else:
+        await message_or_query.answer(
+            panel_text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
 
 
 @router.message(Command("dashboard"))
@@ -1188,6 +1230,23 @@ async def broadcast_text_received(message: Message, state: FSMContext):
     )
 
 
+@router.callback_query(F.data == "broadcast_history")
+@role_required(AdminRole.EDITOR)
+async def broadcast_history_stub(callback: CallbackQuery):
+    """Stub for broadcast history until implemented."""
+    logger.info("Admin %s opened broadcast history stub", callback.from_user.id)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_broadcasts")],
+        ]
+    )
+    await callback.message.edit_text(
+        "Функция не настроена",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("broadcast_"))
 @role_required(AdminRole.EDITOR)
 async def broadcast_send(callback: CallbackQuery, state: FSMContext):
@@ -1258,6 +1317,215 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Error sending broadcast: {e}")
         await callback.answer("❌ Ошибка при отправке рассылки", show_alert=True)
         await state.clear()
+
+
+# Bonus Management
+@router.callback_query(F.data == "admin_bonus")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_menu(callback: CallbackQuery, state: FSMContext):
+    """Entry point for managing bonus materials."""
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Начать", callback_data="admin_bonus_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "🎁 <b>Бонусный материал</b>\n\nЗдесь Вы можете изменить бонус-файл и описание",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    logger.info("Admin %s opened bonus management", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_start")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_start(callback: CallbackQuery, state: FSMContext):
+    """Ask admin to upload a new bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await state.update_data(pending_bonus_file=None, pending_bonus_caption=None)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s started bonus file upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_bonus_file)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_file_received(message: Message, state: FSMContext):
+    """Handle bonus file upload from admin."""
+    document = message.document
+    if not document:
+        await message.answer("Пожалуйста, отправьте файл в формате PDF.")
+        logger.warning("Admin %s sent non-document while bonus file awaited", message.from_user.id)
+        return
+
+    filename = (document.file_name or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        await message.answer("Поддерживаются только PDF-файлы. Отправьте корректный файл.")
+        logger.warning("Admin %s attempted non-pdf bonus file %s", message.from_user.id, filename)
+        return
+
+    target_path = BonusContentManager.target_path(filename)
+    try:
+        await message.bot.download(document, destination=target_path)
+    except Exception as exc:  # pragma: no cover - network/filesystem guard
+        logger.exception(
+            "Failed to store bonus file %s for admin %s: %s",
+            filename,
+            message.from_user.id,
+            exc,
+        )
+        await message.answer("❌ Не удалось сохранить файл. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    existing_caption = data.get("pending_bonus_caption")
+
+    await state.update_data(pending_bonus_file=filename)
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+
+    if existing_caption:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        ])
+        await message.answer(
+            "Файл сохранён. Можно открыть «Предпросмотр» или отправить новое описание.",
+            reply_markup=keyboard,
+        )
+        logger.info(
+            "Admin %s replaced bonus file at %s keeping caption length=%d",
+            message.from_user.id,
+            target_path,
+            len(existing_caption),
+        )
+    else:
+        await message.answer("Файл сохранён. Напишите описание для этого файла, которое увидят пользователи.")
+        logger.info("Admin %s uploaded new bonus file saved to %s", message.from_user.id, target_path)
+
+
+@router.message(AdminStates.waiting_for_bonus_description)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_description_received(message: Message, state: FSMContext):
+    """Store bonus description text provided by admin."""
+    caption = (message.text or "").strip()
+    if not caption:
+        await message.answer("Описание не может быть пустым. Введите текст ещё раз.")
+        logger.warning("Admin %s submitted empty bonus description", message.from_user.id)
+        return
+
+    await state.update_data(pending_bonus_caption=caption)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await message.answer(
+        "Описание сохранено. Нажмите «Предпросмотр», чтобы увидеть файл так, как его получат пользователи.",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s provided bonus description length=%d", message.from_user.id, len(caption))
+
+
+@router.callback_query(F.data == "admin_bonus_preview")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_preview(callback: CallbackQuery, state: FSMContext):
+    """Send preview of the new bonus file with caption."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Сначала загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s requested bonus preview without data", callback.from_user.id)
+        return
+
+    file_path = BonusContentManager.ensure_storage() / filename
+    if not file_path.exists():
+        await callback.answer("Файл не найден. Загрузите его снова.", show_alert=True)
+        logger.warning("Admin %s preview missing file at %s", callback.from_user.id, file_path)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сохранить и опубликовать", callback_data="admin_bonus_publish")],
+        [InlineKeyboardButton(text="Редактировать файл", callback_data="admin_bonus_edit_file")],
+        [InlineKeyboardButton(text="Редактировать подпись", callback_data="admin_bonus_edit_caption")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+
+    await callback.message.answer_document(
+        FSInputFile(file_path),
+        caption=caption,
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s previewed bonus content file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_file")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_file(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to re-upload bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await callback.message.answer(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+    )
+    logger.info("Admin %s requested bonus file re-upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_caption")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_caption(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to update bonus caption."""
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+    await callback.message.answer("Напишите описание для этого файла, которое увидят пользователи.")
+    logger.info("Admin %s requested bonus caption re-edit", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_publish")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_publish(callback: CallbackQuery, state: FSMContext):
+    """Persist bonus changes and publish them for users."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Нет данных для сохранения. Загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s attempted to publish bonus without data", callback.from_user.id)
+        return
+
+    BonusContentManager.persist_metadata(filename, caption)
+    await state.clear()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        [InlineKeyboardButton(text="🎁 Настроить снова", callback_data="admin_bonus")],
+    ])
+
+    await callback.message.answer(
+        "✅ Новый бонус сохранён и будет показан пользователям.",
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s published bonus file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer("Готово!")
 
 
 # Leads Management
@@ -1352,13 +1620,25 @@ async def users_management(callback: CallbackQuery):
         [InlineKeyboardButton(text="👥 Последние регистрации", callback_data="users_recent")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
     ])
-    
+
     await callback.message.edit_text(
         "👤 <b>Управление пользователями</b>\n\n"
         "Выберите действие:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+
+
+@router.callback_query(F.data == "users_search")
+@role_required(AdminRole.ADMIN)
+async def users_search(callback: CallbackQuery):
+    """Placeholder for user search functionality."""
+    logger.info(
+        "users_search callback triggered by user_id=%s - feature not configured",
+        callback.from_user.id,
+    )
+    await callback.answer()
+    await callback.message.answer("Функция не настроена")
 
 
 @router.callback_query(F.data == "users_stats")
@@ -1637,11 +1917,13 @@ async def admins_list(callback: CallbackQuery):
     try:
         async for session in get_db():
             from app.models import Admin
-            
-            stmt = select(Admin, User.first_name, User.last_name, User.username).join(
-                User, Admin.user_id == User.id
-            ).order_by(Admin.role, Admin.created_at)
-            
+
+            stmt = (
+                select(Admin, User.first_name, User.last_name, User.username)
+                .outerjoin(User, Admin.telegram_id == User.telegram_id)
+                .order_by(Admin.role, Admin.created_at)
+            )
+
             result = await session.execute(stmt)
             admins_data = result.all()
             break
@@ -1659,11 +1941,19 @@ async def admins_list(callback: CallbackQuery):
             }
             
             for i, (admin, first_name, last_name, username) in enumerate(admins_data, 1):
-                name = f"{first_name or ''} {last_name or ''}" or f"@{username}" or f"ID {admin.user_id}"
-                role_emoji = role_emojis.get(admin.role.value, "👤")
+                full_name = " ".join(part for part in [first_name, last_name] if part)
+                name = full_name.strip() if full_name else ""
+                if not name and username:
+                    name = f"@{username}"
+                if not name:
+                    name = f"ID {admin.telegram_id}"
+
+                role_value = admin.role.value if isinstance(admin.role, AdminRole) else str(admin.role)
+                role_label = role_value.upper()
+                role_emoji = role_emojis.get(role_label, "👤")
                 created = admin.created_at.strftime('%d.%m.%Y')
-                
-                text += f"{i}. {role_emoji} {admin.role.value}\n"
+
+                text += f"{i}. {role_emoji} {role_label}\n"
                 text += f"   👤 {name}\n"
                 text += f"   📅 С {created}\n\n"
         
@@ -1732,58 +2022,69 @@ async def add_admin_command(message: Message):
             )
             return
         
-        user_id = int(parts[1])
-        role_str = parts[2].upper()
-        
-        # Validate role
-        valid_roles = ["OWNER", "ADMIN", "EDITOR", "VIEWER"]
-        if role_str not in valid_roles:
+        telegram_id = int(parts[1])
+        requested_role = parts[2].strip().upper()
+
+        role_map = {
+            "OWNER": AdminRole.OWNER,
+            "ADMIN": AdminRole.ADMIN,
+            "EDITOR": AdminRole.EDITOR,
+            "MANAGER": AdminRole.MANAGER,
+            "VIEWER": AdminRole.MANAGER,
+        }
+
+        if requested_role not in role_map:
             await message.answer(
-                f"❌ <b>Неверная роль: {role_str}</b>\n\n"
-                f"🔹 Доступные роли: {', '.join(valid_roles)}",
+                f"❌ <b>Неверная роль: {requested_role}</b>\n\n"
+                f"🔹 Доступные роли: {', '.join(role_map.keys())}",
                 parse_mode="HTML"
             )
             return
-        
+
+        role_enum = role_map[requested_role]
+
+        user = None
         async for session in get_db():
             admin_repo = AdminRepository(session)
-            
-            # Check if user exists
-            user_stmt = select(User).where(User.id == user_id)
+
+            user_stmt = select(User).where(User.telegram_id == telegram_id)
             user_result = await session.execute(user_stmt)
             user = user_result.scalar_one_or_none()
-            
+
             if not user:
-                await message.answer(f"❌ Пользователь с ID {user_id} не найден")
+                await message.answer(f"❌ Пользователь с ID {telegram_id} не найден")
                 return
-            
-            # Check if already admin
-            existing_admin = await admin_repo.get_admin_by_user_id(user_id)
+
+            existing_admin = await admin_repo.get_admin_by_user_id(telegram_id)
             if existing_admin:
+                existing_role = existing_admin.role.value if isinstance(existing_admin.role, AdminRole) else str(existing_admin.role)
                 await message.answer(
-                    f"⚠️ Пользователь уже является администратором с ролью: {existing_admin.role.value}"
+                    f"⚠️ Пользователь уже является администратором с ролью: {existing_role.upper()}"
                 )
                 return
-            
-            # Add admin
-            role_enum = AdminRole(role_str)
-            new_admin = await admin_repo.create_admin(user_id, role_enum)
-            
+
+            await admin_repo.create_admin(telegram_id, role_enum)
+
             await session.commit()
             break
-        
-        name = f"{user.first_name or ''} {user.last_name or ''}" or f"@{user.username}" or f"ID {user_id}"
-        
+
+        name_candidates = [
+            " ".join(part for part in [user.first_name, user.last_name] if part) if user else "",
+            f"@{user.username}" if user and user.username else "",
+            f"ID {telegram_id}",
+        ]
+        name = next((candidate for candidate in name_candidates if candidate), f"ID {telegram_id}")
+
         await message.answer(
             f"✅ <b>Администратор добавлен!</b>\n\n"
             f"👤 Пользователь: {name}\n"
-            f"🎯 Роль: {role_str}\n"
+            f"🎯 Роль: {requested_role}\n"
             f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
             parse_mode="HTML"
         )
-        
+
     except ValueError:
-        await message.answer("❌ User ID должен быть числом")
+        await message.answer("❌ Telegram ID должен быть числом")
     except Exception as e:
         logger.error(f"Error adding admin: {e}")
         await message.answer("❌ Ошибка при добавлении администратора")
@@ -1803,33 +2104,38 @@ async def remove_admin_command(message: Message):
             )
             return
         
-        user_id = int(parts[1])
-        
+        telegram_id = int(parts[1])
+
         # Prevent self-removal
-        if user_id == message.from_user.id:
+        if telegram_id == message.from_user.id:
             await message.answer("❌ Нельзя удалить самого себя из администраторов")
             return
-        
+
         async for session in get_db():
             admin_repo = AdminRepository(session)
-            
+
             # Check if admin exists
-            admin = await admin_repo.get_admin_by_user_id(user_id)
+            admin = await admin_repo.get_admin_by_user_id(telegram_id)
             if not admin:
-                await message.answer(f"❌ Пользователь с ID {user_id} не является администратором")
+                await message.answer(f"❌ Пользователь с ID {telegram_id} не является администратором")
                 return
-            
+
             # Get user info for confirmation
-            user_stmt = select(User).where(User.id == user_id)
+            user_stmt = select(User).where(User.telegram_id == telegram_id)
             user_result = await session.execute(user_stmt)
             user = user_result.scalar_one_or_none()
-            
+
             # Remove admin
-            await admin_repo.remove_admin(user_id)
+            await admin_repo.remove_admin(telegram_id)
             await session.commit()
             break
-        
-        name = f"{user.first_name or ''} {user.last_name or ''}" if user else f"ID {user_id}"
+
+        name_candidates = [
+            " ".join(part for part in [user.first_name, user.last_name] if part) if user else "",
+            f"@{user.username}" if user and user.username else "",
+            f"ID {telegram_id}",
+        ]
+        name = next((candidate for candidate in name_candidates if candidate), f"ID {telegram_id}")
         
         await message.answer(
             f"✅ <b>Администратор удален!</b>\n\n"
@@ -1839,7 +2145,7 @@ async def remove_admin_command(message: Message):
         )
         
     except ValueError:
-        await message.answer("❌ User ID должен быть числом")
+        await message.answer("❌ Telegram ID должен быть числом")
     except Exception as e:
         logger.error(f"Error removing admin: {e}")
         await message.answer("❌ Ошибка при удалении администратора")
