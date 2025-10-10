@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 
 import structlog
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.models import User, FunnelStage
@@ -399,3 +399,86 @@ async def handle_llm_interaction(callback: CallbackQuery, user: User, **kwargs):
 def register_handlers(dp):
     """Register survey handlers."""
     dp.include_router(router)
+
+
+async def start_survey_via_message(
+    message: Message,
+    *,
+    session,
+    user: User,
+    user_service: UserService,
+) -> bool:
+    """Start the survey flow using a regular text message as an entry point."""
+
+    logger.info(
+        "survey_start_via_message_called",
+        user_id=getattr(user, "id", None),
+    )
+
+    conversation_logger = ConversationLoggingService(session) if session else None
+    try:
+        await user_service.advance_funnel_stage(user, FunnelStage.SURVEYED)
+
+        event_service = EventService(session)
+        await event_service.log_event(
+            user_id=user.id,
+            event_type="survey_started",
+            payload={"entry": "message"},
+        )
+
+        survey_service = SurveyService(session)
+        await survey_service.clear_user_answers(user.id)
+
+        question = await survey_service.get_question("q1")
+        if not question:
+            logger.error("survey_start_via_message_no_question", user_id=user.id)
+            await message.answer("Ошибка загрузки вопросов")
+            return False
+
+        keyboard = InlineKeyboardBuilder()
+        for answer_code, option in question["options"].items():
+            keyboard.add(InlineKeyboardButton(
+                text=option["text"],
+                callback_data=f"survey:q1:{answer_code}"
+            ))
+        keyboard.adjust(1)
+
+        question_text = question["text"].strip()
+        sections = ["📋 **Анкета для подбора программы**"]
+
+        if question_text:
+            sections.append(question_text)
+
+        sections.append("*Вопрос 1 из 5*")
+
+        survey_text = "\n\n".join(sections)
+
+        if conversation_logger:
+            await conversation_logger.send_or_edit(
+                message,
+                text=survey_text,
+                user_id=user.id,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="Markdown",
+                metadata={"context": "survey_start", "question": "q1", "entry": "message"},
+                prefer_edit=False,
+            )
+        else:
+            await message.answer(
+                survey_text,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="Markdown",
+            )
+
+        logger.info("survey_start_via_message_completed", user_id=user.id)
+        return True
+
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error(
+            "survey_start_via_message_error",
+            user_id=getattr(user, "id", None),
+            error=str(exc),
+            exc_info=True,
+        )
+        await message.answer("Произошла ошибка при запуске анкеты")
+        return False
