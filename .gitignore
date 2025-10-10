@@ -1,2 +1,14 @@
 .env
 .venv/
+
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Testing
+.pytest_cache/
+
+# Logs
+bot.log
+logs/
