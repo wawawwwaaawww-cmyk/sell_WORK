@@ -93,11 +93,15 @@ async def start_survey(callback: CallbackQuery, user: User, user_service: UserSe
             ))
         keyboard.adjust(1)
         
-        survey_text = (
-            "📋 Давайте заполним анкету для подбора программы\n\n"
-            f"{question['text']}\n\n"
-            "Вопрос 1/5"
-        )
+        question_text = question["text"].strip()
+        sections = ["📋 **Анкета для подбора программы**"]
+
+        if question_text:
+            sections.append(question_text)
+
+        sections.append("*Вопрос 1 из 5*")
+
+        survey_text = "\n\n".join(sections)
         
         await _render_survey_step(
             callback,
@@ -193,11 +197,25 @@ async def show_next_question(
         ))
     keyboard.adjust(1)
     
-    survey_text = (
-        f"{confirmation}\n\n"
-        f"{question['text']}\n\n"
-        f"Вопрос {question_num}/5"
-    )
+    confirmation_text = confirmation.strip()
+    question_text = question["text"].strip()
+    sections = []
+
+    if confirmation_text:
+        sections.append(confirmation_text)
+
+    normalized_confirmation = " ".join(confirmation_text.split()) if confirmation_text else ""
+    normalized_question = " ".join(question_text.split()) if question_text else ""
+    includes_question = bool(normalized_question) and normalized_question in normalized_confirmation
+
+    if question_text and not includes_question:
+        sections.append(question_text)
+
+    question_marker = f"*Вопрос {question_num} из 5*"
+    if question_marker not in confirmation_text:
+        sections.append(question_marker)
+
+    survey_text = "\n\n".join(sections)
     
     await _render_survey_step(
         callback,
