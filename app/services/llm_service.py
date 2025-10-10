@@ -28,6 +28,10 @@ class LLMContext:
     relevant_products: List[Dict[str, Any]] = None
     funnel_stage: str = "new"
     scenario_prompt: Optional[str] = None
+    active_function: Optional[str] = None
+    recent_messages: Optional[List[Dict[str, Any]]] = None
+    conversation_pairs: Optional[List[Dict[str, str]]] = None
+    product_focus: Optional[Dict[str, Any]] = None
 
 
 @dataclass 
@@ -115,6 +119,7 @@ class LLMService:
         # Load system prompts
         self.system_prompt = prompt_loader.get_system_prompt()
         self.safety_policies = prompt_loader.get_safety_policies()
+        self.sales_methodology = prompt_loader.get_sales_methodology()
     
     async def generate_response(self, context: LLMContext) -> LLMResponse:
         """Generate LLM response with safety and policy validation."""
@@ -344,10 +349,19 @@ class LLMService:
         user = context.user
         
         # User profile
+        knowledge_level_map = {
+            UserSegment.COLD: "новичок",
+            UserSegment.WARM: "продвинутый",
+            UserSegment.HOT: "эксперт",
+        }
+
+        knowledge_level = knowledge_level_map.get(user.segment, "не определён")
+
         profile_info = f"""
 ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ:
 - Имя: {user.first_name or 'Не указано'} {user.last_name or ''}
 - Сегмент: {user.segment or 'не определен'} ({user.lead_score} баллов)
+- Уровень знаний: {knowledge_level}
 - Этап воронки: {user.funnel_stage}
 - Телефон: {'указан' if user.phone else 'не указан'}
 - Email: {'указан' if user.email else 'не указан'}
@@ -376,13 +390,52 @@ class LLMService:
         if context.scenario_prompt:
             scenario_block = f"\nСЦЕНАРНЫЕ УКАЗАНИЯ:\n{context.scenario_prompt}\n"
 
+        recent_messages_block = ""
+        if context.recent_messages:
+            formatted = []
+            for msg in context.recent_messages:
+                role = msg.get("role")
+                text = msg.get("text", "").replace("\n", " ")
+                timestamp = msg.get("timestamp") or msg.get("created_at")
+                if hasattr(timestamp, "isoformat"):
+                    timestamp = timestamp.isoformat()
+                formatted.append(f"- {role}: {text[:400]} ({timestamp})")
+            recent_messages_block = "\nПОСЛЕДНИЕ 5 СООБЩЕНИЙ:\n" + "\n".join(formatted)
+
+        qa_block = ""
+        if context.conversation_pairs:
+            pairs = []
+            for idx, pair in enumerate(context.conversation_pairs, start=1):
+                user_q = pair.get("user", "").replace("\n", " ")
+                bot_a = pair.get("bot", "").replace("\n", " ")
+                pairs.append(f"{idx}. Вопрос: {user_q[:400]}\n   Ответ: {bot_a[:400]}")
+            qa_block = "\nИСТОРИЯ Q/A:\n" + "\n".join(pairs)
+
+        active_function_block = ""
+        if context.active_function:
+            active_function_block = f"\nАКТИВНАЯ ФУНКЦИЯ БОТА: {context.active_function}"
+
+        product_focus_block = ""
+        if context.product_focus:
+            product = context.product_focus
+            product_focus_block = (
+                "\nТЕКУЩИЙ ПРОДУКТ К ПРОДАЖЕ: "
+                f"{product.get('name', 'Без названия')} — цена {product.get('price', 'N/A')}"
+                f". Описание: {product.get('description', '')[:400]}"
+            )
+
         return f"""
 {self.system_prompt}{scenario_block}
 {profile_info}
 {survey_info}
 {materials_info}
 {products_info}
+{recent_messages_block}
+{qa_block}
+{active_function_block}
+{product_focus_block}
 
+ПРОДАЖНАЯ МЕТОДОЛОГИЯ: {self.sales_methodology}
 ПОЛИТИКИ БЕЗОПАСНОСТИ: {self.safety_policies}
 
 ЗАДАЧА: Твой ответ ДОЛЖЕН быть в формате JSON со следующими полями: "reply_text" (string), "buttons" (list of dicts with "text" and "callback"), "next_action" (string), "confidence" (float).

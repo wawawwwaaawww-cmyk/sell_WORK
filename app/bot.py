@@ -25,6 +25,7 @@ from app.handlers import (
     leads,
     product_handlers,
     user_settings,
+    dialog,
 )
 
 logger = structlog.get_logger()
@@ -58,6 +59,7 @@ materials.register_handlers(dp)
 leads.register_handlers(dp)
 product_handlers.register_product_handlers(dp)
 user_settings.register_handlers(dp)
+dp.include_router(dialog.router)
 
 
 async def set_bot_commands() -> None:

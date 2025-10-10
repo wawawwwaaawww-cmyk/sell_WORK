@@ -20,7 +20,7 @@ class Settings:
         
         # LLM
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-        self.llm_model: str = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
+        self.llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
         
         # Security
         self.secret_key: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
