@@ -154,7 +154,15 @@ class BaseScene(ABC):
         
         # Get conversation history (last 10 messages)
         messages_history = await self._get_conversation_history(user)
-        
+
+        if message_text:
+            messages_history.append({
+                "role": "user",
+                "text": message_text,
+                "created_at": datetime.utcnow().isoformat(),
+                "meta": {"source": "live_input"}
+            })
+
         # Get relevant materials
         materials = await self.materials_service.get_materials_for_segment(
             segment=user.segment or "cold",

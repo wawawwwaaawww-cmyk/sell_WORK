@@ -79,7 +79,7 @@ class PriorityAnalysisService:
                         "content": normalized,
                     },
                 ],
-                max_completion_tokens=120,
+                max_tokens=120,
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else ""
@@ -148,7 +148,7 @@ class PriorityAnalysisService:
                     },
                     {"role": "user", "content": normalized},
                 ],
-                max_completion_tokens=120,
+                max_tokens=120,
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response.choices else ""
