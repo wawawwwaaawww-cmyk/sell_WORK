@@ -145,8 +145,7 @@ states:
     description: "Подготовка к анкете."
     entry:
       steps:
-        - action: "send_message"
-          template: "Отвечай честно, это поможет подобрать программу."
+        - action: "offer_options"
           buttons:
             - text: "Начать"
               callback: "survey:start"
