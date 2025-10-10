@@ -93,11 +93,11 @@ async def start_survey(callback: CallbackQuery, user: User, user_service: UserSe
             ))
         keyboard.adjust(1)
         
-        survey_text = f"""📋 **Анкета для подбора программы**
-
-{question["text"]}
-
-*Вопрос 1 из 5*"""
+        survey_text = (
+            "📋 Давайте заполним анкету для подбора программы\n\n"
+            f"{question['text']}\n\n"
+            "Вопрос 1/5"
+        )
         
         await _render_survey_step(
             callback,
@@ -193,11 +193,11 @@ async def show_next_question(
         ))
     keyboard.adjust(1)
     
-    survey_text = f"""{confirmation}
-
-{question["text"]}
-
-*Вопрос {question_num} из 5*"""
+    survey_text = (
+        f"{confirmation}\n\n"
+        f"{question['text']}\n\n"
+        f"Вопрос {question_num}/5"
+    )
     
     await _render_survey_step(
         callback,
@@ -250,7 +250,7 @@ async def complete_survey(
 {summary["profile_summary"]}
 
 🎯 **Категория:** {summary["segment_description"]}
-📈 **Балл готовности:** {summary["total_score"]}/15
+📈 **Балл готовности:** {summary["total_score"]}/13
 
 💡 *На основе твоих ответов я подберу оптимальную программу обучения!*
 
