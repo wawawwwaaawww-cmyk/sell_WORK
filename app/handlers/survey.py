@@ -332,7 +332,8 @@ async def handle_llm_interaction(callback: CallbackQuery, user: User, **kwargs):
         await callback.answer()
 
         session = kwargs.get("session")
-        action = callback.data.split(":", 1)
+        action_parts = callback.data.split(":", 1)
+        action = action_parts[1] if len(action_parts) > 1 else ""
         
         # Get survey summary for LLM context
         survey_service = SurveyService(session)
@@ -357,8 +358,18 @@ async def handle_llm_interaction(callback: CallbackQuery, user: User, **kwargs):
             })
         elif action == "ask_questions":
             context.messages_history.append({
-                "role": "user", 
+                "role": "user",
                 "text": "У меня есть вопросы о криптовалютах"
+            })
+        elif action:
+            context.messages_history.append({
+                "role": "user",
+                "text": f"Мне нужен ответ по действию: {action}",
+            })
+        else:
+            context.messages_history.append({
+                "role": "user",
+                "text": "Подскажи, какие следующие шаги ты рекомендуешь",
             })
         
         response = await llm_service.generate_response(context)

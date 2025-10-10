@@ -186,7 +186,7 @@ class LLMService:
         kwargs: Dict[str, Any] = {
             "model": model_to_use,
             "messages": messages,
-            "max_completion_tokens": max_tokens,
+            "max_tokens": max_tokens,
         }
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
@@ -219,6 +219,73 @@ class LLMService:
                     expect_json=expect_json,
                 )
             raise
+
+    def _use_responses_api(self) -> bool:
+        """Determine whether to call the Responses API instead of Chat Completions."""
+        model_name = settings.openai_model or ""
+        use_responses = model_name.startswith(("o", "gpt-4.1"))
+        self.logger.debug(
+            "llm_responses_api_check",
+            model=model_name,
+            use_responses=use_responses,
+        )
+        return use_responses
+
+    def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert chat-completion style messages to Responses API input format."""
+        formatted: List[Dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            formatted.append(
+                {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": str(content),
+                        }
+                    ],
+                }
+            )
+
+        self.logger.debug(
+            "llm_responses_input_prepared",
+            items=len(formatted),
+        )
+        return formatted
+
+    def _extract_responses_content(self, response: Any) -> str:
+        """Extract plain text content from Responses API result."""
+        if response is None:
+            self.logger.debug("llm_responses_content_absent")
+            return ""
+
+        if hasattr(response, "output_text") and response.output_text:
+            text_value = str(response.output_text)
+            self.logger.debug(
+                "llm_responses_content_extracted",
+                via="output_text",
+                length=len(text_value),
+            )
+            return text_value
+
+        chunks = []
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "output_text":
+                chunks.append(str(getattr(item, "text", "")))
+                continue
+            for content_item in getattr(item, "content", []) or []:
+                if isinstance(content_item, dict) and content_item.get("type") == "output_text":
+                    chunks.append(str(content_item.get("text", "")))
+
+        extracted = "".join(chunks)
+        self.logger.debug(
+            "llm_responses_content_extracted",
+            via="output",
+            length=len(extracted),
+        )
+        return extracted
 
     def _sanitize_json_string(self, raw: str) -> Optional[str]:
         """Normalize raw LLM output before JSON parsing."""
