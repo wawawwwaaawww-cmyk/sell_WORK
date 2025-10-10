@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from html import escape
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -11,7 +12,13 @@ from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -37,6 +44,7 @@ from ..services.analytics_formatter import (
     format_report_for_telegram,
     format_broadcast_metrics,
 )
+from ..services.bonus_content_manager import BonusContentManager
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -57,52 +65,61 @@ class AdminStates(StatesGroup):
     waiting_for_product_edit_price = State()
     waiting_for_product_edit_description = State()
 
+    # Bonus management states
+    waiting_for_bonus_file = State()
+    waiting_for_bonus_description = State()
+
 
 
 
 def admin_required(func):
     """Decorator to check if user is admin."""
+
+    @wraps(func)
     async def wrapper(message_or_query, *args, **kwargs):
         user_id = message_or_query.from_user.id
-        
+
         async for session in get_db():
             admin_repo = AdminRepository(session)
             is_admin = await admin_repo.is_admin(user_id)
             break
-            
+
         if not is_admin:
             if isinstance(message_or_query, Message):
                 await message_or_query.answer("❌ У вас нет прав администратора.")
             else:
                 await message_or_query.answer("❌ У вас нет прав администратора.", show_alert=True)
             return
-        
-        # Filter out problematic kwargs passed by middleware
-        return await func(message_or_query, *args)
+
+        return await func(message_or_query, *args, **kwargs)
+
     return wrapper
 
 
 def role_required(required_role: AdminRole):
     """Decorator to check if admin has required role."""
+
     def decorator(func):
+        @wraps(func)
         async def wrapper(message_or_query, *args, **kwargs):
             user_id = message_or_query.from_user.id
-            
+
             async for session in get_db():
                 admin_repo = AdminRepository(session)
                 has_permission = await admin_repo.has_permission(user_id, required_role)
                 break
-                
+
             if not has_permission:
                 if isinstance(message_or_query, Message):
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}")
                 else:
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}", show_alert=True)
                 return
-            
-            # Filter out problematic kwargs passed by middleware
-            return await func(message_or_query, *args)
+
+            return await func(message_or_query, *args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -328,6 +345,7 @@ async def admin_panel(message: Message):
     # Broadcast management (editors and above)
     if capabilities.get("can_manage_broadcasts"):
         buttons.append([InlineKeyboardButton(text="📢 Рассылки", callback_data="admin_broadcasts")])
+        buttons.append([InlineKeyboardButton(text="🎁 Бонус", callback_data="admin_bonus")])
 
     # Materials management (editors and above)
     if capabilities.get("can_manage_materials"):
@@ -1260,6 +1278,215 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext):
         await state.clear()
 
 
+# Bonus Management
+@router.callback_query(F.data == "admin_bonus")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_menu(callback: CallbackQuery, state: FSMContext):
+    """Entry point for managing bonus materials."""
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Начать", callback_data="admin_bonus_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "🎁 <b>Бонусный материал</b>\n\nЗдесь Вы можете изменить бонус-файл и описание",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    logger.info("Admin %s opened bonus management", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_start")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_start(callback: CallbackQuery, state: FSMContext):
+    """Ask admin to upload a new bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await state.update_data(pending_bonus_file=None, pending_bonus_caption=None)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s started bonus file upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_bonus_file)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_file_received(message: Message, state: FSMContext):
+    """Handle bonus file upload from admin."""
+    document = message.document
+    if not document:
+        await message.answer("Пожалуйста, отправьте файл в формате PDF.")
+        logger.warning("Admin %s sent non-document while bonus file awaited", message.from_user.id)
+        return
+
+    filename = (document.file_name or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        await message.answer("Поддерживаются только PDF-файлы. Отправьте корректный файл.")
+        logger.warning("Admin %s attempted non-pdf bonus file %s", message.from_user.id, filename)
+        return
+
+    target_path = BonusContentManager.target_path(filename)
+    try:
+        await message.bot.download(document, destination=target_path)
+    except Exception as exc:  # pragma: no cover - network/filesystem guard
+        logger.exception(
+            "Failed to store bonus file %s for admin %s: %s",
+            filename,
+            message.from_user.id,
+            exc,
+        )
+        await message.answer("❌ Не удалось сохранить файл. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    existing_caption = data.get("pending_bonus_caption")
+
+    await state.update_data(pending_bonus_file=filename)
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+
+    if existing_caption:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        ])
+        await message.answer(
+            "Файл сохранён. Можно открыть «Предпросмотр» или отправить новое описание.",
+            reply_markup=keyboard,
+        )
+        logger.info(
+            "Admin %s replaced bonus file at %s keeping caption length=%d",
+            message.from_user.id,
+            target_path,
+            len(existing_caption),
+        )
+    else:
+        await message.answer("Файл сохранён. Напишите описание для этого файла, которое увидят пользователи.")
+        logger.info("Admin %s uploaded new bonus file saved to %s", message.from_user.id, target_path)
+
+
+@router.message(AdminStates.waiting_for_bonus_description)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_description_received(message: Message, state: FSMContext):
+    """Store bonus description text provided by admin."""
+    caption = (message.text or "").strip()
+    if not caption:
+        await message.answer("Описание не может быть пустым. Введите текст ещё раз.")
+        logger.warning("Admin %s submitted empty bonus description", message.from_user.id)
+        return
+
+    await state.update_data(pending_bonus_caption=caption)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await message.answer(
+        "Описание сохранено. Нажмите «Предпросмотр», чтобы увидеть файл так, как его получат пользователи.",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s provided bonus description length=%d", message.from_user.id, len(caption))
+
+
+@router.callback_query(F.data == "admin_bonus_preview")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_preview(callback: CallbackQuery, state: FSMContext):
+    """Send preview of the new bonus file with caption."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Сначала загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s requested bonus preview without data", callback.from_user.id)
+        return
+
+    file_path = BonusContentManager.ensure_storage() / filename
+    if not file_path.exists():
+        await callback.answer("Файл не найден. Загрузите его снова.", show_alert=True)
+        logger.warning("Admin %s preview missing file at %s", callback.from_user.id, file_path)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сохранить и опубликовать", callback_data="admin_bonus_publish")],
+        [InlineKeyboardButton(text="Редактировать файл", callback_data="admin_bonus_edit_file")],
+        [InlineKeyboardButton(text="Редактировать подпись", callback_data="admin_bonus_edit_caption")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+
+    await callback.message.answer_document(
+        FSInputFile(file_path),
+        caption=caption,
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s previewed bonus content file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_file")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_file(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to re-upload bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await callback.message.answer(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+    )
+    logger.info("Admin %s requested bonus file re-upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_caption")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_caption(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to update bonus caption."""
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+    await callback.message.answer("Напишите описание для этого файла, которое увидят пользователи.")
+    logger.info("Admin %s requested bonus caption re-edit", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_publish")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_publish(callback: CallbackQuery, state: FSMContext):
+    """Persist bonus changes and publish them for users."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Нет данных для сохранения. Загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s attempted to publish bonus without data", callback.from_user.id)
+        return
+
+    BonusContentManager.persist_metadata(filename, caption)
+    await state.clear()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        [InlineKeyboardButton(text="🎁 Настроить снова", callback_data="admin_bonus")],
+    ])
+
+    await callback.message.answer(
+        "✅ Новый бонус сохранён и будет показан пользователям.",
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s published bonus file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer("Готово!")
+
+
 # Leads Management
 @router.callback_query(F.data == "admin_leads")
 @admin_required
@@ -1352,13 +1579,25 @@ async def users_management(callback: CallbackQuery):
         [InlineKeyboardButton(text="👥 Последние регистрации", callback_data="users_recent")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
     ])
-    
+
     await callback.message.edit_text(
         "👤 <b>Управление пользователями</b>\n\n"
         "Выберите действие:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+
+
+@router.callback_query(F.data == "users_search")
+@role_required(AdminRole.ADMIN)
+async def users_search(callback: CallbackQuery):
+    """Placeholder for user search functionality."""
+    logger.info(
+        "users_search callback triggered by user_id=%s - feature not configured",
+        callback.from_user.id,
+    )
+    await callback.answer()
+    await callback.message.answer("Функция не настроена")
 
 
 @router.callback_query(F.data == "users_stats")
