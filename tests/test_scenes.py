@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime
 
 from app.scenes.base_scene import BaseScene, SceneState, SceneResponse
+from app.services.llm_service import LLMResponse
 from app.scenes.scene_manager import SceneManager
 from app.scenes.newbie_scene import NewbieScene
 from app.models import User, UserSegment, FunnelStage
@@ -87,10 +88,53 @@ class TestBaseScene:
     def test_should_escalate_max_attempts(self, mock_session, test_user, scene_state):
         """Test escalation trigger by max attempts."""
         scene = NewbieScene(mock_session)
-        
+
         scene_state.attempts_count = 5  # Greater than max_attempts (3)
-        
+
         assert scene.should_escalate(test_user, "обычное сообщение", scene_state) == True
+
+    @pytest.mark.asyncio
+    async def test_process_message_success_no_fallback(self, mock_session, test_user, scene_state):
+        """Process message should return LLM response without fallback when service succeeds."""
+
+        class DummyScene(BaseScene):
+            async def apply_scene_policy(self, user, llm_response, state):
+                return llm_response
+
+            async def determine_next_scene(self, user, llm_response, state):
+                return None
+
+            def get_scene_prompts(self):
+                return {}
+
+        scene = DummyScene(mock_session)
+
+        llm_response = LLMResponse(
+            reply_text="Тестовый ответ",
+            buttons=[{"text": "OK", "callback_data": "ok"}],
+            next_action="continue",
+            confidence=0.85,
+            safety_issues=[],
+            is_safe=True,
+        )
+
+        scene.llm_service = MagicMock()
+        scene.llm_service.generate_response = AsyncMock(return_value=llm_response)
+        scene.materials_service.get_materials_for_segment = AsyncMock(return_value=[])
+        scene.payment_service.get_suitable_products = AsyncMock(return_value=[])
+        scene._get_conversation_history = AsyncMock(return_value=[])
+        scene._get_survey_summary = AsyncMock(return_value=None)
+        scene._log_interaction = AsyncMock()
+        scene._create_fallback_response = AsyncMock()
+
+        response = await scene.process_message(test_user, "Привет", scene_state)
+
+        assert response.message_text == "Тестовый ответ"
+        assert response.escalate is False
+        assert response.log_event["action"] == "continue"
+        assert scene_state.confidence_history == [0.85]
+        scene.llm_service.generate_response.assert_awaited_once()
+        assert scene._create_fallback_response.await_count == 0
 
 
 class TestSceneManager:
