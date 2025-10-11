@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Dict, Any, Tuple
 import asyncio
+import logging
 
 import structlog
 from aiogram import Bot
@@ -26,14 +27,16 @@ class BroadcastRepository:
         title: str,
         body: str,
         buttons: Optional[Dict[str, Any]] = None,
-        segment_filter: Optional[Dict[str, Any]] = None
+        segment_filter: Optional[Dict[str, Any]] = None,
+        content: Optional[List[Dict[str, Any]]] = None,
     ) -> Broadcast:
         """Create a new broadcast."""
         broadcast = Broadcast(
             title=title,
             body=body,
             buttons=buttons,
-            segment_filter=segment_filter
+            segment_filter=segment_filter,
+            content=content,
         )
         
         self.session.add(broadcast)
@@ -64,28 +67,31 @@ class BroadcastService:
         self.repository = BroadcastRepository(session)
         self.ab_testing_service = ABTestingService(session)
         self.logger = structlog.get_logger()
+        self.file_logger = logging.getLogger("seller_krypto")
     
     async def create_simple_broadcast(
         self,
         title: str,
         body: str,
         segment_filter: Optional[Dict[str, Any]] = None,
-        buttons: Optional[List[Dict[str, str]]] = None
+        buttons: Optional[List[Dict[str, str]]] = None,
+        content: Optional[List[Dict[str, Any]]] = None,
     ) -> Broadcast:
         """Create a simple broadcast (no A/B testing)."""
-        
+
         # Convert buttons to format for storage
         buttons_data = None
         if buttons:
             buttons_data = {"buttons": buttons}
-        
+
         broadcast = await self.repository.create_broadcast(
             title=title,
             body=body,
             buttons=buttons_data,
-            segment_filter=segment_filter
+            segment_filter=segment_filter,
+            content=content,
         )
-        
+
         return broadcast
     
     async def create_ab_broadcast(
@@ -140,32 +146,132 @@ class BroadcastService:
             
             # Prepare message
             keyboard = self._build_keyboard(broadcast.buttons)
-            
+
             sent_count = 0
             failed_count = 0
-            
+
             # Send messages
             for user in users:
+                user_failed = False
                 try:
-                    await self.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=broadcast.body,
-                        reply_markup=keyboard,
-                        parse_mode="Markdown"
-                    )
-                    sent_count += 1
-                    
-                    # Delay to avoid rate limits
-                    if delay_between_messages > 0:
-                        await asyncio.sleep(delay_between_messages)
-                        
+                    if broadcast.content:
+                        for index, item in enumerate(broadcast.content):
+                            item_type = item.get("type")
+                            try:
+                                if item_type == "text":
+                                    await self.bot.send_message(
+                                        chat_id=user.telegram_id,
+                                        text=item.get("text", ""),
+                                        parse_mode=item.get("parse_mode"),
+                                        reply_markup=keyboard if index == 0 else None,
+                                    )
+                                elif item_type == "photo":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "photo": item.get("file_id"),
+                                    }
+                                    if item.get("caption"):
+                                        kwargs["caption"] = item.get("caption")
+                                        kwargs["parse_mode"] = item.get("parse_mode")
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_photo(**kwargs)
+                                elif item_type == "video":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "video": item.get("file_id"),
+                                    }
+                                    if item.get("caption"):
+                                        kwargs["caption"] = item.get("caption")
+                                        kwargs["parse_mode"] = item.get("parse_mode")
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_video(**kwargs)
+                                elif item_type == "document":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "document": item.get("file_id"),
+                                    }
+                                    if item.get("caption"):
+                                        kwargs["caption"] = item.get("caption")
+                                        kwargs["parse_mode"] = item.get("parse_mode")
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_document(**kwargs)
+                                elif item_type == "audio":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "audio": item.get("file_id"),
+                                    }
+                                    if item.get("caption"):
+                                        kwargs["caption"] = item.get("caption")
+                                        kwargs["parse_mode"] = item.get("parse_mode")
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_audio(**kwargs)
+                                elif item_type == "voice":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "voice": item.get("file_id"),
+                                    }
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_voice(**kwargs)
+                                else:
+                                    self.logger.warning(
+                                        "Unsupported broadcast content item",
+                                        item_type=item_type,
+                                        user_id=user.id,
+                                    )
+                                    self.file_logger.warning(
+                                        "broadcast.send.unsupported_item user_id=%s item_type=%s",
+                                        user.telegram_id,
+                                        item_type,
+                                    )
+                            except Exception as item_exc:
+                                user_failed = True
+                                self.logger.warning(
+                                    "Failed to send broadcast content item",
+                                    user_id=user.id,
+                                    item_type=item_type,
+                                    error=str(item_exc),
+                                )
+                                self.file_logger.warning(
+                                    "broadcast.send.item_failed user_id=%s item_type=%s error=%s",
+                                    user.telegram_id,
+                                    item_type,
+                                    item_exc,
+                                )
+                                break
+                    else:
+                        await self.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=broadcast.body,
+                            reply_markup=keyboard,
+                            parse_mode="Markdown",
+                        )
+
                 except Exception as e:
+                    user_failed = True
                     self.logger.warning(
                         "Failed to send broadcast message",
                         user_id=user.id,
                         error=str(e)
                     )
+                    self.file_logger.warning(
+                        "broadcast.send.user_failed user_id=%s error=%s",
+                        user.telegram_id,
+                        e,
+                    )
+
+                if user_failed:
                     failed_count += 1
+                else:
+                    sent_count += 1
+
+                # Delay to avoid rate limits
+                if delay_between_messages > 0:
+                    await asyncio.sleep(delay_between_messages)
             
             self.logger.info(
                 "Simple broadcast completed",

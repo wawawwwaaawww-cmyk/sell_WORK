@@ -14,6 +14,7 @@ from sqlalchemy import select
 async def test_send_simple_broadcast(db_session):
     """BroadcastService.send_simple_broadcast рассылает сообщение всем пользователям."""
     bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock()
     service = BroadcastService(bot_mock, db_session)
 
     user1 = User(telegram_id=101, segment=UserSegment.COLD, first_name="Test")
@@ -36,6 +37,52 @@ async def test_send_simple_broadcast(db_session):
         text="*Тестовая рассылка*",
         reply_markup=ANY,
         parse_mode="Markdown",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_simple_broadcast_with_rich_content(db_session):
+    """BroadcastService корректно рассылает текст и вложения из content."""
+    bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock()
+    bot_mock.send_photo = AsyncMock()
+    service = BroadcastService(bot_mock, db_session)
+
+    user = User(telegram_id=303, segment=UserSegment.HOT, first_name="Rich")
+    db_session.add(user)
+    await db_session.flush()
+
+    content = [
+        {"type": "text", "text": "<b>Важная новость</b>", "parse_mode": "HTML"},
+        {
+            "type": "photo",
+            "file_id": "photo123",
+            "caption": "<i>Посмотрите вложение</i>",
+            "parse_mode": "HTML",
+        },
+    ]
+
+    broadcast = await service.create_simple_broadcast(
+        title="Rich",
+        body="",
+        content=content,
+        buttons=[{"text": "Подробнее", "callback_data": "cta:open"}],
+    )
+
+    result = await service.send_simple_broadcast(broadcast.id, delay_between_messages=0)
+
+    assert result == {"sent": 1, "failed": 0, "total": 1}
+    bot_mock.send_message.assert_awaited_once_with(
+        chat_id=303,
+        text="<b>Важная новость</b>",
+        parse_mode="HTML",
+        reply_markup=ANY,
+    )
+    bot_mock.send_photo.assert_awaited_once_with(
+        chat_id=303,
+        photo="photo123",
+        caption="<i>Посмотрите вложение</i>",
+        parse_mode="HTML",
     )
 
 
