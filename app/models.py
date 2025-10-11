@@ -480,12 +480,13 @@ class MaterialMetric(Base):
 class Broadcast(Base):
     """Broadcast model."""
     __tablename__ = "broadcasts"
-    
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     buttons: Mapped[Optional[dict]] = mapped_column(JSON)
     segment_filter: Mapped[Optional[dict]] = mapped_column(JSON)
+    content: Mapped[Optional[list]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
