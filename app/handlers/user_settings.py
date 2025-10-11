@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.models import User
+from app.services.logging_service import ConversationLoggingService
 from app.services.user_service import UserService
 from app.utils.callbacks import Callbacks
 
@@ -18,6 +19,9 @@ logger = structlog.get_logger()
 @router.message(Command("reset"))
 async def handle_reset_command(message: Message, user: User, **kwargs) -> None:
     """Ask the user to confirm wiping their stored data."""
+    session = kwargs.get("session")
+    conversation_logger = ConversationLoggingService(session) if session else None
+
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="Delete my data",
@@ -35,7 +39,26 @@ async def handle_reset_command(message: Message, user: User, **kwargs) -> None:
         "You can start fresh with /start afterwards."
     )
 
-    await message.answer(prompt, reply_markup=builder.as_markup())
+    if conversation_logger:
+        await conversation_logger.log_user_message(
+            user_id=user.id,
+            text=message.text or "/reset",
+            bot=message.bot,
+            user=user,
+            telegram_user=message.from_user,
+            metadata={"source": "command"},
+            source_message=message,
+        )
+        await conversation_logger.send_or_edit(
+            message,
+            text=prompt,
+            user_id=user.id,
+            user=user,
+            reply_markup=builder.as_markup(),
+            prefer_edit=False,
+        )
+    else:
+        await message.answer(prompt, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data == Callbacks.USER_RESET_CANCEL)

@@ -93,6 +93,16 @@ async def start_command(message: Message, **kwargs):
             last_name=message.from_user.last_name,
         )
 
+        conversation_logger = ConversationLoggingService(session)
+        await conversation_logger.log_user_message(
+            user_id=user.id,
+            text=message.text or "/start",
+            bot=message.bot,
+            user=user,
+            telegram_user=message.from_user,
+            source_message=message,
+        )
+
         welcome_text = """👋 Привет!
 Добро пожаловать в чат школы Азата Валеева 🎉
 Здесь ты найдёшь полезные материалы, подарки и специальные предложения.
@@ -103,10 +113,18 @@ async def start_command(message: Message, **kwargs):
             text="Получить бонус",
             callback_data="bonus:get_file"
         ))
+        keyboard.add(InlineKeyboardButton(
+            text="Оставить заявку",
+            callback_data=Callbacks.APPLICATION_START
+        ))
 
-        await message.answer(
-            welcome_text,
-            reply_markup=keyboard.as_markup()
+        await conversation_logger.send_or_edit(
+            message,
+            text=welcome_text,
+            user_id=user.id,
+            user=user,
+            reply_markup=keyboard.as_markup(),
+            prefer_edit=False,
         )
 
         logger.info("Start command processed, bonus offered", user_id=user.id)
@@ -172,8 +190,19 @@ async def handle_bonus_followup_no(
     """Handle the 'No' response to the bonus follow-up."""
 
     session = kwargs.get("session")
+    user_service = UserService(session) if session else None
+    target_user = user
+
+    if target_user is None and user_service and callback.from_user:
+        target_user = await user_service.get_or_create_user(
+            telegram_id=callback.from_user.id,
+            username=callback.from_user.username,
+            first_name=callback.from_user.first_name,
+            last_name=callback.from_user.last_name,
+        )
+
     conversation_logger = ConversationLoggingService(session) if session else None
-    user_id = getattr(user, "id", None) or getattr(callback.from_user, "id", None)
+    user_id = getattr(target_user, "id", None) or getattr(callback.from_user, "id", None)
 
     try:
         await callback.answer()
@@ -190,6 +219,7 @@ async def handle_bonus_followup_no(
                 message,
                 text=response_text,
                 user_id=user_id,
+                user=target_user,
                 prefer_edit=True,
             )
         elif message is not None:
@@ -240,6 +270,10 @@ async def handle_strategy_priority_choice(
         await conversation_logger.log_user_message(
             user_id=user_id,
             text=message.text or "",
+            bot=message.bot,
+            user=target_user,
+            telegram_user=message.from_user,
+            source_message=message,
         )
 
     logger.info(
@@ -261,6 +295,7 @@ async def handle_strategy_priority_choice(
                 message,
                 text=RELIABILITY_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 prefer_edit=False,
             )
         else:
@@ -279,6 +314,7 @@ async def handle_strategy_priority_choice(
                 message,
                 text=GROWTH_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 prefer_edit=False,
             )
         else:
@@ -296,6 +332,7 @@ async def handle_strategy_priority_choice(
             message,
             text=CLARIFICATION_MESSAGE,
             user_id=user_id,
+            user=target_user,
             prefer_edit=False,
         )
     else:
@@ -335,6 +372,10 @@ async def handle_reliability_confirmation(
         await conversation_logger.log_user_message(
             user_id=user_id,
             text=message.text or "",
+            bot=message.bot,
+            user=target_user,
+            telegram_user=message.from_user,
+            source_message=message,
         )
 
     logger.info(
@@ -354,7 +395,7 @@ async def handle_reliability_confirmation(
         builder = InlineKeyboardBuilder()
         builder.add(InlineKeyboardButton(
             text="📝 Заполнить заявку",
-            callback_data=Callbacks.MANAGER_REQUEST,
+            callback_data=Callbacks.APPLICATION_START,
         ))
 
         if conversation_logger and user_id:
@@ -362,6 +403,7 @@ async def handle_reliability_confirmation(
                 message,
                 text=APPLICATION_PROMPT_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 reply_markup=builder.as_markup(),
                 prefer_edit=False,
             )
@@ -385,6 +427,7 @@ async def handle_reliability_confirmation(
                 message,
                 text=RELIABILITY_DECLINE_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 prefer_edit=False,
             )
         else:
@@ -402,6 +445,7 @@ async def handle_reliability_confirmation(
             message,
             text=CONFIRMATION_CLARIFICATION_MESSAGE,
             user_id=user_id,
+            user=target_user,
             prefer_edit=False,
         )
     else:
@@ -441,6 +485,10 @@ async def handle_growth_confirmation(
         await conversation_logger.log_user_message(
             user_id=user_id,
             text=message.text or "",
+            bot=message.bot,
+            user=target_user,
+            telegram_user=message.from_user,
+            source_message=message,
         )
 
     logger.info(
@@ -460,7 +508,7 @@ async def handle_growth_confirmation(
         builder = InlineKeyboardBuilder()
         builder.add(InlineKeyboardButton(
             text="📝 Заполнить заявку",
-            callback_data=Callbacks.MANAGER_REQUEST,
+            callback_data=Callbacks.APPLICATION_START,
         ))
 
         if conversation_logger and user_id:
@@ -468,6 +516,7 @@ async def handle_growth_confirmation(
                 message,
                 text=APPLICATION_PROMPT_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 reply_markup=builder.as_markup(),
                 prefer_edit=False,
             )
@@ -491,6 +540,7 @@ async def handle_growth_confirmation(
                 message,
                 text=GROWTH_DECLINE_MESSAGE,
                 user_id=user_id,
+                user=target_user,
                 prefer_edit=False,
             )
         else:
@@ -516,6 +566,7 @@ async def handle_growth_confirmation(
             message,
             text=CONFIRMATION_CLARIFICATION_MESSAGE,
             user_id=user_id,
+            user=target_user,
             prefer_edit=False,
         )
     else:

@@ -8,7 +8,9 @@ from functools import wraps
 from html import escape
 from typing import List, Optional, Dict, Any, Tuple
 from collections import Counter
+from zoneinfo import ZoneInfo
 
+import structlog
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -21,6 +23,7 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
@@ -46,10 +49,12 @@ from ..services.analytics_formatter import (
     format_broadcast_metrics,
 )
 from ..services.bonus_content_manager import BonusContentManager
+from ..services.scheduler_service import scheduler_service
 
 logger = logging.getLogger(__name__)
-seller_logger = logging.getLogger("seller_krypto")
+seller_logger = structlog.get_logger("seller_krypto")
 router = Router()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 class AdminStates(StatesGroup):
@@ -57,6 +62,7 @@ class AdminStates(StatesGroup):
     # Broadcast states
     waiting_for_broadcast_content = State()
     waiting_for_broadcast_segment = State()
+    waiting_for_broadcast_schedule = State()
     waiting_for_broadcast_confirmation = State()
     
     # Product states
@@ -157,26 +163,29 @@ def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
 
     items: List[Dict[str, Any]] = []
 
-    if message.text:
-        text_html = message.html_text or message.text
-        plain_text = message.text
+    plain_text = message.text or ""
+    text_html = getattr(message, "html_text", None)
+
+    if plain_text:
         items.append(
             {
                 "type": "text",
-                "text": text_html,
+                "text": text_html or plain_text,
                 "plain_text": plain_text,
-                "parse_mode": "HTML",
+                "parse_mode": "HTML" if text_html else None,
             }
         )
         seller_logger.info(
             "broadcast.extract.item",
             message_id=message.message_id,
             item_type="text",
-            length=len(text_html),
+            length=len(text_html or plain_text),
         )
 
-    caption_html = message.html_caption if message.caption else None
-    caption_plain = message.caption
+    caption_plain = message.caption or ""
+    caption_html = getattr(message, "html_caption", None)
+    parse_mode = "HTML" if caption_html else None
+    caption_text = caption_html or caption_plain or None
 
     if message.photo:
         file_id = message.photo[-1].file_id
@@ -184,9 +193,9 @@ def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
             {
                 "type": "photo",
                 "file_id": file_id,
-                "caption": caption_html,
-                "plain_caption": caption_plain,
-                "parse_mode": "HTML" if caption_html else None,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
             }
         )
         seller_logger.info(
@@ -202,9 +211,9 @@ def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
             {
                 "type": "video",
                 "file_id": file_id,
-                "caption": caption_html,
-                "plain_caption": caption_plain,
-                "parse_mode": "HTML" if caption_html else None,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
             }
         )
         seller_logger.info(
@@ -220,9 +229,9 @@ def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
             {
                 "type": "document",
                 "file_id": file_id,
-                "caption": caption_html,
-                "plain_caption": caption_plain,
-                "parse_mode": "HTML" if caption_html else None,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
                 "file_name": message.document.file_name,
             }
         )
@@ -239,9 +248,9 @@ def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
             {
                 "type": "audio",
                 "file_id": file_id,
-                "caption": caption_html,
-                "plain_caption": caption_plain,
-                "parse_mode": "HTML" if caption_html else None,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
             }
         )
         seller_logger.info(
@@ -1400,20 +1409,25 @@ async def broadcast_management(callback: CallbackQuery):
 async def broadcast_create(callback: CallbackQuery, state: FSMContext):
     """Start creating new broadcast."""
     await state.set_state(AdminStates.waiting_for_broadcast_content)
-    await state.update_data(broadcast_items=[], selected_segment=None)
+    await state.update_data(
+        broadcast_items=[],
+        selected_segment=None,
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
+    )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Выбрать аудиторию", callback_data="broadcast_choose_segment")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
         ]
     )
 
     await callback.message.edit_text(
         "📝 <b>Новая рассылка</b>\n\n"
-        "Шаг 1/3: отправьте одно или несколько сообщений, которые должны попасть в рассылку.\n\n"
+        "Шаг 1/4: отправьте одно или несколько сообщений, которые должны попасть в рассылку.\n\n"
         "Можно прикреплять текст, изображения, видео, документы, аудио и голосовые сообщения — в любом количестве."
-        " После добавления всех материалов нажмите «➡️ Выбрать аудиторию».",
+        " Когда добавите все материалы, появится кнопка «➡️ Выбрать аудиторию».",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -1444,7 +1458,7 @@ async def broadcast_content_received(message: Message, state: FSMContext):
     data = await state.get_data()
     items: List[Dict[str, Any]] = data.get("broadcast_items", [])
     items.extend(new_items)
-    await state.update_data(broadcast_items=items)
+    summary_message_id = data.get("broadcast_summary_message_id")
 
     counts = Counter(item.get("type") for item in items)
     summary_parts = [
@@ -1453,10 +1467,75 @@ async def broadcast_content_received(message: Message, state: FSMContext):
     ]
     summary = ", ".join(summary_parts)
 
-    await message.answer(
-        "✅ Материал добавлен в рассылку.\n"
-        f"Сейчас элементов: {len(items)}."
-        + (f"\n📎 Состав: {summary}" if summary else ""),
+    preview_text = next(
+        (
+            (item.get("plain_text") or "").strip()
+            for item in items
+            if item.get("type") == "text" and item.get("plain_text")
+        ),
+        "",
+    )
+    if not preview_text:
+        preview_text = next(
+            (
+                (item.get("plain_caption") or "").strip()
+                for item in items
+                if item.get("plain_caption")
+            ),
+            "",
+        )
+
+    preview_display = (preview_text or "—").strip() or "—"
+    if len(preview_display) > 200:
+        preview_display = preview_display[:200] + "..."
+
+    summary_text = (
+        "✅ <b>Материалы для рассылки обновлены</b>\n"
+        f"Сейчас элементов: {len(items)}.\n"
+    )
+    if summary:
+        summary_text += f"📎 Состав: {summary}\n"
+    summary_text += (
+        f"📝 Предпросмотр текста: {escape(preview_display)}\n\n"
+        "Когда закончите добавлять материалы, нажмите «➡️ Выбрать аудиторию»."
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Выбрать аудиторию", callback_data="broadcast_choose_segment")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    summary_message = None
+    if summary_message_id:
+        try:
+            await message.bot.edit_message_text(
+                summary_text,
+                chat_id=message.chat.id,
+                message_id=summary_message_id,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            summary_message = await message.answer(
+                summary_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+    if summary_message is None and not summary_message_id:
+        summary_message = await message.answer(
+            summary_text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    if summary_message:
+        summary_message_id = summary_message.message_id
+
+    await state.update_data(
+        broadcast_items=items,
+        broadcast_summary_message_id=summary_message_id,
     )
     seller_logger.info(
         "broadcast.content.stored",
@@ -1480,6 +1559,12 @@ async def broadcast_choose_segment(callback: CallbackQuery, state: FSMContext):
             reason="no_items",
         )
         return
+
+    await state.update_data(
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
+    )
 
     counts = Counter(item.get("type") for item in items)
     summary_parts = [f"{label}: {count}" for label, count in counts.items()]
@@ -1522,7 +1607,7 @@ async def broadcast_choose_segment(callback: CallbackQuery, state: FSMContext):
         "📦 <b>Материалы собраны</b>\n\n"
         f"📝 Предпросмотр текста: {escape(preview_text)}\n"
         + (f"📎 Вложения: {summary}\n\n" if summary else "\n")
-        + "🎯 <b>Шаг 2/3:</b> Выберите целевую аудиторию:",
+        + "🎯 <b>Шаг 2/4:</b> Выберите целевую аудиторию:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -1552,60 +1637,32 @@ async def broadcast_segment_selected(callback: CallbackQuery, state: FSMContext)
             await state.set_state(AdminStates.waiting_for_broadcast_content)
             return
 
-        await state.update_data(selected_segment=segment)
-        await state.set_state(AdminStates.waiting_for_broadcast_confirmation)
-
-        await callback.message.edit_text(
-            "📋 Формируем предпросмотр…",
-            parse_mode="HTML",
+        items = list(items)
+        await state.update_data(
+            broadcast_items=items,
+            selected_segment=segment,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
         )
-
-        try:
-            await _send_preview_items(callback.bot, callback.message.chat.id, items)
-        except Exception:
-            await callback.message.answer(
-                "❌ Не удалось показать предпросмотр. Попробуйте ещё раз или измените материалы.",
-                parse_mode="HTML",
-            )
-            await state.set_state(AdminStates.waiting_for_broadcast_content)
-            await state.update_data(selected_segment=None)
-            await callback.answer()
-            return
-
-        counts = Counter(item.get("type") for item in items)
-        summary_parts = [f"{label}: {count}" for label, count in counts.items()]
-        summary = ", ".join(summary_parts)
-
-        segment_names = {
-            "all": "👥 Все пользователи",
-            "cold": "❄️ Холодные",
-            "warm": "🔥 Тёплые",
-            "hot": "🌶️ Горячие",
-        }
-
-        summary_message = (
-            "📋 <b>Предпросмотр готов</b>\n\n"
-            f"🎯 Аудитория: {segment_names.get(segment, segment)}"
-        )
-        if summary:
-            summary_message += f"\n📎 Материалы: {summary}"
+        await state.set_state(AdminStates.waiting_for_broadcast_schedule)
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast_confirm_send")],
-                [InlineKeyboardButton(text="✏️ Редактировать", callback_data="broadcast_edit")],
+                [InlineKeyboardButton(text="⬅️ Изменить аудиторию", callback_data="broadcast_choose_segment")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
             ]
         )
 
         await callback.message.edit_text(
-            summary_message + "\n\nОтправить рассылку?",
+            "🗓 <b>Планирование рассылки</b>\n\n"
+            "Шаг 3/4: отправьте дату и время публикации в формате <code>01.01.2025 17:00</code>.\n"
+            "Время указывается по Москве (UTC+3). После ввода пришлю кнопку «➡️ Продолжить».",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
         await callback.answer()
         seller_logger.info(
-            "broadcast.preview.presented",
+            "broadcast.schedule.requested",
             admin_id=callback.from_user.id,
             segment=segment,
             total_items=len(items),
@@ -1617,6 +1674,166 @@ async def broadcast_segment_selected(callback: CallbackQuery, state: FSMContext)
         await state.clear()
 
 
+@router.message(AdminStates.waiting_for_broadcast_schedule)
+@role_required(AdminRole.EDITOR)
+async def broadcast_schedule_received(message: Message, state: FSMContext):
+    """Receive and validate the scheduled send time from admin."""
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        await message.answer(
+            "❌ Укажите дату и время в формате <code>01.01.2025 17:00</code> (Москва).",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        scheduled_naive = datetime.strptime(raw_text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат. Используйте <code>01.01.2025 17:00</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    scheduled_local = scheduled_naive.replace(tzinfo=MOSCOW_TZ)
+    now_local = datetime.now(MOSCOW_TZ)
+    if scheduled_local <= now_local:
+        await message.answer(
+            "❌ Укажите дату и время в будущем (Москва).",
+            parse_mode="HTML",
+        )
+        return
+
+    scheduled_utc = scheduled_local.astimezone(timezone.utc)
+    scheduled_display = scheduled_local.strftime("%d.%m.%Y %H:%M")
+
+    await state.update_data(
+        scheduled_for_iso=scheduled_utc.isoformat(),
+        scheduled_for_display=scheduled_display,
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="broadcast_schedule_continue")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await message.answer(
+        "✅ Рассылка сохранена и будет опубликована в указанное время.\n"
+        f"🗓 {escape(scheduled_display)} (Мск)\n\n"
+        "Нажмите «➡️ Продолжить», чтобы перейти к предпросмотру.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    seller_logger.info(
+        "broadcast.schedule.saved",
+        admin_id=message.from_user.id,
+        scheduled_for=scheduled_utc.isoformat(),
+    )
+
+
+async def _present_broadcast_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    """Send preview of the broadcast content and show confirmation controls."""
+    data = await state.get_data()
+    items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+    segment = data.get("selected_segment")
+    scheduled_display = data.get("scheduled_for_display")
+
+    if not items or not segment:
+        await callback.answer("❌ Не удалось сформировать предпросмотр", show_alert=True)
+        seller_logger.warning(
+            "broadcast.preview.missing_data",
+            admin_id=callback.from_user.id,
+            has_items=bool(items),
+            segment=segment,
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_content)
+        await state.update_data(
+            selected_segment=None,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
+        )
+        return
+
+    await callback.message.edit_text(
+        "📋 Формируем предпросмотр…",
+        parse_mode="HTML",
+    )
+
+    try:
+        await _send_preview_items(callback.bot, callback.message.chat.id, items)
+    except Exception:
+        await callback.message.answer(
+            "❌ Не удалось показать предпросмотр. Попробуйте ещё раз или измените материалы.",
+            parse_mode="HTML",
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_content)
+        await state.update_data(
+            selected_segment=None,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
+        )
+        await callback.answer()
+        return
+
+    counts = Counter(item.get("type") for item in items)
+    summary_parts = [f"{label}: {count}" for label, count in counts.items()]
+    summary = ", ".join(summary_parts)
+
+    segment_names = {
+        "all": "👥 Все пользователи",
+        "cold": "❄️ Холодные",
+        "warm": "🔥 Тёплые",
+        "hot": "🌶️ Горячие",
+    }
+
+    summary_message = (
+        "📋 <b>Предпросмотр готов</b>\n\n"
+        f"🎯 Аудитория: {segment_names.get(segment, segment)}"
+    )
+    if scheduled_display:
+        summary_message += f"\n🗓 Отправка: {escape(scheduled_display)} (Мск)"
+    if summary:
+        summary_message += f"\n📎 Материалы: {summary}"
+    summary_message += "\n\n📌 Предпросмотр отправлен только вам."
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast_confirm_send")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data="broadcast_edit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await callback.message.edit_text(
+        summary_message + "\n\n🚀 <b>Шаг 4/4:</b> Отправить рассылку?",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+    seller_logger.info(
+        "broadcast.preview.presented",
+        admin_id=callback.from_user.id,
+        segment=segment,
+        total_items=len(items),
+        scheduled_for=scheduled_display,
+    )
+
+
+@router.callback_query(F.data == "broadcast_schedule_continue")
+@role_required(AdminRole.EDITOR)
+async def broadcast_schedule_continue(callback: CallbackQuery, state: FSMContext):
+    """Move to preview after schedule confirmation."""
+    data = await state.get_data()
+    if not data.get("scheduled_for_iso"):
+        await callback.answer("Сначала укажите дату и время отправки", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_broadcast_confirmation)
+    await _present_broadcast_preview(callback, state)
+
+
 @router.callback_query(F.data == "broadcast_edit")
 @role_required(AdminRole.EDITOR)
 async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
@@ -1625,18 +1842,23 @@ async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
     previous_count = len(data.get("broadcast_items", []))
 
     await state.set_state(AdminStates.waiting_for_broadcast_content)
-    await state.update_data(broadcast_items=[], selected_segment=None)
+    await state.update_data(
+        broadcast_items=[],
+        selected_segment=None,
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
+    )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Выбрать аудиторию", callback_data="broadcast_choose_segment")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
         ]
     )
 
     await callback.message.edit_text(
         "✏️ <b>Редактирование рассылки</b>\n\n"
-        "Все предыдущие материалы удалены. Отправьте новые сообщения и вложения, затем снова выберите аудиторию.",
+        "Все предыдущие материалы удалены. Отправьте новые сообщения и вложения — после этого появится кнопка выбора аудитории.",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -1655,6 +1877,8 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     items: List[Dict[str, Any]] = data.get("broadcast_items", [])
     segment = data.get("selected_segment")
+    scheduled_iso = data.get("scheduled_for_iso")
+    scheduled_display = data.get("scheduled_for_display")
 
     if not items or not segment:
         await callback.answer("❌ Не удалось отправить: нет данных рассылки", show_alert=True)
@@ -1667,11 +1891,27 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    if not scheduled_iso or not scheduled_display:
+        await callback.answer("❌ Укажите дату и время отправки перед подтверждением", show_alert=True)
+        seller_logger.error(
+            "broadcast.send.missing_schedule",
+            admin_id=callback.from_user.id,
+            segment=segment,
+        )
+        await state.clear()
+        return
+
+    scheduled_at = datetime.fromisoformat(scheduled_iso)
+    now_utc = datetime.now(timezone.utc)
+    immediate_send = scheduled_at <= now_utc + timedelta(minutes=1)
+
     seller_logger.info(
         "broadcast.send.started",
         admin_id=callback.from_user.id,
         segment=segment,
         total_items=len(items),
+        scheduled_for=scheduled_iso,
+        immediate=immediate_send,
     )
 
     text_preview = next(
@@ -1707,6 +1947,9 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
         from app.services.broadcast_service import BroadcastService
         from app.db import get_db
 
+        send_result: Dict[str, Any] = {}
+        job_id: Optional[str] = None
+
         async for session in get_db():
             broadcast_service = BroadcastService(callback.bot, session)
             broadcast = await broadcast_service.create_simple_broadcast(
@@ -1716,7 +1959,15 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
                 content=items,
             )
 
-            result = await broadcast_service.send_simple_broadcast(broadcast.id)
+            await session.commit()
+
+            if immediate_send:
+                send_result = await broadcast_service.send_simple_broadcast(broadcast.id)
+                await session.commit()
+            else:
+                job_id = await scheduler_service.schedule_broadcast(broadcast.id, scheduled_at)
+                send_result = {"job_id": job_id}
+
             break
 
         segment_names = {
@@ -1726,10 +1977,6 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
             "hot": "🌶️ Горячие",
         }
 
-        sent = result.get("sent", 0)
-        failed = result.get("failed", 0)
-        total = result.get("total", 0)
-
         preview_display = text_preview or "—"
         if len(preview_display) > 100:
             preview_display = preview_display[:100] + "..."
@@ -1738,25 +1985,50 @@ async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
         summary_parts = [f"{label}: {count}" for label, count in counts.items()]
         summary = ", ".join(summary_parts)
 
-        await callback.message.edit_text(
-            f"✅ <b>Рассылка отправлена!</b>\n\n"
-            f"📝 Текст: {escape(preview_display)}\n"
-            + (f"📎 Материалы: {summary}\n" if summary else "")
-            + f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
-            + f"📊 Результат: {sent} отправлено, {failed} ошибок из {total}\n"
-            + f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-            parse_mode="HTML",
-        )
-        await callback.answer("Рассылка запущена")
-        await state.clear()
-        seller_logger.info(
-            "broadcast.send.completed",
-            admin_id=callback.from_user.id,
-            segment=segment,
-            sent=sent,
-            failed=failed,
-            total=total,
-        )
+        if immediate_send:
+            sent = send_result.get("sent", 0)
+            failed = send_result.get("failed", 0)
+            total = send_result.get("total", 0)
+
+            await callback.message.edit_text(
+                f"✅ <b>Рассылка отправлена!</b>\n\n"
+                f"📝 Текст: {escape(preview_display)}\n"
+                + (f"📎 Материалы: {summary}\n" if summary else "")
+                + f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
+                + f"🗓 План: {escape(scheduled_display)} (Мск)\n"
+                + f"📊 Результат: {sent} отправлено, {failed} ошибок из {total}\n"
+                + f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+                parse_mode="HTML",
+            )
+            await callback.answer("Рассылка запущена")
+            await state.clear()
+            seller_logger.info(
+                "broadcast.send.completed",
+                admin_id=callback.from_user.id,
+                segment=segment,
+                scheduled_for=scheduled_iso,
+                sent=sent,
+                failed=failed,
+                total=total,
+            )
+        else:
+            await callback.message.edit_text(
+                f"✅ <b>Рассылка запланирована!</b>\n\n"
+                f"📝 Текст: {escape(preview_display)}\n"
+                + (f"📎 Материалы: {summary}\n" if summary else "")
+                + f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
+                + f"🗓 Отправка: {escape(scheduled_display)} (Мск)\n",
+                parse_mode="HTML",
+            )
+            await callback.answer("Рассылка запланирована")
+            await state.clear()
+            seller_logger.info(
+                "broadcast.send.scheduled",
+                admin_id=callback.from_user.id,
+                segment=segment,
+                scheduled_for=scheduled_iso,
+                scheduler_job_id=job_id,
+            )
 
     except Exception as exc:
         logger.exception("Error sending broadcast", exc_info=exc)

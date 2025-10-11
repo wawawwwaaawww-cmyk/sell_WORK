@@ -109,6 +109,16 @@ class BaseScene(ABC):
             )
             
         except Exception as e:
+            try:
+                await self.session.rollback()
+            except Exception as rollback_error:  # pragma: no cover - best effort cleanup
+                self.logger.warning(
+                    "Failed to rollback session after scene error",
+                    scene=self.scene_name,
+                    user_id=user.id,
+                    rollback_error=str(rollback_error)
+                )
+
             self.logger.error(
                 "Scene processing error",
                 scene=self.scene_name,

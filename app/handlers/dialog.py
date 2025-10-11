@@ -62,6 +62,10 @@ async def handle_user_text_message(
         user_id=user.id,
         text=text_payload,
         metadata={"source": "text_input"},
+        bot=message.bot,
+        user=user,
+        telegram_user=message.from_user,
+        source_message=message,
     )
 
     manager = SceneManager(session)

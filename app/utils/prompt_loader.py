@@ -1,7 +1,7 @@
 """Prompt loader utility for managing LLM prompts."""
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
 
 import structlog
@@ -65,11 +65,12 @@ class PromptLoader:
             if candidate not in paths:
                 paths.append(candidate)
 
-        if self.DEFAULT_EXTERNAL_DIR not in paths:
-            paths.append(self.DEFAULT_EXTERNAL_DIR)
-
-        if project_prompts not in paths:
-            paths.append(project_prompts)
+        for base in (self.DEFAULT_EXTERNAL_DIR, project_prompts):
+            if base not in paths:
+                paths.append(base)
+            local_override = base / "local"
+            if local_override not in paths:
+                paths.append(local_override)
 
         existing = [path for path in paths if path.exists()]
         if not existing:
@@ -86,15 +87,53 @@ class PromptLoader:
     def _resolve_prompt_path(self, filename: str) -> Optional[Path]:
         """Find the first matching prompt file in configured directories."""
 
-        for directory in self._search_paths:
-            candidate = directory / f"{filename}.txt"
-            if candidate.exists():
-                self.logger.info(
-                    "prompt_file_resolved",
+        direct_name = f"{filename}.txt"
+        ranked_candidates: List[Tuple[int, float, int, Path]] = []
+        seen: Set[Path] = set()
+
+        for order, directory in enumerate(self._search_paths):
+            if not directory.exists():
+                continue
+            try:
+                possible = list(directory.rglob(f"{filename}.txt*"))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.debug(
+                    "prompt_candidate_search_failed",
                     filename=filename,
-                    path=str(candidate),
+                    directory=str(directory),
+                    error=str(exc),
                 )
-                return candidate
+                continue
+
+            for path in possible:
+                if not path.is_file() or path in seen:
+                    continue
+                seen.add(path)
+
+                try:
+                    stats = path.stat()
+                    mtime = stats.st_mtime
+                    is_empty = stats.st_size == 0
+                except OSError:
+                    mtime = 0.0
+                    is_empty = False
+
+                base_priority = 0 if path.name == direct_name else 1
+                if base_priority == 0:
+                    priority = 0 if not is_empty else 2
+                else:
+                    priority = 1 if not is_empty else 3
+                ranked_candidates.append((priority, -mtime, order, path))
+
+        if ranked_candidates:
+            ranked_candidates.sort()
+            _, _, _, best_path = ranked_candidates[0]
+            self.logger.info(
+                "prompt_file_resolved",
+                filename=filename,
+                path=str(best_path),
+            )
+            return best_path
 
         self.logger.warning(
             "prompt_file_missing",

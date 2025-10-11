@@ -164,6 +164,7 @@ async def send_scene_response(
                 message,
                 text=response.message_text,
                 user_id=user.id,
+                user=user,
                 reply_markup=markup,
                 parse_mode="HTML",
                 metadata=metadata or None,

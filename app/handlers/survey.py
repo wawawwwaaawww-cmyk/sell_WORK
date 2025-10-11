@@ -43,6 +43,7 @@ async def _render_survey_step(
             message,
             text=text,
             user_id=user.id,
+            user=user,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
             metadata=metadata,
@@ -304,6 +305,11 @@ async def complete_survey(
                 text="💬 Задать вопросы",
                 callback_data="llm:ask_questions"
             ))
+
+        keyboard.add(InlineKeyboardButton(
+            text="📝 Оставить заявку",
+            callback_data=Callbacks.APPLICATION_START
+        ))
         
         keyboard.adjust(1)
         
@@ -469,6 +475,7 @@ async def start_survey_via_message(
                 message,
                 text=survey_text,
                 user_id=user.id,
+                user=user,
                 reply_markup=keyboard.as_markup(),
                 parse_mode="Markdown",
                 metadata={"context": "survey_start", "question": "q1", "entry": "message"},

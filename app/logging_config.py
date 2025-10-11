@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-import logging.handlers
 import sys
-import threading
 from pathlib import Path
-from types import FrameType
 from typing import Any
 
 import structlog
@@ -18,146 +14,96 @@ from app.config import settings
 
 # Define the project root to calculate the log file path
 project_root = Path(__file__).parent.parent
-log_file_path = project_root / "logs/seller_krypto.log"
+log_file_path = project_root / "logs/bot_interactions.log"
+
+INTERACTION_LOGGER_PREFIX = "bot.interactions"
 
 _logging_configured = False
-_function_tracing_enabled = False
-_trace_guard = threading.local()
 
 
-def _safe_repr(value: Any, max_length: int = 200) -> str:
-    """Return a safe, truncated representation of a value for logging."""
+def _russian_message_renderer(
+    _: logging.Logger,
+    __: str,
+    event_dict: dict[str, Any],
+) -> str:
+    """Format structlog event into a readable Russian message."""
 
-    try:
-        representation = repr(value)
-    except Exception as exc:  # pragma: no cover - defensive programming
-        representation = f"<repr-error {exc}>"
+    timestamp = event_dict.pop("timestamp", "")
+    level = str(event_dict.pop("level", "")).upper()
+    event = str(event_dict.pop("event", ""))
+    logger_name = event_dict.pop("logger", "")
 
-    if len(representation) > max_length:
-        return f"{representation[:max_length]}...<truncated>"
-    return representation
+    field_labels = {
+        "request_id": "запрос",
+        "user_id": "пользователь",
+        "username": "ник",
+        "full_name": "имя",
+        "event_type": "тип события",
+        "content_type": "тип контента",
+        "text": "текст",
+        "data": "данные",
+        "status": "статус",
+        "handler": "обработчик",
+    }
 
+    details: list[str] = []
 
-def _should_trace(frame: FrameType) -> bool:
-    """Check whether the current frame belongs to the project code base."""
+    for key, label in field_labels.items():
+        value = event_dict.pop(key, None)
 
-    module_name = frame.f_globals.get("__name__", "")
-    if module_name == __name__ and frame.f_code.co_name == "_profile_function":
-        return False
+        if value in (None, "", []):
+            continue
 
-    filename = frame.f_code.co_filename
-    try:
-        file_path = Path(filename).resolve()
-    except FileNotFoundError:  # pragma: no cover - handle removed files gracefully
-        return False
+        if isinstance(value, dict):
+            value = ", ".join(f"{dict_key}={dict_value}" for dict_key, dict_value in value.items())
 
-    try:
-        file_path.relative_to(project_root)
-    except ValueError:
-        return False
+        details.append(f"{label}: {value}")
 
-    if "venv" in file_path.parts:
-        return False
+    for key, value in event_dict.items():
+        if value in (None, "", []):
+            continue
+        details.append(f"{key}={value}")
 
-    return True
+    parts = [str(timestamp) if timestamp else ""]
 
+    if level:
+        parts.append(level)
 
-def _profile_function(frame: FrameType, event: str, arg: Any) -> None:
-    """Profile callback used to log every function call inside the project."""
+    if logger_name:
+        parts.append(f"источник: {logger_name}")
 
-    if not _should_trace(frame):
-        return
+    parts.append(event)
 
-    if getattr(_trace_guard, "active", False):
-        return
+    if details:
+        parts.append("; ".join(details))
 
-    _trace_guard.active = True
-    try:
-        module_name = frame.f_globals.get("__name__", "unknown_module")
-        function_name = frame.f_code.co_name
-        logger = structlog.get_logger(module_name)
-
-        if event == "call":
-            arg_info = inspect.getargvalues(frame)
-            arguments = {
-                name: _safe_repr(arg_info.locals.get(name))
-                for name in arg_info.args
-            }
-            if arg_info.varargs:
-                arguments[arg_info.varargs] = _safe_repr(
-                    arg_info.locals.get(arg_info.varargs, ())
-                )
-            if arg_info.keywords:
-                arguments[arg_info.keywords] = _safe_repr(
-                    arg_info.locals.get(arg_info.keywords, {})
-                )
-
-            logger.info(
-                "function.call",
-                function=function_name,
-                arguments=arguments,
-            )
-        elif event == "return":
-            logger.info(
-                "function.return",
-                function=function_name,
-                return_value=_safe_repr(arg),
-            )
-        elif event == "exception":
-            exc_type, exc_value, _ = arg
-            logger.error(
-                "function.exception",
-                function=function_name,
-                exception_type=getattr(exc_type, "__name__", str(exc_type)),
-                exception_message=str(exc_value),
-            )
-    finally:
-        _trace_guard.active = False
-
-
-def enable_function_tracing() -> None:
-    """Enable global function-level tracing for the entire project."""
-
-    global _function_tracing_enabled
-
-    if _function_tracing_enabled:
-        return
-
-    sys.setprofile(_profile_function)
-    threading.setprofile(_profile_function)
-    _function_tracing_enabled = True
-
-    structlog.get_logger("logging_setup").info(
-        "Function-level tracing enabled",
-        log_file=str(log_file_path),
-    )
+    return " | ".join(part for part in parts if part)
 
 
 def setup_logging(*, enable_tracing: bool = False) -> None:
     """
     Configure structured logging for the entire application.
 
-    This setup ensures that logs are consistently formatted and output
-    to both the console and a rotating file. It handles logs from standard
-    logging and structlog. When ``enable_tracing`` is True, every function call
-    in the project is logged to ``seller_krypto.log``.
+    The configuration writes verbose diagnostics to stdout while only user-facing
+    interaction logs are persisted in ``logs/bot_interactions.log`` in a
+    human-readable Russian format.
     """
 
     global _logging_configured
 
     if _logging_configured:
-        if enable_tracing:
-            enable_function_tracing()
         return
 
     log_level = settings.log_level.upper()
+
+    # Ensure log directory exists before configuring handlers
+    log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Define shared processors for structlog
     shared_processors: list[Processor] = [
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
+        structlog.processors.TimeStamper(fmt="%d.%m.%Y %H:%M:%S"),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
     ]
@@ -187,9 +133,9 @@ def setup_logging(*, enable_tracing: bool = False) -> None:
         foreign_pre_chain=shared_processors,
     )
 
-    # Define formatter for file output (JSON for machine-readability)
+    # Define formatter for file output (Russian readable format)
     file_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=structlog.processors.JSONRenderer(),
+        processor=_russian_message_renderer,
         foreign_pre_chain=shared_processors,
     )
 
@@ -197,11 +143,10 @@ def setup_logging(*, enable_tracing: bool = False) -> None:
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(console_formatter)
 
-    # Create file handler with rotation
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file_path, maxBytes=5 * 1024 * 1024, backupCount=5  # 5 MB per file, 5 backups
-    )
+    # Create file handler writing to a single consolidated file
+    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
     file_handler.setFormatter(file_formatter)
+    file_handler.addFilter(logging.Filter(INTERACTION_LOGGER_PREFIX))
 
     # Get the root logger and remove existing handlers
     root_logger = logging.getLogger()
@@ -213,14 +158,15 @@ def setup_logging(*, enable_tracing: bool = False) -> None:
     root_logger.addHandler(file_handler)
     root_logger.setLevel(log_level)
 
+    # Reduce noise from third-party libraries in file logs
+    for noisy_logger in ("aiogram", "apscheduler", "sqlalchemy", "asyncio", "urllib3"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
     logger = structlog.get_logger("logging_setup")
     logger.info(
-        "Logging configured successfully",
+        "Логирование настроено",
         level=log_level,
-        file_path=str(log_file_path)
+        file_path=str(log_file_path),
     )
-
-    if enable_tracing:
-        enable_function_tracing()
 
     _logging_configured = True
