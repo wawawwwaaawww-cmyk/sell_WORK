@@ -115,11 +115,17 @@ class LLMService:
         self.policy_layer = PolicyLayer()
         self.safety_validator = SafetyValidator()
         self.logger = structlog.get_logger()
-        
+
         # Load system prompts
         self.system_prompt = prompt_loader.get_system_prompt()
         self.safety_policies = prompt_loader.get_safety_policies()
         self.sales_methodology = prompt_loader.get_sales_methodology()
+        self.persona_prompt = prompt_loader.load_prompt("system_manager") or ""
+        followups_prompt = prompt_loader.load_prompt("followups") or ""
+        self.dialog_analysis_guidelines = self._extract_guideline_section(
+            followups_prompt,
+            header="АНАЛИЗ СООБЩЕНИЙ",
+        )
     
     async def generate_response(self, context: LLMContext) -> LLMResponse:
         """Generate LLM response with safety and policy validation."""
@@ -333,7 +339,7 @@ class LLMService:
         messages = [
             {"role": "system", "content": self._build_system_message(context)}
         ]
-        
+
         # Add conversation history
         for msg in context.messages_history[-10:]:  # Last 10 messages
             role = "assistant" if msg["role"] == "bot" else "user"
@@ -341,13 +347,66 @@ class LLMService:
                 "role": role,
                 "content": msg["text"]
             })
-        
+
         return messages
-    
+
+    def _extract_guideline_section(self, prompt_text: str, header: str) -> str:
+        """Extract specific guideline section from prompt text with logging."""
+
+        has_prompt = bool(prompt_text)
+        self.logger.info(
+            "guideline_extraction_started",
+            header=header,
+            has_prompt=has_prompt,
+        )
+
+        if not has_prompt:
+            self.logger.warning(
+                "guideline_prompt_missing",
+                header=header,
+            )
+            return ""
+
+        lines = prompt_text.splitlines()
+        header_upper = header.strip().upper()
+        capture = False
+        collected: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not capture:
+                if stripped.upper().startswith(header_upper):
+                    capture = True
+                    self.logger.debug(
+                        "guideline_section_detected",
+                        header=header,
+                        line=stripped,
+                    )
+                    continue
+            else:
+                if (
+                    stripped
+                    and stripped == stripped.upper()
+                    and stripped.endswith(":")
+                    and stripped.upper() != header_upper
+                ):
+                    break
+                collected.append(line.rstrip())
+
+        extracted = "\n".join(collected).strip()
+
+        self.logger.info(
+            "guideline_extraction_completed",
+            header=header,
+            length=len(extracted),
+        )
+
+        return extracted
+
     def _build_system_message(self, context: LLMContext) -> str:
         """Build comprehensive system message with context."""
         user = context.user
-        
+
         # User profile
         knowledge_level_map = {
             UserSegment.COLD: "новичок",
@@ -390,6 +449,26 @@ class LLMService:
         if context.scenario_prompt:
             scenario_block = f"\nСЦЕНАРНЫЕ УКАЗАНИЯ:\n{context.scenario_prompt}\n"
 
+        persona_block = ""
+        if self.persona_prompt:
+            persona_block = f"\nПЕРСОНАЖ И СТИЛЬ:\n{self.persona_prompt}\n"
+
+        dialogue_guidelines_block = ""
+        if self.dialog_analysis_guidelines:
+            dialogue_guidelines_block = (
+                "\nАНАЛИЗ ДИАЛОГА (из подсказки FOLLOW-UPS):\n"
+                f"{self.dialog_analysis_guidelines}\n"
+                "Следуй этим принципам, чтобы понимать ответы пользователя и реагировать по смыслу. "
+                "Если он отвечает по существу твоего вопроса (даже другими словами или синонимами), продолжай диалог в той же логике. "
+                "Если пользователь меняет тему или задает новый вопрос, переключайся на новый смысл и отвечай, опираясь на последние пять сообщений и общий контекст ниже."
+            )
+        else:
+            dialogue_guidelines_block = (
+                "\nАНАЛИЗ ДИАЛОГА:\n"
+                "Внимательно анализируй последние пять сообщений и отвечай по смыслу. "
+                "Сохраняй текущую тему, если пользователь дал релевантный ответ, и переключайся, если тема изменилась."
+            )
+
         recent_messages_block = ""
         if context.recent_messages:
             formatted = []
@@ -425,7 +504,7 @@ class LLMService:
             )
 
         return f"""
-{self.system_prompt}{scenario_block}
+{self.system_prompt}{scenario_block}{persona_block}{dialogue_guidelines_block}
 {profile_info}
 {survey_info}
 {materials_info}
