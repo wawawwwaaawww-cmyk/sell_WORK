@@ -74,7 +74,7 @@ class BaseScene(ABC):
                 return await self._create_escalation_response(user, state)
             
             # Build LLM context
-            context = await self._build_llm_context(user, message_text)
+            context = await self._build_llm_context(user, message_text, state)
             
             # Generate response using LLM
             llm_response = await self.llm_service.generate_response(context)
@@ -148,11 +148,12 @@ class BaseScene(ABC):
         return False
     
     async def _build_llm_context(
-        self, 
-        user: User, 
-        message_text: str
+        self,
+        user: User,
+        message_text: str,
+        state: SceneState,
     ) -> LLMContext:
-        """Build context for LLM request."""
+        """Build context for LLM request using the current scene state."""
         
         # Get conversation history (last 10 messages)
         messages_history = await self._get_conversation_history(user)
