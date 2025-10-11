@@ -322,17 +322,17 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
     builder.row(InlineKeyboardButton(text="⬅️ К списку", callback_data="product_list"))
     builder.row(InlineKeyboardButton(text="💰 Раздел", callback_data="admin_products"))
     return text, builder.as_markup()
-@router.message(Command("admin"))
-@admin_required
-async def admin_panel(message: Message):
-    """Show full admin panel."""
-    async for session in get_db():
-        admin_repo = AdminRepository(session)
-        capabilities = await admin_repo.get_admin_capabilities(message.from_user.id)
-        break
-        
-    buttons = []
-    
+
+
+def _prepare_admin_panel_response(user_id: int, capabilities: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    """Build text and keyboard for admin panel entry point."""
+    logger.info(
+        "Preparing admin panel response",
+        extra={"user_id": user_id, "role": capabilities.get("role"), "capabilities": capabilities},
+    )
+
+    buttons: List[List[InlineKeyboardButton]] = []
+
     # Analytics (all admins)
     buttons.append([InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_analytics")])
 
@@ -341,7 +341,7 @@ async def admin_panel(message: Message):
 
     # Leads management (all admins)
     buttons.append([InlineKeyboardButton(text="👥 Лиды", callback_data="admin_leads")])
-    
+
     # Broadcast management (editors and above)
     if capabilities.get("can_manage_broadcasts"):
         buttons.append([InlineKeyboardButton(text="📢 Рассылки", callback_data="admin_broadcasts")])
@@ -362,22 +362,34 @@ async def admin_panel(message: Message):
     # Product management (admins and above)
     if capabilities.get("can_manage_products"):
         buttons.append([InlineKeyboardButton(text="💰 Продукты", callback_data="admin_products")])
-    
+
     # Admin management (owners only)
     if capabilities.get("can_manage_admins"):
         buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
-    
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
     role = capabilities.get("role", "unknown")
-    
-    await message.answer(
-        f"🔧 <b>Панель администратора</b>\n\n"
+
+    text = (
+        "🔧 <b>Панель администратора</b>\n\n"
         f"👤 Ваша роль: <b>{role}</b>\n\n"
-        "Выберите нужный раздел:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        "Выберите нужный раздел:"
     )
+    return text, keyboard
+
+
+@router.message(Command("admin"))
+@admin_required
+async def admin_panel(message: Message):
+    """Show full admin panel."""
+    async for session in get_db():
+        admin_repo = AdminRepository(session)
+        capabilities = await admin_repo.get_admin_capabilities(message.from_user.id)
+        break
+
+    text, keyboard = _prepare_admin_panel_response(message.from_user.id, capabilities)
+
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.message(Command("dashboard"))
@@ -1952,7 +1964,16 @@ async def admins_add(callback: CallbackQuery):
 async def admin_back(callback: CallbackQuery, state: FSMContext):
     """Go back to admin panel."""
     await state.clear()
-    await admin_panel(callback)
+    async for session in get_db():
+        admin_repo = AdminRepository(session)
+        capabilities = await admin_repo.get_admin_capabilities(callback.from_user.id)
+        break
+
+    text, keyboard = _prepare_admin_panel_response(callback.from_user.id, capabilities)
+
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
 
 
 # Admin management commands
