@@ -2,6 +2,7 @@
 
 from typing import Optional, Dict, Any
 import asyncio
+import html
 
 import structlog
 from aiogram import Bot
@@ -11,6 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.models import Lead, User
 from app.services.lead_service import LeadService
 from app.config import settings
+from app.utils.callbacks import Callbacks
 
 
 class ManagerNotificationService:
@@ -79,6 +81,87 @@ class ManagerNotificationService:
                 exc_info=True,
             )
             return False    
+
+    async def notify_new_application(
+        self,
+        *,
+        user: User,
+        name: str,
+        phone: str,
+        telegram_html: str,
+        email: Optional[str],
+        survey_lines: list[str],
+        status: str,
+        lead_id: Optional[int] = None,
+    ) -> bool:
+        """Send formatted application notification to the manager channel."""
+        if not self.manager_channel_id:
+            self.logger.error("Manager channel ID is not configured; cannot publish application", user_id=user.id)
+            return False
+
+        try:
+            name_html = html.escape(name)
+            phone_html = html.escape(phone)
+            email_html = html.escape(email) if email else "не указана"
+            status_html = html.escape(status)
+
+            lines = ["🚨 <b>Новая заявка от клиента!</b>"]
+            if lead_id:
+                lines.append(f"🆔 <b>ID заявки:</b> {lead_id}")
+
+            lines.extend([
+                "",
+                f"👤 <b>Имя:</b> {name_html}",
+                f"📱 <b>Телефон:</b> {phone_html}",
+                f"💬 <b>Telegram:</b> {telegram_html}",
+                f"📧 <b>Почта:</b> {email_html}",
+            ])
+
+            if survey_lines:
+                lines.append("")
+                lines.append("📝 <b>Ответы анкеты:</b>")
+                lines.extend(f"• {line}" for line in survey_lines)
+
+            lines.extend([
+                "",
+                f"🔥 <b>Статус:</b> {status_html}",
+            ])
+
+            message_text = "\n".join(lines)
+
+            keyboard = None
+            if lead_id:
+                keyboard = InlineKeyboardBuilder()
+                keyboard.add(InlineKeyboardButton(
+                    text="✅ Взять заявку",
+                    callback_data=f"{Callbacks.APPLICATION_TAKE}:{lead_id}:{user.id}",
+                ))
+                keyboard.adjust(1)
+
+            await self.bot.send_message(
+                chat_id=self.manager_channel_id,
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=keyboard.as_markup() if keyboard else None,
+            )
+
+            self.logger.info(
+                "Application notification sent",
+                user_id=user.id,
+                lead_id=lead_id,
+            )
+
+            return True
+
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error(
+                "Error sending application notification",
+                error=str(exc),
+                user_id=user.id,
+                exc_info=True,
+            )
+            return False
+
     async def notify_lead_taken(self, lead: Lead, user: User, manager_id: int) -> bool:
         """Notify that lead was taken and send details to manager."""
         try:

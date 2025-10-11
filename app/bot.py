@@ -13,11 +13,14 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 from app.config import settings
 from app.middlewares.logging import LoggingMiddleware
 from app.middlewares.user_context import UserContextMiddleware
+from app.middlewares.manual_dialog import ManualDialogMiddleware
 from app.middlewares.rate_limit import RateLimitMiddleware
+from app.middlewares.dialog_mirror import DialogsMirrorMiddleware, DialogsChannelRequestMiddleware
 from app.handlers import (
     start,
     survey,
     consultation,
+    application,
     payments,
     help_faq,
     admin_full as admin,
@@ -25,6 +28,8 @@ from app.handlers import (
     leads,
     product_handlers,
     user_settings,
+    dialog,
+    manual_dialog,
 )
 
 logger = structlog.get_logger()
@@ -35,6 +40,9 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
+# Mirror all bot messages to dialogs channel at API layer
+bot.session.middleware(DialogsChannelRequestMiddleware(settings.dialogs_channel_id))
+
 # Create dispatcher
 dp = Dispatcher()
 
@@ -43,6 +51,8 @@ dp.message.middleware(LoggingMiddleware())
 dp.callback_query.middleware(LoggingMiddleware())
 dp.message.middleware(UserContextMiddleware())
 dp.callback_query.middleware(UserContextMiddleware())
+dp.message.middleware(ManualDialogMiddleware())
+dp.message.middleware(DialogsMirrorMiddleware())
 dp.message.middleware(RateLimitMiddleware())
 dp.callback_query.middleware(RateLimitMiddleware())
 
@@ -51,6 +61,7 @@ dp.callback_query.middleware(RateLimitMiddleware())
 start.register_handlers(dp)
 survey.register_handlers(dp)
 consultation.register_handlers(dp)
+application.register_handlers(dp)
 payments.register_handlers(dp)
 help_faq.register_handlers(dp)
 admin.register_full_admin_handlers(dp)
@@ -58,6 +69,8 @@ materials.register_handlers(dp)
 leads.register_handlers(dp)
 product_handlers.register_product_handlers(dp)
 user_settings.register_handlers(dp)
+dp.include_router(dialog.router)
+dp.include_router(manual_dialog.router)
 
 
 async def set_bot_commands() -> None:
@@ -66,6 +79,7 @@ async def set_bot_commands() -> None:
         BotCommand(command="start", description="Start working with the bot"),
         BotCommand(command="help", description="Show available help options"),
         BotCommand(command="reset", description="Delete my saved data"),
+        BotCommand(command="contact", description="Оставить заявку"),
     ]
     
     await bot.set_my_commands(commands, BotCommandScopeDefault())

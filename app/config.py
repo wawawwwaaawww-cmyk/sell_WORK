@@ -18,6 +18,7 @@ class Settings:
         self.telegram_webhook_url: str = os.getenv("TELEGRAM_WEBHOOK_URL", "")
         self.telegram_webhook_secret: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "webhook_secret")
         self.manager_channel_id: int = int(os.getenv("MANAGER_CHANNEL_ID", "0"))
+        self.dialogs_channel_id: int = int(os.getenv("DIALOGS_CHANNEL_ID", "0"))
         self.webhook_path: str = os.getenv("WEBHOOK_PATH", "/telegram/webhook")
 
         # Database
@@ -29,7 +30,7 @@ class Settings:
 
         # LLM
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-        self.llm_model: str = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
+        self.llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
         # Security
         self.secret_key: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")

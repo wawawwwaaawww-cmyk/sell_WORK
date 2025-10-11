@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import User, MessageRole
 from app.services.llm_service import LLMService, LLMContext, LLMResponse
 from app.services.materials_service import MaterialService
+from app.services.payment_service import PaymentService
 from app.safety.validator import SafetyValidator
 
 
@@ -43,6 +44,7 @@ class BaseScene(ABC):
         self.session = session
         self.llm_service = LLMService()
         self.materials_service = MaterialService(session)
+        self.payment_service = PaymentService(session)
         self.safety_validator = SafetyValidator()
         self.logger = structlog.get_logger()
         
@@ -72,7 +74,7 @@ class BaseScene(ABC):
                 return await self._create_escalation_response(user, state)
             
             # Build LLM context
-            context = await self._build_llm_context(user, message_text)
+            context = await self._build_llm_context(user, message_text, state)
             
             # Generate response using LLM
             llm_response = await self.llm_service.generate_response(context)
@@ -107,6 +109,16 @@ class BaseScene(ABC):
             )
             
         except Exception as e:
+            try:
+                await self.session.rollback()
+            except Exception as rollback_error:  # pragma: no cover - best effort cleanup
+                self.logger.warning(
+                    "Failed to rollback session after scene error",
+                    scene=self.scene_name,
+                    user_id=user.id,
+                    rollback_error=str(rollback_error)
+                )
+
             self.logger.error(
                 "Scene processing error",
                 scene=self.scene_name,
@@ -146,25 +158,62 @@ class BaseScene(ABC):
         return False
     
     async def _build_llm_context(
-        self, 
-        user: User, 
-        message_text: str
+        self,
+        user: User,
+        message_text: str,
+        state: SceneState,
     ) -> LLMContext:
-        """Build context for LLM request."""
+        """Build context for LLM request using the current scene state."""
         
         # Get conversation history (last 10 messages)
         messages_history = await self._get_conversation_history(user)
-        
+
+        if message_text:
+            messages_history.append({
+                "role": "user",
+                "text": message_text,
+                "created_at": datetime.utcnow().isoformat(),
+                "meta": {"source": "live_input"}
+            })
+
+        recent_messages = self._extract_recent_messages(messages_history)
+        qa_pairs = self._build_question_answer_pairs(messages_history)
+        active_function = self._compose_active_function_label(state)
+
         # Get relevant materials
         materials = await self.materials_service.get_materials_for_segment(
             segment=user.segment or "cold",
             funnel_stage=user.funnel_stage,
             limit=3
         )
-        
+
+        # Get relevant products
+        products = await self.payment_service.get_suitable_products(user)
+        product_payload = [
+            {
+                "name": product.name,
+                "code": product.code,
+                "price": str(product.price),
+                "description": product.description or "",
+                "is_active": product.is_active,
+            }
+            for product in products[:3]
+        ]
+
         # Get survey summary if available
         survey_summary = await self._get_survey_summary(user)
-        
+
+        product_focus = product_payload[0] if product_payload else None
+
+        self.logger.info(
+            "llm_context_built",
+            user_id=user.id,
+            scene=self.scene_name,
+            active_function=active_function,
+            materials=len(materials),
+            products=len(product_payload),
+        )
+
         return LLMContext(
             user=user,
             messages_history=messages_history,
@@ -177,8 +226,62 @@ class BaseScene(ABC):
                 }
                 for mat in materials
             ],
-            funnel_stage=user.funnel_stage
+            relevant_products=product_payload,
+            funnel_stage=user.funnel_stage,
+            active_function=active_function,
+            recent_messages=recent_messages,
+            conversation_pairs=qa_pairs,
+            product_focus=product_focus,
         )
+
+    def _extract_recent_messages(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return last five messages from history for prompt context."""
+
+        recent = history[-5:] if history else []
+        self.logger.info(
+            "recent_messages_prepared",
+            scene=self.scene_name,
+            count=len(recent),
+        )
+        return recent
+
+    def _build_question_answer_pairs(self, history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """Build up to five question-answer pairs from conversation history."""
+
+        pairs: List[Dict[str, str]] = []
+        pending_user: Optional[str] = None
+
+        for message in history:
+            role = message.get("role")
+            text = str(message.get("text", ""))
+            if role == "user":
+                pending_user = text
+            elif role == "bot" and pending_user:
+                pairs.append({"user": pending_user, "bot": text})
+                pending_user = None
+
+        trimmed_pairs = pairs[-5:]
+        self.logger.info(
+            "qa_pairs_prepared",
+            scene=self.scene_name,
+            count=len(trimmed_pairs),
+        )
+        return trimmed_pairs
+
+    def _compose_active_function_label(self, state: SceneState) -> str:
+        """Compose label describing current function/scene for prompts."""
+
+        parts = [f"scene:{self.scene_name}"]
+        if state.current_step and state.current_step != "initial":
+            parts.append(f"step:{state.current_step}")
+
+        label = "|".join(parts)
+        self.logger.info(
+            "active_function_determined",
+            scene=self.scene_name,
+            label=label,
+        )
+        return label
     
     async def _get_conversation_history(self, user: User) -> List[Dict[str, str]]:
         """Get recent conversation history."""

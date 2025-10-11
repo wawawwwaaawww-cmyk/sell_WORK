@@ -94,6 +94,11 @@ class Callbacks:
     
     # Payment actions
     OFFER_PAYMENT = "offer:pay"
+
+    # Application form
+    APPLICATION_START = "application:start"
+    APPLICATION_SKIP_EMAIL = "application:skip_email"
+    APPLICATION_TAKE = "application:take"
     
     # Help actions
     FAQ_ITEM = "faq"

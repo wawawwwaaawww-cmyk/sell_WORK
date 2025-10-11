@@ -7,8 +7,9 @@ from typing import Dict, List, Optional, Any
 from enum import Enum
 
 import structlog
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, cast
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.models import User, Product, Payment, PaymentStatus
 
@@ -36,10 +37,13 @@ class ProductRepository:
     
     async def get_products_for_segment(self, segment: str) -> List[Product]:
         """Get products suitable for user segment."""
+        meta_jsonb = cast(Product.meta, JSONB)
+
         stmt = select(Product).where(
             and_(
-                Product.is_active == True,
-                Product.meta.contains({"segments": [segment]})
+                Product.is_active.is_(True),
+                Product.meta.isnot(None),
+                meta_jsonb["segments"].contains([segment])
             )
         )
         result = await self.session.execute(stmt)

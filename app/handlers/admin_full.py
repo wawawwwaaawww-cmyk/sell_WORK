@@ -4,15 +4,26 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from html import escape
 from typing import List, Optional, Dict, Any, Tuple
+from collections import Counter
+from zoneinfo import ZoneInfo
 
+import structlog
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
@@ -37,16 +48,22 @@ from ..services.analytics_formatter import (
     format_report_for_telegram,
     format_broadcast_metrics,
 )
+from ..services.bonus_content_manager import BonusContentManager
+from ..services.scheduler_service import scheduler_service
 
 logger = logging.getLogger(__name__)
+seller_logger = structlog.get_logger("seller_krypto")
 router = Router()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 class AdminStates(StatesGroup):
     """Admin FSM states."""
     # Broadcast states
-    waiting_for_broadcast_text = State()
+    waiting_for_broadcast_content = State()
     waiting_for_broadcast_segment = State()
+    waiting_for_broadcast_schedule = State()
+    waiting_for_broadcast_confirmation = State()
     
     # Product states
     waiting_for_product_code = State()
@@ -57,52 +74,61 @@ class AdminStates(StatesGroup):
     waiting_for_product_edit_price = State()
     waiting_for_product_edit_description = State()
 
+    # Bonus management states
+    waiting_for_bonus_file = State()
+    waiting_for_bonus_description = State()
+
 
 
 
 def admin_required(func):
     """Decorator to check if user is admin."""
+
+    @wraps(func)
     async def wrapper(message_or_query, *args, **kwargs):
         user_id = message_or_query.from_user.id
-        
+
         async for session in get_db():
             admin_repo = AdminRepository(session)
             is_admin = await admin_repo.is_admin(user_id)
             break
-            
+
         if not is_admin:
             if isinstance(message_or_query, Message):
                 await message_or_query.answer("❌ У вас нет прав администратора.")
             else:
                 await message_or_query.answer("❌ У вас нет прав администратора.", show_alert=True)
             return
-        
-        # Filter out problematic kwargs passed by middleware
-        return await func(message_or_query, *args)
+
+        return await func(message_or_query, *args, **kwargs)
+
     return wrapper
 
 
 def role_required(required_role: AdminRole):
     """Decorator to check if admin has required role."""
+
     def decorator(func):
+        @wraps(func)
         async def wrapper(message_or_query, *args, **kwargs):
             user_id = message_or_query.from_user.id
-            
+
             async for session in get_db():
                 admin_repo = AdminRepository(session)
                 has_permission = await admin_repo.has_permission(user_id, required_role)
                 break
-                
+
             if not has_permission:
                 if isinstance(message_or_query, Message):
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}")
                 else:
                     await message_or_query.answer(f"❌ Требуется роль: {required_role.value}", show_alert=True)
                 return
-            
-            # Filter out problematic kwargs passed by middleware
-            return await func(message_or_query, *args)
+
+            return await func(message_or_query, *args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -123,6 +149,238 @@ PRODUCT_STATUS_LABELS = {
     False: "⚪️ Выключен",
 }
 
+
+def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
+    """Convert an incoming admin message into broadcast content items."""
+
+    seller_logger.info(
+        "broadcast.extract.start",
+        message_id=message.message_id,
+        from_user=getattr(message.from_user, "id", None),
+        content_type=message.content_type,
+        media_group_id=message.media_group_id,
+    )
+
+    items: List[Dict[str, Any]] = []
+
+    plain_text = message.text or ""
+    text_html = getattr(message, "html_text", None)
+
+    if plain_text:
+        items.append(
+            {
+                "type": "text",
+                "text": text_html or plain_text,
+                "plain_text": plain_text,
+                "parse_mode": "HTML" if text_html else None,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="text",
+            length=len(text_html or plain_text),
+        )
+
+    caption_plain = message.caption or ""
+    caption_html = getattr(message, "html_caption", None)
+    parse_mode = "HTML" if caption_html else None
+    caption_text = caption_html or caption_plain or None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        items.append(
+            {
+                "type": "photo",
+                "file_id": file_id,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="photo",
+            file_id=file_id,
+        )
+
+    if message.video:
+        file_id = message.video.file_id
+        items.append(
+            {
+                "type": "video",
+                "file_id": file_id,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="video",
+            file_id=file_id,
+        )
+
+    if message.document:
+        file_id = message.document.file_id
+        items.append(
+            {
+                "type": "document",
+                "file_id": file_id,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
+                "file_name": message.document.file_name,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="document",
+            file_id=file_id,
+        )
+
+    if message.audio:
+        file_id = message.audio.file_id
+        items.append(
+            {
+                "type": "audio",
+                "file_id": file_id,
+                "caption": caption_text,
+                "plain_caption": caption_plain or None,
+                "parse_mode": parse_mode,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="audio",
+            file_id=file_id,
+        )
+
+    if message.voice:
+        file_id = message.voice.file_id
+        items.append(
+            {
+                "type": "voice",
+                "file_id": file_id,
+            }
+        )
+        seller_logger.info(
+            "broadcast.extract.item",
+            message_id=message.message_id,
+            item_type="voice",
+            file_id=file_id,
+        )
+
+    if not items:
+        seller_logger.warning(
+            "broadcast.extract.empty",
+            message_id=message.message_id,
+            content_type=message.content_type,
+        )
+        raise ValueError("Unsupported message type for broadcast")
+
+    seller_logger.info(
+        "broadcast.extract.complete",
+        message_id=message.message_id,
+        total_items=len(items),
+    )
+    return items
+
+
+async def _send_preview_items(bot, chat_id: int, items: List[Dict[str, Any]]) -> None:
+    """Send broadcast items to a chat for preview purposes."""
+
+    seller_logger.info(
+        "broadcast.preview.send_start",
+        chat_id=chat_id,
+        total_items=len(items),
+    )
+
+    for index, item in enumerate(items):
+        item_type = item.get("type")
+        try:
+            if item_type == "text":
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=item.get("text", ""),
+                    parse_mode=item.get("parse_mode"),
+                )
+            elif item_type == "photo":
+                kwargs = {
+                    "chat_id": chat_id,
+                    "photo": item.get("file_id"),
+                }
+                if item.get("caption"):
+                    kwargs["caption"] = item["caption"]
+                    kwargs["parse_mode"] = item.get("parse_mode")
+                await bot.send_photo(**kwargs)
+            elif item_type == "video":
+                kwargs = {
+                    "chat_id": chat_id,
+                    "video": item.get("file_id"),
+                }
+                if item.get("caption"):
+                    kwargs["caption"] = item["caption"]
+                    kwargs["parse_mode"] = item.get("parse_mode")
+                await bot.send_video(**kwargs)
+            elif item_type == "document":
+                kwargs = {
+                    "chat_id": chat_id,
+                    "document": item.get("file_id"),
+                }
+                if item.get("caption"):
+                    kwargs["caption"] = item["caption"]
+                    kwargs["parse_mode"] = item.get("parse_mode")
+                await bot.send_document(**kwargs)
+            elif item_type == "audio":
+                kwargs = {
+                    "chat_id": chat_id,
+                    "audio": item.get("file_id"),
+                }
+                if item.get("caption"):
+                    kwargs["caption"] = item["caption"]
+                    kwargs["parse_mode"] = item.get("parse_mode")
+                await bot.send_audio(**kwargs)
+            elif item_type == "voice":
+                await bot.send_voice(
+                    chat_id=chat_id,
+                    voice=item.get("file_id"),
+                )
+            else:
+                seller_logger.warning(
+                    "broadcast.preview.unsupported_item",
+                    chat_id=chat_id,
+                    index=index,
+                    item_type=item_type,
+                )
+                continue
+
+            seller_logger.info(
+                "broadcast.preview.item_sent",
+                chat_id=chat_id,
+                index=index,
+                item_type=item_type,
+            )
+
+        except Exception as exc:
+            seller_logger.error(
+                "broadcast.preview.error",
+                chat_id=chat_id,
+                index=index,
+                item_type=item_type,
+                error=str(exc),
+            )
+            raise
+
+    seller_logger.info(
+        "broadcast.preview.send_complete",
+        chat_id=chat_id,
+        total_items=len(items),
+    )
 
 def _format_currency(amount: Decimal) -> str:
     try:
@@ -328,6 +586,7 @@ async def admin_panel(message: Message):
     # Broadcast management (editors and above)
     if capabilities.get("can_manage_broadcasts"):
         buttons.append([InlineKeyboardButton(text="📢 Рассылки", callback_data="admin_broadcasts")])
+        buttons.append([InlineKeyboardButton(text="🎁 Бонус", callback_data="admin_bonus")])
 
     # Materials management (editors and above)
     if capabilities.get("can_manage_materials"):
@@ -1149,115 +1408,846 @@ async def broadcast_management(callback: CallbackQuery):
 @role_required(AdminRole.EDITOR)
 async def broadcast_create(callback: CallbackQuery, state: FSMContext):
     """Start creating new broadcast."""
-    await state.set_state(AdminStates.waiting_for_broadcast_text)
-    await callback.message.edit_text(
-        "📝 <b>Новая рассылка</b>\n\n"
-        "Шаг 1/2: Отправьте текст сообщения.\n\n"
-        "📝 Можно использовать:\n"
-        "• <b>Жирный текст</b>\n"
-        "• <i>Курсив</i>\n"
-        "• <code>Моноширинный текст</code>\n"
-        "• Эмодзи 🚀",
-        parse_mode="HTML"
+    await state.set_state(AdminStates.waiting_for_broadcast_content)
+    await state.update_data(
+        broadcast_items=[],
+        selected_segment=None,
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
     )
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
 
-@router.message(AdminStates.waiting_for_broadcast_text)
-@role_required(AdminRole.EDITOR)
-async def broadcast_text_received(message: Message, state: FSMContext):
-    """Process broadcast text and show segment selection."""
-    broadcast_text = message.text
-    await state.update_data(broadcast_text=broadcast_text)
-    await state.set_state(AdminStates.waiting_for_broadcast_segment)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Все пользователи", callback_data="broadcast_all")],
-        [InlineKeyboardButton(text="❄️ Холодные", callback_data="broadcast_cold")],
-        [InlineKeyboardButton(text="🔥 Тёплые", callback_data="broadcast_warm")],
-        [InlineKeyboardButton(text="🌶️ Горячие", callback_data="broadcast_hot")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")]
-    ])
-    
-    preview_text = broadcast_text[:200] + "..." if len(broadcast_text) > 200 else broadcast_text
-    
-    await message.answer(
-        f"📝 <b>Превью сообщения:</b>\n\n{preview_text}\n\n"
-        f"🎯 <b>Шаг 2/2:</b> Выберите целевую аудиторию:",
+    await callback.message.edit_text(
+        "📝 <b>Новая рассылка</b>\n\n"
+        "Шаг 1/4: отправьте одно или несколько сообщений, которые должны попасть в рассылку.\n\n"
+        "Можно прикреплять текст, изображения, видео, документы, аудио и голосовые сообщения — в любом количестве."
+        " Когда добавите все материалы, появится кнопка «➡️ Выбрать аудиторию».",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+    seller_logger.info(
+        "broadcast.create.started",
+        admin_id=callback.from_user.id,
+    )
 
 
-@router.callback_query(F.data.startswith("broadcast_"))
+@router.message(AdminStates.waiting_for_broadcast_content)
 @role_required(AdminRole.EDITOR)
-async def broadcast_send(callback: CallbackQuery, state: FSMContext):
-    """Send broadcast to selected segment."""
+async def broadcast_content_received(message: Message, state: FSMContext):
+    """Collect broadcast content items from admin messages."""
+    seller_logger.info(
+        "broadcast.content.received",
+        admin_id=message.from_user.id,
+        message_id=message.message_id,
+    )
+
+    try:
+        new_items = _extract_broadcast_items(message)
+    except ValueError:
+        await message.answer(
+            "❌ Этот тип сообщения пока не поддерживается в рассылках."
+        )
+        return
+
+    data = await state.get_data()
+    items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+    items.extend(new_items)
+    summary_message_id = data.get("broadcast_summary_message_id")
+
+    counts = Counter(item.get("type") for item in items)
+    summary_parts = [
+        f"{label}: {count}"
+        for label, count in counts.items()
+    ]
+    summary = ", ".join(summary_parts)
+
+    preview_text = next(
+        (
+            (item.get("plain_text") or "").strip()
+            for item in items
+            if item.get("type") == "text" and item.get("plain_text")
+        ),
+        "",
+    )
+    if not preview_text:
+        preview_text = next(
+            (
+                (item.get("plain_caption") or "").strip()
+                for item in items
+                if item.get("plain_caption")
+            ),
+            "",
+        )
+
+    preview_display = (preview_text or "—").strip() or "—"
+    if len(preview_display) > 200:
+        preview_display = preview_display[:200] + "..."
+
+    summary_text = (
+        "✅ <b>Материалы для рассылки обновлены</b>\n"
+        f"Сейчас элементов: {len(items)}.\n"
+    )
+    if summary:
+        summary_text += f"📎 Состав: {summary}\n"
+    summary_text += (
+        f"📝 Предпросмотр текста: {escape(preview_display)}\n\n"
+        "Когда закончите добавлять материалы, нажмите «➡️ Выбрать аудиторию»."
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Выбрать аудиторию", callback_data="broadcast_choose_segment")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    summary_message = None
+    if summary_message_id:
+        try:
+            await message.bot.edit_message_text(
+                summary_text,
+                chat_id=message.chat.id,
+                message_id=summary_message_id,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            summary_message = await message.answer(
+                summary_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+    if summary_message is None and not summary_message_id:
+        summary_message = await message.answer(
+            summary_text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    if summary_message:
+        summary_message_id = summary_message.message_id
+
+    await state.update_data(
+        broadcast_items=items,
+        broadcast_summary_message_id=summary_message_id,
+    )
+    seller_logger.info(
+        "broadcast.content.stored",
+        admin_id=message.from_user.id,
+        total_items=len(items),
+    )
+
+
+@router.callback_query(F.data == "broadcast_choose_segment")
+@role_required(AdminRole.EDITOR)
+async def broadcast_choose_segment(callback: CallbackQuery, state: FSMContext):
+    """Move to segment selection after content preparation."""
+    data = await state.get_data()
+    items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+
+    if not items:
+        await callback.answer("Сначала добавьте хотя бы одно сообщение", show_alert=True)
+        seller_logger.info(
+            "broadcast.segment.denied",
+            admin_id=callback.from_user.id,
+            reason="no_items",
+        )
+        return
+
+    await state.update_data(
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
+    )
+
+    counts = Counter(item.get("type") for item in items)
+    summary_parts = [f"{label}: {count}" for label, count in counts.items()]
+    summary = ", ".join(summary_parts)
+
+    preview_text = next(
+        (
+            (item.get("plain_text") or "").strip()
+            for item in items
+            if item.get("type") == "text" and item.get("plain_text")
+        ),
+        "",
+    )
+    if not preview_text:
+        preview_text = next(
+            (
+                (item.get("plain_caption") or "").strip()
+                for item in items
+                if item.get("plain_caption")
+            ),
+            "",
+        )
+
+    preview_text = preview_text or "—"
+    if len(preview_text) > 200:
+        preview_text = preview_text[:200] + "..."
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Все пользователи", callback_data="broadcast_all")],
+            [InlineKeyboardButton(text="❄️ Холодные", callback_data="broadcast_cold")],
+            [InlineKeyboardButton(text="🔥 Тёплые", callback_data="broadcast_warm")],
+            [InlineKeyboardButton(text="🌶️ Горячие", callback_data="broadcast_hot")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await state.set_state(AdminStates.waiting_for_broadcast_segment)
+    await callback.message.edit_text(
+        "📦 <b>Материалы собраны</b>\n\n"
+        f"📝 Предпросмотр текста: {escape(preview_text)}\n"
+        + (f"📎 Вложения: {summary}\n\n" if summary else "\n")
+        + "🎯 <b>Шаг 2/4:</b> Выберите целевую аудиторию:",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    seller_logger.info(
+        "broadcast.segment.selection_started",
+        admin_id=callback.from_user.id,
+        total_items=len(items),
+    )
+
+
+@router.callback_query(F.data.in_({"broadcast_all", "broadcast_cold", "broadcast_warm", "broadcast_hot"}))
+@role_required(AdminRole.EDITOR)
+async def broadcast_segment_selected(callback: CallbackQuery, state: FSMContext):
+    """Show preview for the selected segment before sending."""
     try:
         segment = callback.data.split("_")[1]
-        
-        if segment in ["all", "cold", "warm", "hot"]:
-            data = await state.get_data()
-            broadcast_text = data.get("broadcast_text")
-            
-            if broadcast_text:
-                # Import broadcast service
-                from app.services.broadcast_service import BroadcastService
-                from app.db import get_db
-                
-                async for session in get_db():
-                    broadcast_service = BroadcastService(callback.bot, session)
-                    
-                    # Create segment filter
-                    segment_filter = None
-                    if segment != "all":
-                        segment_map = {
-                            "cold": "COLD",
-                            "warm": "WARM", 
-                            "hot": "HOT"
-                        }
-                        segment_filter = {"segments": [segment_map[segment]]}
-                    
-                    # Create and send broadcast
-                    broadcast = await broadcast_service.create_simple_broadcast(
-                        title=f"Рассылка {datetime.now().strftime('%d.%m.%Y')}",
-                        body=broadcast_text,
-                        segment_filter=segment_filter
-                    )
-                    
-                    # Send broadcast
-                    result = await broadcast_service.send_simple_broadcast(broadcast.id)
-                    break
-                
-                segment_names = {
-                    "all": "👥 Все пользователи",
-                    "cold": "❄️ Холодные",
-                    "warm": "🔥 Тёплые", 
-                    "hot": "🌶️ Горячие"
-                }
-                
-                sent = result.get("sent", 0)
-                failed = result.get("failed", 0)
-                total = result.get("total", 0)
-                
-                await callback.message.edit_text(
-                    f"✅ <b>Рассылка отправлена!</b>\n\n"
-                    f"📝 Текст: {broadcast_text[:100]}...\n"
-                    f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
-                    f"📊 Результат: {sent} отправлено, {failed} ошибок из {total}\n"
-                    f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-                    parse_mode="HTML"
-                )
-                
-                await state.clear()
-            else:
-                await callback.answer("❌ Текст рассылки не найден", show_alert=True)
-        else:
-            await callback.answer("❌ Неверный сегмент", show_alert=True)
-            
+        data = await state.get_data()
+        items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+
+        if not items:
+            await callback.answer("❌ Материалы рассылки не найдены", show_alert=True)
+            seller_logger.warning(
+                "broadcast.segment.no_materials",
+                admin_id=callback.from_user.id,
+                segment=segment,
+            )
+            await state.set_state(AdminStates.waiting_for_broadcast_content)
+            return
+
+        items = list(items)
+        await state.update_data(
+            broadcast_items=items,
+            selected_segment=segment,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_schedule)
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Изменить аудиторию", callback_data="broadcast_choose_segment")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+            ]
+        )
+
+        await callback.message.edit_text(
+            "🗓 <b>Планирование рассылки</b>\n\n"
+            "Шаг 3/4: отправьте дату и время публикации в формате <code>01.01.2025 17:00</code>.\n"
+            "Время указывается по Москве (UTC+3). После ввода пришлю кнопку «➡️ Продолжить».",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        seller_logger.info(
+            "broadcast.schedule.requested",
+            admin_id=callback.from_user.id,
+            segment=segment,
+            total_items=len(items),
+        )
+
     except Exception as e:
         logger.error(f"Error sending broadcast: {e}")
         await callback.answer("❌ Ошибка при отправке рассылки", show_alert=True)
         await state.clear()
+
+
+@router.message(AdminStates.waiting_for_broadcast_schedule)
+@role_required(AdminRole.EDITOR)
+async def broadcast_schedule_received(message: Message, state: FSMContext):
+    """Receive and validate the scheduled send time from admin."""
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        await message.answer(
+            "❌ Укажите дату и время в формате <code>01.01.2025 17:00</code> (Москва).",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        scheduled_naive = datetime.strptime(raw_text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат. Используйте <code>01.01.2025 17:00</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    scheduled_local = scheduled_naive.replace(tzinfo=MOSCOW_TZ)
+    now_local = datetime.now(MOSCOW_TZ)
+    if scheduled_local <= now_local:
+        await message.answer(
+            "❌ Укажите дату и время в будущем (Москва).",
+            parse_mode="HTML",
+        )
+        return
+
+    scheduled_utc = scheduled_local.astimezone(timezone.utc)
+    scheduled_display = scheduled_local.strftime("%d.%m.%Y %H:%M")
+
+    await state.update_data(
+        scheduled_for_iso=scheduled_utc.isoformat(),
+        scheduled_for_display=scheduled_display,
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="broadcast_schedule_continue")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await message.answer(
+        "✅ Рассылка сохранена и будет опубликована в указанное время.\n"
+        f"🗓 {escape(scheduled_display)} (Мск)\n\n"
+        "Нажмите «➡️ Продолжить», чтобы перейти к предпросмотру.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    seller_logger.info(
+        "broadcast.schedule.saved",
+        admin_id=message.from_user.id,
+        scheduled_for=scheduled_utc.isoformat(),
+    )
+
+
+async def _present_broadcast_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    """Send preview of the broadcast content and show confirmation controls."""
+    data = await state.get_data()
+    items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+    segment = data.get("selected_segment")
+    scheduled_display = data.get("scheduled_for_display")
+
+    if not items or not segment:
+        await callback.answer("❌ Не удалось сформировать предпросмотр", show_alert=True)
+        seller_logger.warning(
+            "broadcast.preview.missing_data",
+            admin_id=callback.from_user.id,
+            has_items=bool(items),
+            segment=segment,
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_content)
+        await state.update_data(
+            selected_segment=None,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
+        )
+        return
+
+    await callback.message.edit_text(
+        "📋 Формируем предпросмотр…",
+        parse_mode="HTML",
+    )
+
+    try:
+        await _send_preview_items(callback.bot, callback.message.chat.id, items)
+    except Exception:
+        await callback.message.answer(
+            "❌ Не удалось показать предпросмотр. Попробуйте ещё раз или измените материалы.",
+            parse_mode="HTML",
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_content)
+        await state.update_data(
+            selected_segment=None,
+            scheduled_for_iso=None,
+            scheduled_for_display=None,
+        )
+        await callback.answer()
+        return
+
+    counts = Counter(item.get("type") for item in items)
+    summary_parts = [f"{label}: {count}" for label, count in counts.items()]
+    summary = ", ".join(summary_parts)
+
+    segment_names = {
+        "all": "👥 Все пользователи",
+        "cold": "❄️ Холодные",
+        "warm": "🔥 Тёплые",
+        "hot": "🌶️ Горячие",
+    }
+
+    summary_message = (
+        "📋 <b>Предпросмотр готов</b>\n\n"
+        f"🎯 Аудитория: {segment_names.get(segment, segment)}"
+    )
+    if scheduled_display:
+        summary_message += f"\n🗓 Отправка: {escape(scheduled_display)} (Мск)"
+    if summary:
+        summary_message += f"\n📎 Материалы: {summary}"
+    summary_message += "\n\n📌 Предпросмотр отправлен только вам."
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast_confirm_send")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data="broadcast_edit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await callback.message.edit_text(
+        summary_message + "\n\n🚀 <b>Шаг 4/4:</b> Отправить рассылку?",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+    seller_logger.info(
+        "broadcast.preview.presented",
+        admin_id=callback.from_user.id,
+        segment=segment,
+        total_items=len(items),
+        scheduled_for=scheduled_display,
+    )
+
+
+@router.callback_query(F.data == "broadcast_schedule_continue")
+@role_required(AdminRole.EDITOR)
+async def broadcast_schedule_continue(callback: CallbackQuery, state: FSMContext):
+    """Move to preview after schedule confirmation."""
+    data = await state.get_data()
+    if not data.get("scheduled_for_iso"):
+        await callback.answer("Сначала укажите дату и время отправки", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_broadcast_confirmation)
+    await _present_broadcast_preview(callback, state)
+
+
+@router.callback_query(F.data == "broadcast_edit")
+@role_required(AdminRole.EDITOR)
+async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
+    """Return to content collection for editing."""
+    data = await state.get_data()
+    previous_count = len(data.get("broadcast_items", []))
+
+    await state.set_state(AdminStates.waiting_for_broadcast_content)
+    await state.update_data(
+        broadcast_items=[],
+        selected_segment=None,
+        broadcast_summary_message_id=None,
+        scheduled_for_iso=None,
+        scheduled_for_display=None,
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcasts")],
+        ]
+    )
+
+    await callback.message.edit_text(
+        "✏️ <b>Редактирование рассылки</b>\n\n"
+        "Все предыдущие материалы удалены. Отправьте новые сообщения и вложения — после этого появится кнопка выбора аудитории.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+    seller_logger.info(
+        "broadcast.edit.reset",
+        admin_id=callback.from_user.id,
+        removed_items=previous_count,
+    )
+
+
+@router.callback_query(F.data == "broadcast_confirm_send")
+@role_required(AdminRole.EDITOR)
+async def broadcast_confirm_send(callback: CallbackQuery, state: FSMContext):
+    """Finalize and send the broadcast to selected segment."""
+    data = await state.get_data()
+    items: List[Dict[str, Any]] = data.get("broadcast_items", [])
+    segment = data.get("selected_segment")
+    scheduled_iso = data.get("scheduled_for_iso")
+    scheduled_display = data.get("scheduled_for_display")
+
+    if not items or not segment:
+        await callback.answer("❌ Не удалось отправить: нет данных рассылки", show_alert=True)
+        seller_logger.error(
+            "broadcast.send.missing_data",
+            admin_id=callback.from_user.id,
+            has_items=bool(items),
+            segment=segment,
+        )
+        await state.clear()
+        return
+
+    if not scheduled_iso or not scheduled_display:
+        await callback.answer("❌ Укажите дату и время отправки перед подтверждением", show_alert=True)
+        seller_logger.error(
+            "broadcast.send.missing_schedule",
+            admin_id=callback.from_user.id,
+            segment=segment,
+        )
+        await state.clear()
+        return
+
+    scheduled_at = datetime.fromisoformat(scheduled_iso)
+    now_utc = datetime.now(timezone.utc)
+    immediate_send = scheduled_at <= now_utc + timedelta(minutes=1)
+
+    seller_logger.info(
+        "broadcast.send.started",
+        admin_id=callback.from_user.id,
+        segment=segment,
+        total_items=len(items),
+        scheduled_for=scheduled_iso,
+        immediate=immediate_send,
+    )
+
+    text_preview = next(
+        (
+            (item.get("plain_text") or "").strip()
+            for item in items
+            if item.get("type") == "text" and item.get("plain_text")
+        ),
+        "",
+    )
+    if not text_preview:
+        text_preview = next(
+            (
+                (item.get("plain_caption") or "").strip()
+                for item in items
+                if item.get("plain_caption")
+            ),
+            "",
+        )
+
+    body_preview = text_preview or ""
+
+    segment_filter = None
+    if segment != "all":
+        segment_map = {
+            "cold": "COLD",
+            "warm": "WARM",
+            "hot": "HOT",
+        }
+        segment_filter = {"segments": [segment_map.get(segment, segment.upper())]}
+
+    try:
+        from app.services.broadcast_service import BroadcastService
+        from app.db import get_db
+
+        send_result: Dict[str, Any] = {}
+        job_id: Optional[str] = None
+
+        async for session in get_db():
+            broadcast_service = BroadcastService(callback.bot, session)
+            broadcast = await broadcast_service.create_simple_broadcast(
+                title=f"Рассылка {datetime.now().strftime('%d.%m.%Y')}",
+                body=body_preview,
+                segment_filter=segment_filter,
+                content=items,
+            )
+
+            await session.commit()
+
+            if immediate_send:
+                send_result = await broadcast_service.send_simple_broadcast(broadcast.id)
+                await session.commit()
+            else:
+                job_id = await scheduler_service.schedule_broadcast(broadcast.id, scheduled_at)
+                send_result = {"job_id": job_id}
+
+            break
+
+        segment_names = {
+            "all": "👥 Все пользователи",
+            "cold": "❄️ Холодные",
+            "warm": "🔥 Тёплые",
+            "hot": "🌶️ Горячие",
+        }
+
+        preview_display = text_preview or "—"
+        if len(preview_display) > 100:
+            preview_display = preview_display[:100] + "..."
+
+        counts = Counter(item.get("type") for item in items)
+        summary_parts = [f"{label}: {count}" for label, count in counts.items()]
+        summary = ", ".join(summary_parts)
+
+        if immediate_send:
+            sent = send_result.get("sent", 0)
+            failed = send_result.get("failed", 0)
+            total = send_result.get("total", 0)
+
+            await callback.message.edit_text(
+                f"✅ <b>Рассылка отправлена!</b>\n\n"
+                f"📝 Текст: {escape(preview_display)}\n"
+                + (f"📎 Материалы: {summary}\n" if summary else "")
+                + f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
+                + f"🗓 План: {escape(scheduled_display)} (Мск)\n"
+                + f"📊 Результат: {sent} отправлено, {failed} ошибок из {total}\n"
+                + f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+                parse_mode="HTML",
+            )
+            await callback.answer("Рассылка запущена")
+            await state.clear()
+            seller_logger.info(
+                "broadcast.send.completed",
+                admin_id=callback.from_user.id,
+                segment=segment,
+                scheduled_for=scheduled_iso,
+                sent=sent,
+                failed=failed,
+                total=total,
+            )
+        else:
+            await callback.message.edit_text(
+                f"✅ <b>Рассылка запланирована!</b>\n\n"
+                f"📝 Текст: {escape(preview_display)}\n"
+                + (f"📎 Материалы: {summary}\n" if summary else "")
+                + f"🎯 Аудитория: {segment_names.get(segment, segment)}\n"
+                + f"🗓 Отправка: {escape(scheduled_display)} (Мск)\n",
+                parse_mode="HTML",
+            )
+            await callback.answer("Рассылка запланирована")
+            await state.clear()
+            seller_logger.info(
+                "broadcast.send.scheduled",
+                admin_id=callback.from_user.id,
+                segment=segment,
+                scheduled_for=scheduled_iso,
+                scheduler_job_id=job_id,
+            )
+
+    except Exception as exc:
+        logger.exception("Error sending broadcast", exc_info=exc)
+        await callback.answer("❌ Ошибка при запуске рассылки", show_alert=True)
+        seller_logger.error(
+            "broadcast.send.failed",
+            admin_id=callback.from_user.id,
+            segment=segment,
+            error=str(exc),
+        )
+        await state.clear()
+
+# Bonus Management
+@router.callback_query(F.data == "admin_bonus")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_menu(callback: CallbackQuery, state: FSMContext):
+    """Entry point for managing bonus materials."""
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Начать", callback_data="admin_bonus_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "🎁 <b>Бонусный материал</b>\n\nЗдесь Вы можете изменить бонус-файл и описание",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    logger.info("Admin %s opened bonus management", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_start")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_start(callback: CallbackQuery, state: FSMContext):
+    """Ask admin to upload a new bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await state.update_data(pending_bonus_file=None, pending_bonus_caption=None)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s started bonus file upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_bonus_file)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_file_received(message: Message, state: FSMContext):
+    """Handle bonus file upload from admin."""
+    document = message.document
+    if not document:
+        await message.answer("Пожалуйста, отправьте файл в формате PDF.")
+        logger.warning("Admin %s sent non-document while bonus file awaited", message.from_user.id)
+        return
+
+    filename = (document.file_name or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        await message.answer("Поддерживаются только PDF-файлы. Отправьте корректный файл.")
+        logger.warning("Admin %s attempted non-pdf bonus file %s", message.from_user.id, filename)
+        return
+
+    target_path = BonusContentManager.target_path(filename)
+    try:
+        await message.bot.download(document, destination=target_path)
+    except Exception as exc:  # pragma: no cover - network/filesystem guard
+        logger.exception(
+            "Failed to store bonus file %s for admin %s: %s",
+            filename,
+            message.from_user.id,
+            exc,
+        )
+        await message.answer("❌ Не удалось сохранить файл. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    existing_caption = data.get("pending_bonus_caption")
+
+    await state.update_data(pending_bonus_file=filename)
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+
+    if existing_caption:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        ])
+        await message.answer(
+            "Файл сохранён. Можно открыть «Предпросмотр» или отправить новое описание.",
+            reply_markup=keyboard,
+        )
+        logger.info(
+            "Admin %s replaced bonus file at %s keeping caption length=%d",
+            message.from_user.id,
+            target_path,
+            len(existing_caption),
+        )
+    else:
+        await message.answer("Файл сохранён. Напишите описание для этого файла, которое увидят пользователи.")
+        logger.info("Admin %s uploaded new bonus file saved to %s", message.from_user.id, target_path)
+
+
+@router.message(AdminStates.waiting_for_bonus_description)
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_description_received(message: Message, state: FSMContext):
+    """Store bonus description text provided by admin."""
+    caption = (message.text or "").strip()
+    if not caption:
+        await message.answer("Описание не может быть пустым. Введите текст ещё раз.")
+        logger.warning("Admin %s submitted empty bonus description", message.from_user.id)
+        return
+
+    await state.update_data(pending_bonus_caption=caption)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Предпросмотр", callback_data="admin_bonus_preview")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+    await message.answer(
+        "Описание сохранено. Нажмите «Предпросмотр», чтобы увидеть файл так, как его получат пользователи.",
+        reply_markup=keyboard,
+    )
+    logger.info("Admin %s provided bonus description length=%d", message.from_user.id, len(caption))
+
+
+@router.callback_query(F.data == "admin_bonus_preview")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_preview(callback: CallbackQuery, state: FSMContext):
+    """Send preview of the new bonus file with caption."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Сначала загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s requested bonus preview without data", callback.from_user.id)
+        return
+
+    file_path = BonusContentManager.ensure_storage() / filename
+    if not file_path.exists():
+        await callback.answer("Файл не найден. Загрузите его снова.", show_alert=True)
+        logger.warning("Admin %s preview missing file at %s", callback.from_user.id, file_path)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сохранить и опубликовать", callback_data="admin_bonus_publish")],
+        [InlineKeyboardButton(text="Редактировать файл", callback_data="admin_bonus_edit_file")],
+        [InlineKeyboardButton(text="Редактировать подпись", callback_data="admin_bonus_edit_caption")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+    ])
+
+    await callback.message.answer_document(
+        FSInputFile(file_path),
+        caption=caption,
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s previewed bonus content file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_file")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_file(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to re-upload bonus file."""
+    await state.set_state(AdminStates.waiting_for_bonus_file)
+    await callback.message.answer(
+        "Загрузите сюда новый файл, он будет отправляться в качестве нового бонусного файла",
+    )
+    logger.info("Admin %s requested bonus file re-upload", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_edit_caption")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_edit_caption(callback: CallbackQuery, state: FSMContext):
+    """Allow admin to update bonus caption."""
+    await state.set_state(AdminStates.waiting_for_bonus_description)
+    await callback.message.answer("Напишите описание для этого файла, которое увидят пользователи.")
+    logger.info("Admin %s requested bonus caption re-edit", callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bonus_publish")
+@role_required(AdminRole.EDITOR)
+async def admin_bonus_publish(callback: CallbackQuery, state: FSMContext):
+    """Persist bonus changes and publish them for users."""
+    data = await state.get_data()
+    filename = data.get("pending_bonus_file")
+    caption = data.get("pending_bonus_caption")
+
+    if not filename or not caption:
+        await callback.answer("Нет данных для сохранения. Загрузите файл и описание.", show_alert=True)
+        logger.warning("Admin %s attempted to publish bonus without data", callback.from_user.id)
+        return
+
+    BonusContentManager.persist_metadata(filename, caption)
+    await state.clear()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
+        [InlineKeyboardButton(text="🎁 Настроить снова", callback_data="admin_bonus")],
+    ])
+
+    await callback.message.answer(
+        "✅ Новый бонус сохранён и будет показан пользователям.",
+        reply_markup=keyboard,
+    )
+    logger.info(
+        "Admin %s published bonus file=%s caption_length=%d",
+        callback.from_user.id,
+        filename,
+        len(caption),
+    )
+    await callback.answer("Готово!")
 
 
 # Leads Management
@@ -1352,13 +2342,25 @@ async def users_management(callback: CallbackQuery):
         [InlineKeyboardButton(text="👥 Последние регистрации", callback_data="users_recent")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
     ])
-    
+
     await callback.message.edit_text(
         "👤 <b>Управление пользователями</b>\n\n"
         "Выберите действие:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+
+
+@router.callback_query(F.data == "users_search")
+@role_required(AdminRole.ADMIN)
+async def users_search(callback: CallbackQuery):
+    """Placeholder for user search functionality."""
+    logger.info(
+        "users_search callback triggered by user_id=%s - feature not configured",
+        callback.from_user.id,
+    )
+    await callback.answer()
+    await callback.message.answer("Функция не настроена")
 
 
 @router.callback_query(F.data == "users_stats")

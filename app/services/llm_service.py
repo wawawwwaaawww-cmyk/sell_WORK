@@ -28,6 +28,10 @@ class LLMContext:
     relevant_products: List[Dict[str, Any]] = None
     funnel_stage: str = "new"
     scenario_prompt: Optional[str] = None
+    active_function: Optional[str] = None
+    recent_messages: Optional[List[Dict[str, Any]]] = None
+    conversation_pairs: Optional[List[Dict[str, str]]] = None
+    product_focus: Optional[Dict[str, Any]] = None
 
 
 @dataclass 
@@ -111,10 +115,17 @@ class LLMService:
         self.policy_layer = PolicyLayer()
         self.safety_validator = SafetyValidator()
         self.logger = structlog.get_logger()
-        
+
         # Load system prompts
         self.system_prompt = prompt_loader.get_system_prompt()
         self.safety_policies = prompt_loader.get_safety_policies()
+        self.sales_methodology = prompt_loader.get_sales_methodology()
+        self.persona_prompt = prompt_loader.load_prompt("system_manager") or ""
+        followups_prompt = prompt_loader.load_prompt("followups") or ""
+        self.dialog_analysis_guidelines = self._extract_guideline_section(
+            followups_prompt,
+            header="АНАЛИЗ СООБЩЕНИЙ",
+        )
     
     async def generate_response(self, context: LLMContext) -> LLMResponse:
         """Generate LLM response with safety and policy validation."""
@@ -186,7 +197,7 @@ class LLMService:
         kwargs: Dict[str, Any] = {
             "model": model_to_use,
             "messages": messages,
-            "max_completion_tokens": max_tokens,
+            "max_tokens": max_tokens,
         }
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
@@ -219,6 +230,73 @@ class LLMService:
                     expect_json=expect_json,
                 )
             raise
+
+    def _use_responses_api(self) -> bool:
+        """Determine whether to call the Responses API instead of Chat Completions."""
+        model_name = settings.openai_model or ""
+        use_responses = model_name.startswith(("o", "gpt-4.1"))
+        self.logger.debug(
+            "llm_responses_api_check",
+            model=model_name,
+            use_responses=use_responses,
+        )
+        return use_responses
+
+    def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert chat-completion style messages to Responses API input format."""
+        formatted: List[Dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            formatted.append(
+                {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": str(content),
+                        }
+                    ],
+                }
+            )
+
+        self.logger.debug(
+            "llm_responses_input_prepared",
+            items=len(formatted),
+        )
+        return formatted
+
+    def _extract_responses_content(self, response: Any) -> str:
+        """Extract plain text content from Responses API result."""
+        if response is None:
+            self.logger.debug("llm_responses_content_absent")
+            return ""
+
+        if hasattr(response, "output_text") and response.output_text:
+            text_value = str(response.output_text)
+            self.logger.debug(
+                "llm_responses_content_extracted",
+                via="output_text",
+                length=len(text_value),
+            )
+            return text_value
+
+        chunks = []
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "output_text":
+                chunks.append(str(getattr(item, "text", "")))
+                continue
+            for content_item in getattr(item, "content", []) or []:
+                if isinstance(content_item, dict) and content_item.get("type") == "output_text":
+                    chunks.append(str(content_item.get("text", "")))
+
+        extracted = "".join(chunks)
+        self.logger.debug(
+            "llm_responses_content_extracted",
+            via="output",
+            length=len(extracted),
+        )
+        return extracted
 
     def _sanitize_json_string(self, raw: str) -> Optional[str]:
         """Normalize raw LLM output before JSON parsing."""
@@ -261,7 +339,7 @@ class LLMService:
         messages = [
             {"role": "system", "content": self._build_system_message(context)}
         ]
-        
+
         # Add conversation history
         for msg in context.messages_history[-10:]:  # Last 10 messages
             role = "assistant" if msg["role"] == "bot" else "user"
@@ -269,18 +347,80 @@ class LLMService:
                 "role": role,
                 "content": msg["text"]
             })
-        
+
         return messages
-    
+
+    def _extract_guideline_section(self, prompt_text: str, header: str) -> str:
+        """Extract specific guideline section from prompt text with logging."""
+
+        has_prompt = bool(prompt_text)
+        self.logger.info(
+            "guideline_extraction_started",
+            header=header,
+            has_prompt=has_prompt,
+        )
+
+        if not has_prompt:
+            self.logger.warning(
+                "guideline_prompt_missing",
+                header=header,
+            )
+            return ""
+
+        lines = prompt_text.splitlines()
+        header_upper = header.strip().upper()
+        capture = False
+        collected: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not capture:
+                if stripped.upper().startswith(header_upper):
+                    capture = True
+                    self.logger.debug(
+                        "guideline_section_detected",
+                        header=header,
+                        line=stripped,
+                    )
+                    continue
+            else:
+                if (
+                    stripped
+                    and stripped == stripped.upper()
+                    and stripped.endswith(":")
+                    and stripped.upper() != header_upper
+                ):
+                    break
+                collected.append(line.rstrip())
+
+        extracted = "\n".join(collected).strip()
+
+        self.logger.info(
+            "guideline_extraction_completed",
+            header=header,
+            length=len(extracted),
+        )
+
+        return extracted
+
     def _build_system_message(self, context: LLMContext) -> str:
         """Build comprehensive system message with context."""
         user = context.user
-        
+
         # User profile
+        knowledge_level_map = {
+            UserSegment.COLD: "новичок",
+            UserSegment.WARM: "продвинутый",
+            UserSegment.HOT: "эксперт",
+        }
+
+        knowledge_level = knowledge_level_map.get(user.segment, "не определён")
+
         profile_info = f"""
 ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ:
 - Имя: {user.first_name or 'Не указано'} {user.last_name or ''}
 - Сегмент: {user.segment or 'не определен'} ({user.lead_score} баллов)
+- Уровень знаний: {knowledge_level}
 - Этап воронки: {user.funnel_stage}
 - Телефон: {'указан' if user.phone else 'не указан'}
 - Email: {'указан' if user.email else 'не указан'}
@@ -309,13 +449,72 @@ class LLMService:
         if context.scenario_prompt:
             scenario_block = f"\nСЦЕНАРНЫЕ УКАЗАНИЯ:\n{context.scenario_prompt}\n"
 
+        persona_block = ""
+        if self.persona_prompt:
+            persona_block = f"\nПЕРСОНАЖ И СТИЛЬ:\n{self.persona_prompt}\n"
+
+        dialogue_guidelines_block = ""
+        if self.dialog_analysis_guidelines:
+            dialogue_guidelines_block = (
+                "\nАНАЛИЗ ДИАЛОГА (из подсказки FOLLOW-UPS):\n"
+                f"{self.dialog_analysis_guidelines}\n"
+                "Следуй этим принципам, чтобы понимать ответы пользователя и реагировать по смыслу. "
+                "Если он отвечает по существу твоего вопроса (даже другими словами или синонимами), продолжай диалог в той же логике. "
+                "Если пользователь меняет тему или задает новый вопрос, переключайся на новый смысл и отвечай, опираясь на последние пять сообщений и общий контекст ниже."
+            )
+        else:
+            dialogue_guidelines_block = (
+                "\nАНАЛИЗ ДИАЛОГА:\n"
+                "Внимательно анализируй последние пять сообщений и отвечай по смыслу. "
+                "Сохраняй текущую тему, если пользователь дал релевантный ответ, и переключайся, если тема изменилась."
+            )
+
+        recent_messages_block = ""
+        if context.recent_messages:
+            formatted = []
+            for msg in context.recent_messages:
+                role = msg.get("role")
+                text = msg.get("text", "").replace("\n", " ")
+                timestamp = msg.get("timestamp") or msg.get("created_at")
+                if hasattr(timestamp, "isoformat"):
+                    timestamp = timestamp.isoformat()
+                formatted.append(f"- {role}: {text[:400]} ({timestamp})")
+            recent_messages_block = "\nПОСЛЕДНИЕ 5 СООБЩЕНИЙ:\n" + "\n".join(formatted)
+
+        qa_block = ""
+        if context.conversation_pairs:
+            pairs = []
+            for idx, pair in enumerate(context.conversation_pairs, start=1):
+                user_q = pair.get("user", "").replace("\n", " ")
+                bot_a = pair.get("bot", "").replace("\n", " ")
+                pairs.append(f"{idx}. Вопрос: {user_q[:400]}\n   Ответ: {bot_a[:400]}")
+            qa_block = "\nИСТОРИЯ Q/A:\n" + "\n".join(pairs)
+
+        active_function_block = ""
+        if context.active_function:
+            active_function_block = f"\nАКТИВНАЯ ФУНКЦИЯ БОТА: {context.active_function}"
+
+        product_focus_block = ""
+        if context.product_focus:
+            product = context.product_focus
+            product_focus_block = (
+                "\nТЕКУЩИЙ ПРОДУКТ К ПРОДАЖЕ: "
+                f"{product.get('name', 'Без названия')} — цена {product.get('price', 'N/A')}"
+                f". Описание: {product.get('description', '')[:400]}"
+            )
+
         return f"""
-{self.system_prompt}{scenario_block}
+{self.system_prompt}{scenario_block}{persona_block}{dialogue_guidelines_block}
 {profile_info}
 {survey_info}
 {materials_info}
 {products_info}
+{recent_messages_block}
+{qa_block}
+{active_function_block}
+{product_focus_block}
 
+ПРОДАЖНАЯ МЕТОДОЛОГИЯ: {self.sales_methodology}
 ПОЛИТИКИ БЕЗОПАСНОСТИ: {self.safety_policies}
 
 ЗАДАЧА: Твой ответ ДОЛЖЕН быть в формате JSON со следующими полями: "reply_text" (string), "buttons" (list of dicts with "text" and "callback"), "next_action" (string), "confidence" (float).

@@ -246,6 +246,38 @@ class SchedulerService:
             )
             raise
 
+    async def schedule_broadcast(self, broadcast_id: int, run_time: datetime) -> str:
+        """Schedule a broadcast delivery."""
+        try:
+            if run_time.tzinfo is None:
+                run_date = self.timezone.localize(run_time)
+            else:
+                run_date = run_time.astimezone(self.timezone)
+
+            job = self.scheduler.add_job(
+                send_scheduled_broadcast,
+                trigger=DateTrigger(run_date=run_date, timezone=self.timezone),
+                args=[broadcast_id],
+                id=f"broadcast_send_{broadcast_id}",
+                replace_existing=True,
+            )
+
+            logger.info(
+                "Scheduled broadcast delivery (broadcast_id=%s, run_at=%s, job_id=%s)",
+                broadcast_id,
+                run_date,
+                job.id,
+            )
+            return job.id
+
+        except Exception as exc:
+            logger.error(
+                "Error scheduling broadcast (broadcast_id=%s)",
+                broadcast_id,
+                exc_info=exc,
+            )
+            raise
+
 
     def cancel_job(self, job_id: Optional[str]) -> None:
         """Cancel a scheduled job if it exists."""
@@ -263,6 +295,28 @@ class SchedulerService:
             )
 
 # Background job implementations
+
+
+async def send_scheduled_broadcast(broadcast_id: int) -> None:
+    """Deliver a scheduled broadcast."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            broadcast_service = BroadcastService(notification_service.bot, db)
+            result = await broadcast_service.send_simple_broadcast(broadcast_id)
+            await db.commit()
+            logger.info(
+                "Scheduled broadcast sent (broadcast_id=%s, result=%s)",
+                broadcast_id,
+                result,
+            )
+            break
+    except Exception as exc:
+        logger.error(
+            "Error sending scheduled broadcast (broadcast_id=%s)",
+            broadcast_id,
+            exc_info=exc,
+        )
 
 
 async def send_daily_lead_reminders() -> None:

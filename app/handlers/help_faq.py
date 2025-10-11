@@ -8,6 +8,7 @@ from typing import Optional
 
 from app.handlers.scene_dispatcher import try_process_command
 from app.models import User
+from app.services.logging_service import ConversationLoggingService
 
 router = Router()
 
@@ -16,10 +17,21 @@ router = Router()
 async def help_command(message: Message, user: Optional[User] = None, **kwargs):
     """Handle /help command."""
     session = kwargs.get("session")
+    conversation_logger = ConversationLoggingService(session) if session else None
     if session and user:
         handled = await try_process_command(message, "/help", session=session, user=user)
         if handled:
             return
+        if conversation_logger:
+            await conversation_logger.log_user_message(
+                user_id=user.id,
+                text=message.text or "/help",
+                bot=message.bot,
+                user=user,
+                telegram_user=message.from_user,
+                metadata={"source": "command"},
+                source_message=message,
+            )
     help_text = """🆘 <b>Помощь по работе с ботом</b>
 
 🚀 <b>Основные команды:</b>
@@ -53,11 +65,22 @@ async def help_command(message: Message, user: Optional[User] = None, **kwargs):
         [InlineKeyboardButton(text="📞 Консультация", callback_data=Callbacks.CONSULT_OFFER)]
     ])
     
-    await message.answer(
-        help_text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    if conversation_logger and user:
+        await conversation_logger.send_or_edit(
+            message,
+            text=help_text,
+            user_id=user.id,
+            user=user,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            prefer_edit=False,
+        )
+    else:
+        await message.answer(
+            help_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
 
 
 @router.callback_query(F.data == "restart")

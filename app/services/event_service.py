@@ -1,5 +1,6 @@
 """Event repository for tracking user actions."""
 
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 import structlog
