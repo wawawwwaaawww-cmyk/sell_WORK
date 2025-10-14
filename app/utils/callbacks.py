@@ -56,6 +56,9 @@ class Callbacks:
     
     # Survey actions  
     SURVEY_START = "survey:start"
+    SURVEY_START_FROM_OFFER = "survey:start_offer"
+    SURVEY_OFFER_LATER = "survey:offer_later"
+    SURVEY_OFFER_SNOOZE = "survey:offer_snooze"
     SURVEY_Q1_BEGINNER = "survey:q1:beginner"
     SURVEY_Q1_SOME_EXP = "survey:q1:some_exp"
     SURVEY_Q1_ADVANCED = "survey:q1:advanced"

@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable, Dict
 import structlog
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, TelegramObject
+from sqlalchemy.sql import func
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -48,6 +49,8 @@ class UserContextMiddleware(BaseMiddleware):
                     first_name=user.first_name,
                     last_name=user.last_name,
                 )
+                
+                db_user.last_user_activity_at = func.now()
 
                 data["user"] = db_user
                 data["user_service"] = user_service

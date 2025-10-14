@@ -95,6 +95,16 @@ class UserService:
     ) -> User:
         """Set user contact information."""
         return await self.repository.set_contact_info(user, phone, email)
+
+    async def update_user(
+        self,
+        user: User,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> User:
+        """Alias for set_user_contact_info for backward compatibility."""
+        self.logger.warning("Using deprecated UserService.update_user method", user_id=user.id)
+        return await self.set_user_contact_info(user, phone, email)
     
     async def is_user_ready_for_consultation(self, user: User) -> bool:
         """Check if user is ready for consultation offer."""
@@ -195,6 +205,16 @@ class UserService:
         except Exception as e:
             self.logger.error("Error getting conversation history", error=str(e))
             return []
+
+    async def get_user_funnel_state(self, user_id: int) -> Optional[UserFunnelState]:
+        """Get user funnel state."""
+        try:
+            stmt = select(UserFunnelState).where(UserFunnelState.user_id == user_id)
+            result = await self.session.execute(stmt)
+            return result.scalar_one_or_none()
+        except Exception as e:
+            self.logger.error("Error getting user funnel state", error=str(e))
+            return None
     
     async def save_message(
         self,

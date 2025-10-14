@@ -21,6 +21,7 @@ from app.services.user_service import UserService
 from app.services.consultation_service import ConsultationService
 from app.services.event_service import EventService
 from app.services.manager_notification_service import ManagerNotificationService
+from app.services.lead_service import LeadService
 from app.utils.callbacks import Callbacks
 
 
@@ -32,6 +33,7 @@ class ConsultationStates(StatesGroup):
     free_form_datetime = State()
     confirmation = State()
     waiting_for_phone = State()
+    waiting_for_name = State()
 
 
 router = Router()
@@ -69,11 +71,14 @@ async def start_consultation_booking(
 
 @router.callback_query(F.data.startswith("consult_date:"))
 async def handle_date_choice(
-    callback: CallbackQuery, state: FSMContext, session, **kwargs
+    callback: CallbackQuery, state: FSMContext, session, user: User, **kwargs
 ):
     """Handles the user's choice of a consultation date."""
     await callback.answer()
     choice = callback.data.split(":")[1]
+
+    lead_service = LeadService(session)
+    await lead_service.start_incomplete_lead_timer(user, "consultation_date_picked")
 
     if choice == "custom":
         await callback.message.edit_text(
@@ -111,10 +116,13 @@ async def handle_date_choice(
 
 
 @router.callback_query(F.data.startswith("consult_time:"))
-async def handle_time_choice(callback: CallbackQuery, state: FSMContext, **kwargs):
+async def handle_time_choice(callback: CallbackQuery, state: FSMContext, session, user: User, **kwargs):
     """Handles the user's choice of a consultation time."""
     await callback.answer()
     choice = callback.data.split(":")[1]
+
+    lead_service = LeadService(session)
+    await lead_service.start_incomplete_lead_timer(user, "consultation_time_picked")
 
     if choice == "custom":
         await callback.message.edit_text(
@@ -216,7 +224,8 @@ async def handle_confirmation(
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await callback.message.edit_text(
+        await callback.message.delete()
+        await callback.message.answer(
             "Для подтверждения записи, пожалуйста, отправьте ваш номер телефона.",
             reply_markup=keyboard,
         )
@@ -237,7 +246,28 @@ async def handle_phone_contact(
 ):
     """Handles receiving the user's phone number."""
     user.phone = message.contact.phone_number
-    await user_service.update_user(user, phone=user.phone)
+    await user_service.set_user_contact_info(user, phone=user.phone)
+    await session.commit()
+    
+    lead_service = LeadService(session)
+    await lead_service.start_incomplete_lead_timer(user, "consultation_phone_sent")
+
+    await message.answer("Пожалуйста, напишите ваше имя.")
+    await state.set_state(ConsultationStates.waiting_for_name)
+
+
+@router.message(ConsultationStates.waiting_for_name)
+async def handle_name(
+    message: Message,
+    state: FSMContext,
+    user: User,
+    session,
+    bot: Bot,
+    user_service: UserService,
+    **kwargs,
+):
+    """Handles receiving the user's name."""
+    await state.update_data(user_name=message.text)
     await create_appointment(message, state, user, session, bot, user_service)
 
 
@@ -257,6 +287,7 @@ async def create_appointment(
     consultation_service = ConsultationService(session)
     success, appointment, error_msg = await consultation_service.book_consultation(
         user_id=user.id,
+        user_name=user_data.get("user_name") or user.first_name or "Пользователь",
         consultation_date=final_date,
         slot=selected_time,
         source="bot_survey",

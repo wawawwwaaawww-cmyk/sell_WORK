@@ -13,9 +13,14 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 from app.config import settings
 from app.middlewares.logging import LoggingMiddleware
 from app.middlewares.user_context import UserContextMiddleware
+from app.middlewares.idempotency import IdempotencyMiddleware
 from app.middlewares.manual_dialog import ManualDialogMiddleware
 from app.middlewares.rate_limit import RateLimitMiddleware
+from app.middlewares.anti_spam import AntiSpamMiddleware
 from app.middlewares.dialog_mirror import DialogsMirrorMiddleware, DialogsChannelRequestMiddleware
+from app.middlewares.reask_middleware import ReaskMiddleware
+from app.middlewares.state_reset_middleware import StateResetMiddleware
+from app.middlewares.survey_offer_middleware import SurveyOfferMiddleware
 from app.services.sentiment_service import sentiment_service
 from app.handlers import (
     start,
@@ -32,6 +37,7 @@ from app.handlers import (
     dialog,
     manual_dialog,
     admin_scripts,
+    admin_spam,
 )
 
 logger = structlog.get_logger()
@@ -49,11 +55,18 @@ bot.session.middleware(DialogsChannelRequestMiddleware(settings.dialogs_channel_
 dp = Dispatcher()
 
 # Register middlewares
+dp.update.middleware(IdempotencyMiddleware())
 dp.message.middleware(LoggingMiddleware())
 dp.callback_query.middleware(LoggingMiddleware())
 dp.message.middleware(UserContextMiddleware())
 dp.callback_query.middleware(UserContextMiddleware())
+dp.message.middleware(StateResetMiddleware())
+dp.callback_query.middleware(StateResetMiddleware())
 dp.message.middleware(ManualDialogMiddleware())
+dp.message.middleware(ReaskMiddleware())
+dp.message.middleware(SurveyOfferMiddleware())
+dp.message.middleware(AntiSpamMiddleware())
+dp.callback_query.middleware(AntiSpamMiddleware())
 dp.message.middleware(DialogsMirrorMiddleware())
 dp.message.middleware(RateLimitMiddleware())
 dp.callback_query.middleware(RateLimitMiddleware())
@@ -74,6 +87,7 @@ user_settings.register_handlers(dp)
 dp.include_router(dialog.router)
 dp.include_router(manual_dialog.router)
 dp.include_router(admin_scripts.router)
+dp.include_router(admin_spam.router)
 
 
 async def set_bot_commands() -> None:
@@ -81,7 +95,6 @@ async def set_bot_commands() -> None:
     commands = [
         BotCommand(command="start", description="Start working with the bot"),
         BotCommand(command="help", description="Show available help options"),
-        BotCommand(command="reset", description="Delete my saved data"),
         BotCommand(command="contact", description="Оставить заявку"),
     ]
     
