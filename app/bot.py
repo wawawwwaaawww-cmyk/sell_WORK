@@ -16,6 +16,7 @@ from app.middlewares.user_context import UserContextMiddleware
 from app.middlewares.manual_dialog import ManualDialogMiddleware
 from app.middlewares.rate_limit import RateLimitMiddleware
 from app.middlewares.dialog_mirror import DialogsMirrorMiddleware, DialogsChannelRequestMiddleware
+from app.services.sentiment_service import sentiment_service
 from app.handlers import (
     start,
     survey,
@@ -30,6 +31,7 @@ from app.handlers import (
     user_settings,
     dialog,
     manual_dialog,
+    admin_scripts,
 )
 
 logger = structlog.get_logger()
@@ -71,6 +73,7 @@ product_handlers.register_product_handlers(dp)
 user_settings.register_handlers(dp)
 dp.include_router(dialog.router)
 dp.include_router(manual_dialog.router)
+dp.include_router(admin_scripts.router)
 
 
 async def set_bot_commands() -> None:
@@ -114,6 +117,8 @@ async def on_startup() -> None:
         # Set webhook if not in debug mode
         if not settings.debug:
             await set_webhook()
+
+        await sentiment_service.start()
         
         logger.info("Bot started successfully", mode="webhook" if not settings.debug else "polling")
         
@@ -125,6 +130,8 @@ async def on_startup() -> None:
 async def on_shutdown() -> None:
     """Execute on bot shutdown."""
     try:
+        await sentiment_service.stop()
+
         # Remove webhook if in debug mode
         if settings.debug:
             await remove_webhook()

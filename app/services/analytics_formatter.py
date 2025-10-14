@@ -161,7 +161,8 @@ def _build_report_lines(report: Dict[str, Any]) -> List[Line]:
                 "   "
                 + f"{variant.get('variant')}: доставлено {variant.get('delivered', 0)}, "
                 + f"CTR {format_percent(variant.get('ctr'))}, CR {format_percent(variant.get('cr'))}, "
-                + f"конверсии {variant.get('conversions', 0)}",
+                + f"клики {variant.get('clicks', 0)}, лиды {variant.get('leads', 0)}, "
+                + f"отписки {variant.get('unsub', 0)} ({format_percent(variant.get('unsub_rate'))})",
             )
 
     if generated_at:

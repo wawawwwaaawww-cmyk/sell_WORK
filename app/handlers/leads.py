@@ -228,6 +228,23 @@ async def handle_lead_profile(callback: CallbackQuery, **kwargs):
         event_service = EventService(kwargs.get("session"))
         engagement_score = await event_service.get_engagement_score(user_id, hours=24)
         
+        total_scored = user.scored_total or 0
+        if user.lead_level_percent is None or total_scored < 10:
+            lead_level_display = f"недостаточно данных ({total_scored}/10)"
+        else:
+            lead_level_display = f"{user.lead_level_percent}%"
+
+        counter_value = user.counter or 0
+        pos_count = user.pos_count or 0
+        neu_count = user.neu_count or 0
+        neg_count = user.neg_count or 0
+
+        sentiment_updated = (
+            user.lead_level_updated_at.strftime('%d.%m.%Y %H:%M')
+            if user.lead_level_updated_at
+            else "—"
+        )
+
         profile_text = f"""👤 **Профиль пользователя #{user_id}**
 
 📋 **Основная информация:**
@@ -245,6 +262,11 @@ async def handle_lead_profile(callback: CallbackQuery, **kwargs):
 • **Балл вовлеченности:** {engagement_score}
 • **Заблокирован:** {'Да' if user.is_blocked else 'Нет'}
 • **Источник:** {user.source or 'не указан'}
+
+📊 **Тональность сообщений:**
+• **Уровень лида:** {lead_level_display}
+• **Баланс:** {counter_value:+d} (позитив {pos_count} / нейтр {neu_count} / негатив {neg_count})
+• **Обновлено:** {sentiment_updated}
 
 📅 **Даты:**
 • **Регистрация:** {user.created_at.strftime('%d.%m.%Y %H:%M')}

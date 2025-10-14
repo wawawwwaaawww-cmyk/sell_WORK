@@ -13,6 +13,7 @@ from app.config import settings
 from app.models import User as AppUser
 from app.services.user_service import UserService
 from app.services.manual_dialog_service import manual_dialog_service, ManualDialogSession
+from app.services.sentiment_service import sentiment_service
 
 
 class ConversationLoggingService:
@@ -102,12 +103,45 @@ class ConversationLoggingService:
         source_message: Optional[Message] = None,
     ) -> bool:
         """Persist user-authored message and mirror it to dialogs channel."""
+        metadata_payload: Dict[str, Any] = dict(metadata) if metadata else {}
+        message_id: Optional[int] = None
+        chat_id: Optional[int] = None
+        if source_message is not None:
+            message_id = getattr(source_message, "message_id", None)
+            chat = getattr(source_message, "chat", None)
+            chat_id = getattr(chat, "id", None) if chat else None
+        if message_id is not None:
+            metadata_payload.setdefault("telegram_message_id", message_id)
+        if chat_id is not None:
+            metadata_payload.setdefault("telegram_chat_id", chat_id)
+
         result = await self.log_message(
             user_id=user_id,
             role="user",
             text=text,
-            metadata=metadata,
+            metadata=metadata_payload,
         )
+        if message_id is not None:
+            try:
+                await sentiment_service.enqueue_message(
+                    user_id=user_id,
+                    message_id=message_id,
+                    text=text,
+                    source=str(metadata_payload.get("source")) if metadata_payload.get("source") else None,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self._logger.warning(
+                    "sentiment_enqueue_failed",
+                    error=str(exc),
+                    user_id=user_id,
+                    message_id=message_id,
+                )
+        else:
+            self._logger.debug(
+                "sentiment_enqueue_skipped_missing_message_id",
+                user_id=user_id,
+            )
+
         await self._mirror_message(
             sender="user",
             bot=bot,

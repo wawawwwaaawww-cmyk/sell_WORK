@@ -1,15 +1,16 @@
 """Consultation scheduling service."""
 
 from datetime import datetime, date, time, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pytz
 import structlog
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from dateutil.parser import parse as parse_datetime
 
 from app.services.scheduler_service import scheduler_service
-from app.models import Appointment, AppointmentStatus, User
+from app.models import Appointment, AppointmentStatus, User, AttendanceStatus
 
 
 class ConsultationRepository:
@@ -18,13 +19,21 @@ class ConsultationRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.logger = structlog.get_logger()
+
+    async def get_appointment_by_id(self, appointment_id: int) -> Optional[Appointment]:
+        """Get an appointment by its ID."""
+        stmt = select(Appointment).where(Appointment.id == appointment_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
     
     async def create_appointment(
         self,
         user_id: int,
         appointment_date: date,
         slot: time,
-        timezone: str = "Europe/Moscow"
+        slot_utc: datetime,
+        source: str,
+        timezone: str = "Europe/Moscow",
     ) -> Appointment:
         """Create a new appointment."""
         appointment = Appointment(
@@ -32,7 +41,10 @@ class ConsultationRepository:
             date=appointment_date,
             slot=slot,
             tz=timezone,
-            status=AppointmentStatus.SCHEDULED
+            status=AppointmentStatus.SCHEDULED,
+            slot_utc=slot_utc,
+            source=source,
+            attendance=AttendanceStatus.PENDING,
         )
         
         self.session.add(appointment)
@@ -108,6 +120,20 @@ class ConsultationRepository:
         )
         
         return appointment
+
+    async def update_attendance(
+        self, appointment: Appointment, attendance: AttendanceStatus
+    ) -> Appointment:
+        """Update appointment attendance status."""
+        appointment.attendance = attendance
+        await self.session.flush()
+        await self.session.refresh(appointment)
+        self.logger.info(
+            "Appointment attendance updated",
+            appointment_id=appointment.id,
+            attendance=attendance,
+        )
+        return appointment
     
     async def reschedule_appointment(
         self,
@@ -152,6 +178,30 @@ class ConsultationService:
         # Moscow timezone
         self.moscow_tz = pytz.timezone("Europe/Moscow")
     
+    def _get_now_msk(self) -> datetime:
+        """Get current time in Moscow timezone."""
+        return datetime.now(self.moscow_tz)
+
+    def get_consultation_date_options(self) -> List[Dict[str, any]]:
+        """Get date choices based on the 17:45 MSK rule."""
+        now_msk = self._get_now_msk()
+        today = now_msk.date()
+        
+        options = []
+        
+        # Rule: if it's before 17:45 MSK, offer today.
+        if now_msk.time() < time(17, 45):
+            options.append({"label": f"Сегодня, {today.strftime('%d %b (%a)')}", "date": today})
+            tomorrow = today + timedelta(days=1)
+            options.append({"label": f"Завтра, {tomorrow.strftime('%d %b (%a)')}", "date": tomorrow})
+        else:
+            tomorrow = today + timedelta(days=1)
+            options.append({"label": f"Завтра, {tomorrow.strftime('%d %b (%a)')}", "date": tomorrow})
+            after_tomorrow = today + timedelta(days=2)
+            options.append({"label": f"Послезавтра, {after_tomorrow.strftime('%d %b (%a)')}", "date": after_tomorrow})
+            
+        return options
+
     def get_next_available_dates(self, days_ahead: int = 14) -> List[date]:
         """Get next available dates (excluding weekends)."""
         available_dates = []
@@ -186,14 +236,19 @@ class ConsultationService:
         self,
         user_id: int,
         consultation_date: date,
-        slot: time
+        slot: time,
+        source: str = "bot_consultation",
     ) -> Tuple[bool, Optional[Appointment], str]:
         """Book a consultation."""
         try:
+            # Combine date and time with Moscow timezone
+            dt_msk = self.moscow_tz.localize(datetime.combine(consultation_date, slot))
+            dt_utc = dt_msk.astimezone(pytz.utc)
+
             # Validate date (not in the past, not weekend)
-            if consultation_date <= date.today():
-                return False, None, "Нельзя записаться на прошедшую дату"
-            
+            if dt_msk < self._get_now_msk():
+                return False, None, "Нельзя записаться на прошедшее время"
+
             if consultation_date.weekday() >= 5:
                 return False, None, "Консультации проводятся только в будние дни"
             
@@ -218,14 +273,17 @@ class ConsultationService:
             appointment = await self.repository.create_appointment(
                 user_id=user_id,
                 appointment_date=consultation_date,
-                slot=slot
+                slot=slot,
+                slot_utc=dt_utc,
+                source=source,
             )
             
-            reminder_datetime = datetime.combine(consultation_date, slot) - timedelta(minutes=15)
-            if reminder_datetime > datetime.utcnow():
+            # Schedule reminder using UTC time
+            reminder_datetime_utc = dt_utc - timedelta(minutes=15)
+            if reminder_datetime_utc > datetime.now(pytz.utc):
                 await scheduler_service.schedule_appointment_reminder(
                     appointment.id,
-                    reminder_datetime
+                    reminder_datetime_utc
                 )
 
             return True, appointment, "Консультация успешно запланирована"
@@ -234,6 +292,26 @@ class ConsultationService:
             self.logger.error("Error booking consultation", error=str(e), user_id=user_id)
             return False, None, "Произошла ошибка при записи"
     
+    async def process_reminder_response(
+        self, appointment_id: int, action: str
+    ) -> Optional[Appointment]:
+        """Process user's response from a reminder."""
+        appointment = await self.repository.get_appointment_by_id(appointment_id)
+        if not appointment:
+            return None
+
+        if action == "confirm":
+            await self.repository.update_attendance(
+                appointment, AttendanceStatus.CONFIRMED
+            )
+        elif action == "cancel":
+            await self.cancel_appointment(appointment)
+            await self.repository.update_attendance(
+                appointment, AttendanceStatus.CANCELED
+            )
+        
+        return appointment
+
     async def cancel_appointment(self, appointment: Appointment) -> bool:
         """Cancel an appointment."""
         try:
@@ -324,3 +402,42 @@ class ConsultationService:
     def format_slot_time(self, slot: time) -> str:
         """Format time slot for display."""
         return slot.strftime("%H:%M МСК")
+
+    def parse_free_text_datetime(self, text: str) -> Tuple[Optional[datetime], str]:
+        """Parse free text input into a Moscow datetime object."""
+        now_msk = self._get_now_msk()
+        
+        # Replace common phrases
+        text = text.lower().replace("на ", "").replace("в ", "")
+        if "сегодня" in text:
+            text = text.replace("сегодня", now_msk.strftime("%d.%m.%Y"))
+        elif "завтра" in text:
+            tomorrow = now_msk + timedelta(days=1)
+            text = text.replace("завтра", tomorrow.strftime("%d.%m.%Y"))
+        elif "послезавтра" in text:
+            after_tomorrow = now_msk + timedelta(days=2)
+            text = text.replace("послезавтра", after_tomorrow.strftime("%d.%m.%Y"))
+
+        try:
+            # Let dateutil do the heavy lifting
+            parsed_dt = parse_datetime(text, dayfirst=True, default=now_msk.replace(second=0, microsecond=0))
+            
+            # Localize to Moscow time
+            if parsed_dt.tzinfo is None:
+                parsed_dt = self.moscow_tz.localize(parsed_dt)
+            else:
+                parsed_dt = parsed_dt.astimezone(self.moscow_tz)
+
+            # --- Validations ---
+            # 1. Not in the past (with 45 min gap)
+            if parsed_dt < now_msk + timedelta(minutes=45):
+                return None, "Это время уже прошло или слишком близко. Пожалуйста, выберите время как минимум через 45 минут."
+
+            # 2. Time step >= 15 minutes
+            if parsed_dt.minute % 15 != 0:
+                return None, "Пожалуйста, выберите время с шагом в 15 минут (например, 16:00, 16:15, 16:30)."
+
+            return parsed_dt, "Дата и время приняты."
+
+        except Exception:
+            return None, "Не удалось распознать дату и время. Попробуйте формат 'ДД.ММ ЧЧ:ММ', например: '15.10 16:30'."

@@ -23,6 +23,8 @@ from ..repositories.broadcast_repository import BroadcastRepository, ABTestRepos
 from ..repositories.admin_repository import AdminRepository
 from ..repositories.product_repository import ProductRepository
 from ..services.materials_service import MaterialService
+from ..services.excel_material_service import excel_material_service
+from ..services.scheduler_service import scheduler_service
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,11 @@ class AdminStates(StatesGroup):
     waiting_for_product_name = State()
     waiting_for_product_price = State()
     waiting_for_product_description = State()
+
+   # Excel materials states
+   waiting_for_excel_file = State()
+   waiting_for_media_files = State()
+   waiting_for_test_username = State()
 
 
 def admin_required(func):
@@ -768,20 +775,355 @@ async def ab_test_stop(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_materials")
 @role_required(AdminRole.EDITOR)
 async def materials_management(callback: CallbackQuery):
-    """Materials management menu."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🆕 Новый материал", callback_data="material_create")],
-        [InlineKeyboardButton(text="📚 Все материалы", callback_data="material_list")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="material_stats")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
-    ])
-    
-    await callback.message.edit_text(
-        "📚 <b>Управление материалами</b>\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+   """Materials management menu."""
+   keyboard = InlineKeyboardMarkup(inline_keyboard=[
+       [InlineKeyboardButton(text="📦 Материалы из БД", callback_data="material_db_menu")],
+       [InlineKeyboardButton(text="📄 Материалы из Excel", callback_data="material_excel_menu")],
+       [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
+   ])
+   
+   await callback.message.edit_text(
+       "📚 <b>Управление материалами</b>\n\n"
+       "Выберите источник материалов:",
+       reply_markup=keyboard,
+       parse_mode="HTML"
+   )
+
+@router.callback_query(F.data == "material_db_menu")
+@role_required(AdminRole.EDITOR)
+async def materials_db_management(callback: CallbackQuery):
+   """Materials management menu for DB."""
+   keyboard = InlineKeyboardMarkup(inline_keyboard=[
+       [InlineKeyboardButton(text="🆕 Новый материал", callback_data="material_create")],
+       [InlineKeyboardButton(text="📚 Все материалы", callback_data="material_list")],
+       [InlineKeyboardButton(text="📊 Статистика", callback_data="material_stats")],
+       [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_materials")]
+   ])
+   
+   await callback.message.edit_text(
+       "📦 <b>Материалы из Базы Данных</b>\n\n"
+       "Выберите действие:",
+       reply_markup=keyboard,
+       parse_mode="HTML"
+   )
+
+@router.callback_query(F.data == "excel_upload")
+@role_required(AdminRole.EDITOR)
+async def request_excel_file(callback: CallbackQuery, state: FSMContext, **kwargs):
+  """Prompts admin to upload the materials.xlsx file."""
+  await state.set_state(AdminStates.waiting_for_excel_file)
+  await callback.message.edit_text(
+      "📥 <b>Загрузка Excel файла</b>\n\n"
+      "Пожалуйста, отправьте файл `materials.xlsx`.\n\n"
+      "Требования к файлу:\n"
+      "• Лист с названием `materials`\n"
+      "• Колонки: `title`, `text`, `media_filename`",
+      parse_mode="HTML"
+  )
+
+@router.message(AdminStates.waiting_for_excel_file, F.document)
+@role_required(AdminRole.EDITOR)
+async def process_excel_file(message: Message, state: FSMContext, **kwargs):
+  """Processes the uploaded materials.xlsx file."""
+  if message.document.file_name != 'materials.xlsx':
+      await message.answer("❌ Неверное имя файла. Пожалуйста, загрузите файл с именем `materials.xlsx`.")
+      return
+
+  try:
+      from app.bot import bot
+      file = await bot.get_file(message.document.file_id)
+      await bot.download_file(file.file_path, excel_material_service.EXCEL_FILE_PATH)
+      
+      # Validate the file
+      validation_result = excel_material_service.validate_excel_file()
+      
+      if not validation_result:
+          await message.answer("❌ Не удалось прочитать или обработать файл. Проверьте его структуру.")
+      else:
+          summary = (
+              f"✅ <b>Файл успешно загружен и провалидирован!</b>\n\n"
+              f"📈 <b>Сводка:</b>\n"
+              f"• Всего строк: {validation_result.total_rows}\n"
+              f"• Готово к отправке: {validation_result.valid_rows}\n"
+              f"• Пропущено: {validation_result.skipped_rows}\n\n"
+          )
+          if validation_result.reasons:
+              summary += "<b>Причины пропуска:</b>\n"
+              for reason, count in validation_result.reasons.items():
+                  summary += f"• {reason}: {count}\n"
+          
+          await message.answer(summary, parse_mode="HTML")
+
+  except Exception as e:
+      logger.error(f"Error processing Excel file: {e}", exc_info=True)
+      await message.answer("❌ Произошла ошибка при обработке файла.")
+  
+  await state.clear()
+  # Show the updated menu
+  await materials_excel_management(message, **kwargs)
+
+
+@router.callback_query(F.data == "excel_media_upload")
+@role_required(AdminRole.EDITOR)
+async def request_media_files(callback: CallbackQuery, state: FSMContext, **kwargs):
+  """Prompts admin to upload media files."""
+  await state.set_state(AdminStates.waiting_for_media_files)
+  await callback.message.edit_text(
+      "🖼️ <b>Загрузка медиа файлов</b>\n\n"
+      "Отправьте фото или видео. Можно отправить несколько файлов одним сообщением.\n\n"
+      "Поддерживаемые форматы:\n"
+      "• Фото: jpg, jpeg, png, webp\n"
+      "• Видео: mp4, mov, webm",
+      parse_mode="HTML"
+  )
+
+@router.message(AdminStates.waiting_for_media_files, F.photo | F.video)
+@role_required(AdminRole.EDITOR)
+async def process_media_files(message: Message, state: FSMContext, **kwargs):
+  """Processes uploaded media files."""
+  file_id = None
+  file_name = None
+  
+  try:
+      if message.photo:
+          file_id = message.photo[-1].file_id
+          file_name = f"{file_id}.jpg"
+      elif message.video:
+          file_id = message.video.file_id
+          file_name = message.video.file_name or f"{file_id}.mp4"
+
+      if file_id and file_name:
+          from app.bot import bot
+          file_info = await bot.get_file(file_id)
+          destination_path = os.path.join(excel_material_service.MEDIA_PATH, file_name)
+          await bot.download_file(file_info.file_path, destination_path)
+          await message.answer(f"✅ Файл `{file_name}` успешно загружен.")
+      else:
+          await message.answer("❌ Не удалось определить файл.")
+
+  except Exception as e:
+      logger.error(f"Error processing media file: {e}", exc_info=True)
+      await message.answer(f"❌ Ошибка при загрузке файла `{file_name}`.")
+
+@router.callback_query(F.data == "excel_schedule_settings")
+@role_required(AdminRole.EDITOR)
+async def excel_schedule_settings(callback: CallbackQuery, **kwargs):
+   """Displays schedule settings and controls."""
+   config = excel_material_service.get_schedule_config()
+   
+   freq_map = {
+       "daily_1": "1 раз в сутки", "daily_2": "2 раза в сутки",
+       "every_2": "Раз в 2 дня", "every_3": "Раз в 3 дня",
+       "every_4": "Раз в 4 дня", "every_5": "Раз в 5 дней",
+       "every_6": "Раз в 6 дней", "weekly": "Раз в неделю"
+   }
+   current_freq = freq_map.get(config.get('frequency'), "Не задана")
+   status = "⏸️ На паузе" if config.get('paused') else "▶️ Активна"
+
+   text = (
+       f"📋 <b>Настройки расписания рассылки</b>\n\n"
+       f"Текущий статус: <b>{status}</b>\n"
+       f"Частота: <b>{current_freq}</b>\n"
+       f"Окно отправки: <b>{config.get('window_start_h_msk', 11)}:00 - {config.get('window_end_h_msk', 20)}:00 МСК</b>\n\n"
+       "Выберите действие:"
+   )
+
+   pause_resume_button = InlineKeyboardButton(
+       text="▶️ Возобновить" if config.get('paused') else "⏸️ Поставить на паузу",
+       callback_data="excel_schedule_toggle_pause"
+   )
+
+   keyboard = InlineKeyboardMarkup(inline_keyboard=[
+       [
+           InlineKeyboardButton(text="1 раз/сутки", callback_data="excel_freq:daily_1"),
+           InlineKeyboardButton(text="2 раза/сутки", callback_data="excel_freq:daily_2")
+       ],
+       [
+           InlineKeyboardButton(text="Раз в 2 дня", callback_data="excel_freq:every_2"),
+           InlineKeyboardButton(text="Раз в 3 дня", callback_data="excel_freq:every_3"),
+       ],
+       [
+           InlineKeyboardButton(text="Раз в 4 дня", callback_data="excel_freq:every_4"),
+           InlineKeyboardButton(text="Раз в 5 дней", callback_data="excel_freq:every_5"),
+       ],
+       [
+           InlineKeyboardButton(text="Раз в 6 дней", callback_data="excel_freq:every_6"),
+           InlineKeyboardButton(text="Раз в неделю", callback_data="excel_freq:weekly"),
+       ],
+       [pause_resume_button],
+       [InlineKeyboardButton(text="⬅️ Назад", callback_data="material_excel_menu")]
+   ])
+
+   await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("excel_freq:"))
+@role_required(AdminRole.EDITOR)
+async def set_excel_schedule_frequency(callback: CallbackQuery, **kwargs):
+   """Sets the frequency for the excel material mailing."""
+   freq = callback.data.split(":")[1]
+   
+   config = excel_material_service.get_schedule_config()
+   config['frequency'] = freq
+   excel_material_service.save_schedule_config(config)
+   
+   scheduler_service.reschedule_excel_materials_mailing()
+   
+   await callback.answer(f"✅ Частота обновлена!")
+   await excel_schedule_settings(callback, **kwargs)
+
+
+@router.callback_query(F.data == "excel_schedule_toggle_pause")
+@role_required(AdminRole.EDITOR)
+async def toggle_excel_schedule_pause(callback: CallbackQuery, **kwargs):
+   """Pauses or resumes the excel material mailing."""
+   config = excel_material_service.get_schedule_config()
+   config['paused'] = not config.get('paused', False)
+   excel_material_service.save_schedule_config(config)
+   
+   scheduler_service.reschedule_excel_materials_mailing()
+   
+   status = "приостановлена" if config['paused'] else "возобновлена"
+   await callback.answer(f"✅ Рассылка {status}!")
+   await excel_schedule_settings(callback, **kwargs)
+
+@router.callback_query(F.data == "material_excel_menu")
+@role_required(AdminRole.EDITOR)
+async def excel_logs(callback: CallbackQuery, **kwargs):
+   """Displays the last 20 log entries for excel material sends."""
+   logs = excel_material_service.get_latest_log_entries(limit=20)
+
+   if not logs:
+       text = "📊 <b>Логи отправки материалов из Excel</b>\n\nЗаписи отсутствуют."
+   else:
+       text = "📊 <b>Последние 20 записей лога:</b>\n\n"
+       for log in reversed(logs):
+           ts = log.get('ts_utc', '').replace('T', ' ')[:19]
+           status_icon = "✅" if log.get('status') == 'success' else "❌"
+           text += (
+               f"{status_icon} <b>{ts}</b> - Пользователю @{log.get('username', log.get('user_id'))}\n"
+               f"   Строка: {log.get('row')}, Файл: {log.get('media_filename')}\n"
+           )
+           if log.get('status') != 'success':
+               text += f"   Ошибка: {log.get('error', 'N/A')}\n"
+   
+   keyboard = InlineKeyboardMarkup(inline_keyboard=[
+       [InlineKeyboardButton(text="⬅️ Назад", callback_data="material_excel_menu")]
+   ])
+
+   await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+@router.callback_query(F.data == "excel_test_send")
+@role_required(AdminRole.EDITOR)
+async def excel_test_send_request(callback: CallbackQuery, state: FSMContext, **kwargs):
+   """Requests a username for a test send."""
+   await state.set_state(AdminStates.waiting_for_test_username)
+   await callback.message.edit_text(
+       "📲 <b>Тестовая отправка</b>\n\n"
+       "Введите @username пользователя для отправки следующего материала.\n"
+       "Убедитесь, что пользователь запустил бота.",
+       parse_mode="HTML"
+   )
+
+@router.message(AdminStates.waiting_for_test_username, F.text)
+@role_required(AdminRole.EDITOR)
+async def excel_test_send_execute(message: Message, state: FSMContext, **kwargs):
+   """Executes a test send to a specific user."""
+   username = message.text.strip()
+   if not username.startswith('@'):
+       await message.answer("❌ Неверный формат. Имя пользователя должно начинаться с @.")
+       return
+
+   clean_username = username[1:]
+
+   try:
+       async for db in get_db():
+           user_repo = AdminRepository(db) # Using AdminRepository to find user
+           user = await user_repo.find_user_by_username(clean_username)
+           break
+       
+       if not user:
+           await message.answer(f"❌ Пользователь {username} не найден.")
+           await state.clear()
+           return
+
+       material = excel_material_service.get_next_material_for_user(user.id)
+
+       if not material:
+           await message.answer("❌ Нет доступных материалов для отправки.")
+           await state.clear()
+           return
+       
+       from aiogram.types import FSInputFile
+       from app.bot import bot
+
+       caption = material.text
+       
+       if material.media_type == 'photo':
+           await bot.send_photo(
+               chat_id=user.telegram_id,
+               photo=FSInputFile(material.media_path),
+               caption=caption
+           )
+       elif material.media_type == 'video':
+           await bot.send_video(
+               chat_id=user.telegram_id,
+               video=FSInputFile(material.media_path),
+               caption=caption
+           )
+       
+       # Update progress for the test user
+       excel_material_service.update_user_progress(user.id, material.row_index)
+       excel_material_service.log_send_attempt(
+           user_id=user.id,
+           username=user.username,
+           material=material,
+           status='success',
+           error='test_send'
+       )
+       
+       await message.answer(
+           f"✅ Материал `{material.media_filename}` (строка {material.row_index}) "
+           f"успешно отправлен пользователю {username}."
+       )
+
+   except Exception as e:
+       logger.error(f"Error during test send to {username}: {e}", exc_info=True)
+       await message.answer(f"❌ Произошла ошибка при отправке материала пользователю {username}.")
+   
+   await state.clear()
+
+
+@router.callback_query(F.data == "material_excel_menu")
+@role_required(AdminRole.EDITOR)
+async def materials_excel_management(callback: CallbackQuery, **kwargs):
+   """Excel materials management menu."""
+  keyboard = InlineKeyboardMarkup(inline_keyboard=[
+      [InlineKeyboardButton(text="📥 Загрузить Excel", callback_data="excel_upload")],
+      [InlineKeyboardButton(text="🖼️ Загрузить медиа", callback_data="excel_media_upload")],
+      [InlineKeyboardButton(text="📋 Настройки расписания", callback_data="excel_schedule_settings")],
+      [InlineKeyboardButton(text="📲 Тестовая отправка", callback_data="excel_test_send")],
+      [InlineKeyboardButton(text="📊 Логи отправки", callback_data="excel_logs")],
+      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_materials")]
+  ])
+  
+  # Get current status
+  validation_result = excel_material_service.validate_excel_file()
+  status_text = "⚠️ Файл `materials.xlsx` не найден или поврежден."
+  if validation_result:
+      status_text = (
+          f"✅ Файл `materials.xlsx` загружен.\n"
+          f"Всего строк: {validation_result.total_rows}\n"
+          f"Готово к отправке: {validation_result.valid_rows}\n"
+          f"Пропущено: {validation_result.skipped_rows}"
+      )
+
+  await callback.message.edit_text(
+      f"📄 <b>Материалы из Excel</b>\n\n"
+      f"<b>Статус:</b>\n{status_text}\n\n"
+      "Выберите действие:",
+      reply_markup=keyboard,
+      parse_mode="HTML"
+  )
 
 
 @router.callback_query(F.data == "material_create")

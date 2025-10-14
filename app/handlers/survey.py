@@ -1,24 +1,120 @@
 """Survey handlers for the 5-question survey system."""
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import json
 
 import structlog
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
 
 from app.models import User, FunnelStage
 from app.services.user_service import UserService
 from app.services.survey_service import SurveyService
 from app.services.event_service import EventService
 from app.services.llm_service import LLMService, LLMContext
+from app.services.product_matching_service import ProductMatchingService
 from app.services.logging_service import ConversationLoggingService
 from app.utils.callbacks import Callbacks, CallbackData
 from app.handlers.scene_dispatcher import try_process_callback
+from app.handlers.consultation import start_consultation_booking
 
 
 router = Router()
 logger = structlog.get_logger()
+
+
+def _md_escape(value: str) -> str:
+    """Escape characters that break Telegram Markdown."""
+    if not value:
+        return ""
+    replacements = {
+        "\\": "\\\\",
+        "_": "\\_",
+        "*": "\\*",
+        "[": "\\[",
+        "]": "\\]",
+        "(": "\\(",
+        ")": "\\)",
+        "~": "\\~",
+        "`": "\\`",
+        ">": "\\>",
+        "#": "\\#",
+        "+": "\\+",
+        "-": "\\-",
+        "=": "\\=",
+        "|": "\\|",
+        "{": "\\{",
+        "}": "\\}",
+        ".": "\\.",
+        "!": "\\!",
+    }
+    escaped = value
+    for char, replacement in replacements.items():
+        escaped = escaped.replace(char, replacement)
+    return escaped
+
+
+def _format_price_value(amount) -> str:
+    """Format decimal price with thousand delimiter."""
+    if amount is None:
+        return "-"
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+    if abs(value - int(value)) < 1e-6:
+        return f"{int(value):,}".replace(",", " ")
+    return f"{value:,.2f}".replace(",", " ")
+
+
+def _extract_value_props(raw_props) -> List[str]:
+    """Normalize value props to a list of strings."""
+    if not raw_props:
+        return []
+    if isinstance(raw_props, str):
+        try:
+            parsed = json.loads(raw_props)
+            return _extract_value_props(parsed)
+        except json.JSONDecodeError:
+            return [raw_props]
+    if isinstance(raw_props, dict):
+        items: List[str] = []
+        for value in raw_props.values():
+            items.extend(_extract_value_props(value))
+        return items
+    if isinstance(raw_props, (list, tuple, set)):
+        result: List[str] = []
+        for item in raw_props:
+            result.extend(_extract_value_props(item))
+        return result
+    return [str(raw_props)]
+
+
+def _build_product_card_text(product, score: float, explanation: str) -> str:
+    """Render product recommendation block."""
+    name = _md_escape(product.name or "Программа")
+    short_desc = _md_escape(product.short_desc or "")
+    value_props = [
+        f"• {_md_escape(prop)}"
+        for prop in _extract_value_props(product.value_props)[:2]
+    ]
+    price_text = _format_price_value(product.price)
+    currency = _md_escape((product.currency or "RUB").upper())
+    lines = [
+        "🎯 **Подобрали программу для тебя:**",
+        f"**{name}**",
+    ]
+    if short_desc:
+        lines.append(short_desc)
+    if value_props:
+        lines.extend(value_props)
+    lines.append(f"💵 Стоимость: {price_text} {currency}")
+    lines.append(f"✅ Совпадение: {int(round(score * 100))}%")
+    if explanation:
+        lines.append(f"📌 Почему: {_md_escape(explanation)}")
+    return "\n".join(lines)
 
 
 async def _render_survey_step(
@@ -122,8 +218,21 @@ async def start_survey(callback: CallbackQuery, user: User, user_service: UserSe
         await callback.answer("Произошла ошибка при запуске анкеты")
 
 
+# Set of affirmative answers to trigger consultation booking
+AFFIRMATIVE_ANSWERS = {
+    "yes", "да", "давай", "хорошо", "запиши", "готов", "согласен", "ок", "го", "поехали",
+    "конечно", "ага", "угу", "хочу", "записывай", "естественно"
+}
+
+
 @router.callback_query(F.data.startswith("survey:q"))
-async def handle_survey_answer(callback: CallbackQuery, user: User, user_service: UserService, **kwargs):
+async def handle_survey_answer(
+    callback: CallbackQuery,
+    user: User,
+    user_service: UserService,
+    state: FSMContext,
+    **kwargs,
+):
     """Handle survey answer."""
     try:
         session = kwargs.get("session")
@@ -152,7 +261,18 @@ async def handle_survey_answer(callback: CallbackQuery, user: User, user_service
         
         # Get confirmation text
         confirmation = await survey_service.get_confirmation_text(question_code, answer_code)
-        
+
+        # --- New logic for Q5 ---
+        if question_code == "q5":
+            question = await survey_service.get_question(question_code)
+            answer_text = question.get("options", {}).get(answer_code, {}).get("text", "").lower()
+            
+            # Check if the answer is affirmative
+            if any(word in answer_text for word in AFFIRMATIVE_ANSWERS) or answer_code == 'yes':
+                await callback.message.edit_text("Отлично! Давайте подберем удобное время для консультации.")
+                await start_consultation_booking(callback.message, state, user, session)
+                return
+
         # Check if more questions remain
         next_question_code = await survey_service.get_next_question_code(user.id)
         
@@ -260,58 +380,94 @@ async def complete_survey(
         except Exception as log_error:
             logger.warning("Failed to log survey completion", error=str(log_error), user_id=user.id)
         
-        # Create results text
-        results_text = f"""{confirmation}
+        sanitized_confirmation = confirmation.strip() if confirmation else ""
+        question_four = survey_service.questions.get("q4", {})
+        question_four_text = question_four.get("text", "")
+        if sanitized_confirmation and question_four_text:
+            plain_q4 = question_four_text.replace("*", "").strip()
+            sanitized_confirmation = sanitized_confirmation.replace(question_four_text, "")
+            if plain_q4:
+                sanitized_confirmation = sanitized_confirmation.replace(plain_q4, "")
+            sanitized_confirmation = sanitized_confirmation.strip()
 
-🎉 **Анкета завершена!**
+        sections = [
+            "🎉 **Анкета завершена!**",
+            "📊 **Твой профиль:**",
+            summary["profile_summary"],
+            f"🎯 **Категория:** {summary['segment_description']}",
+            f"📈 **Балл готовности:** {summary['total_score']}/13",
+            "💡 *На основе твоих ответов я подберу оптимальную программу обучения!*",
+        ]
 
-📊 **Твой профиль:**
-{summary["profile_summary"]}
+        if sanitized_confirmation:
+            sections.append(sanitized_confirmation)
 
-🎯 **Категория:** {summary["segment_description"]}
-📈 **Балл готовности:** {summary["total_score"]}/13
+        matching_service = ProductMatchingService(session)
+        match_result = await matching_service.match_for_user(
+            user,
+            trigger="survey_complete",
+            log_result=True,
+        )
 
-💡 *На основе твоих ответов я подберу оптимальную программу обучения!*
+        metadata = {
+            "context": "survey_complete",
+            "segment": summary["segment"],
+            "score": summary["total_score"],
+            "product_id": None,
+            "product_score": match_result.score,
+        }
 
-Давай обсудим следующие шаги? 🚀"""
-        
-        # Create keyboard for next actions
         keyboard = InlineKeyboardBuilder()
-        
-        if summary["segment"] == "hot":
-            keyboard.add(InlineKeyboardButton(
-                text="📞 Записаться на консультацию",
-                callback_data=Callbacks.CONSULT_OFFER
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Обсудить программы",
-                callback_data="llm:discuss_programs"
-            ))
-        elif summary["segment"] == "warm":
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Подобрать программу",
-                callback_data="llm:discuss_programs"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="📞 Консультация с экспертом",
-                callback_data=Callbacks.CONSULT_OFFER
-            ))
-        else:  # cold
-            keyboard.add(InlineKeyboardButton(
-                text="📚 Получить материалы для изучения",
-                callback_data="materials:educational"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Задать вопросы",
-                callback_data="llm:ask_questions"
-            ))
+        if match_result.best_product:
+            product_card = _build_product_card_text(
+                match_result.best_product,
+                match_result.score,
+                match_result.explanation,
+            )
+            sections.append(product_card)
+            metadata["product_id"] = match_result.best_product.id
+            cta_text = "🔥 Хочу программу"
+            keyboard.add(
+                InlineKeyboardButton(
+                    text=cta_text,
+                    callback_data=Callbacks.MANAGER_REQUEST,
+                )
+            )
+            landing = match_result.best_product.landing_url or match_result.best_product.payment_landing_url
+            if landing:
+                keyboard.add(
+                    InlineKeyboardButton(
+                        text="🌐 Подробнее",
+                        url=landing,
+                    )
+                )
+            keyboard.add(
+                InlineKeyboardButton(
+                    text="💬 Задать вопросы",
+                    callback_data="llm:ask_questions",
+                )
+            )
+            keyboard.adjust(1)
+            sections.append("Готов обсудить детали? 🚀")
+        else:
+            sections.append(
+                "Пока не вижу идеального курса, но можем подобрать решение на консультации."
+            )
+            keyboard.add(
+                InlineKeyboardButton(
+                    text="📅 Записаться на консультацию",
+                    callback_data=Callbacks.CONSULT_OFFER,
+                )
+            )
+            keyboard.add(
+                InlineKeyboardButton(
+                    text="💬 Задать вопросы боту",
+                    callback_data="llm:ask_questions",
+                )
+            )
+            keyboard.adjust(1)
 
-        keyboard.add(InlineKeyboardButton(
-            text="📝 Оставить заявку",
-            callback_data=Callbacks.APPLICATION_START
-        ))
-        
-        keyboard.adjust(1)
+        results_text = "\n\n".join(part for part in sections if part)
         
         await _render_survey_step(
             callback,
@@ -320,7 +476,7 @@ async def complete_survey(
             text=results_text,
             reply_markup=keyboard.as_markup(),
             parse_mode="Markdown",
-            metadata={"context": "survey_complete", "segment": summary["segment"], "score": summary["total_score"]},
+            metadata=metadata,
         )
         
         await callback.answer("✅ Анкета завершена!")

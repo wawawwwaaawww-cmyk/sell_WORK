@@ -1,13 +1,14 @@
 """Product repository for managing educational products and programs."""
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable
 from decimal import Decimal
 
 import structlog
 from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.models import Product, UserSegment
+from app.models import Product, UserSegment, ProductCriteria
 
 
 class ProductRepository:
@@ -23,16 +24,36 @@ class ProductRepository:
         name: str,
         price: Decimal,
         description: Optional[str] = None,
-        meta: Optional[Dict[str, Any]] = None
+        meta: Optional[Dict[str, Any]] = None,
+        *,
+        slug: Optional[str] = None,
+        short_desc: Optional[str] = None,
+        value_props: Optional[Iterable[str]] = None,
+        currency: Optional[str] = None,
+        landing_url: Optional[str] = None,
+        payment_landing_url: Optional[str] = None,
+        is_active: bool = True,
     ) -> Product:
         """Create a new product."""
+        value_props_payload: list[str] | None = None
+        if value_props is not None:
+            value_props_payload = [str(item).strip() for item in value_props if str(item).strip()]
+        else:
+            value_props_payload = []
+
         product = Product(
             code=code,
             name=name,
+            slug=slug,
             description=description,
             price=price,
+            currency=currency or "RUB",
             meta=meta or {},
-            is_active=True
+            is_active=is_active,
+            short_desc=short_desc,
+            value_props=value_props_payload,
+            landing_url=landing_url,
+            payment_landing_url=payment_landing_url or landing_url,
         )
         
         self.session.add(product)
@@ -49,6 +70,16 @@ class ProductRepository:
         
         return product
     
+    async def load_product_with_criteria(self, product_id: int) -> Optional[Product]:
+        """Fetch product with criteria eagerly loaded."""
+        stmt = (
+            select(Product)
+            .options(selectinload(Product.criteria))
+            .where(Product.id == product_id)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_by_id(self, product_id: int) -> Optional[Product]:
         """Get product by ID."""
         stmt = select(Product).where(Product.id == product_id)
@@ -69,6 +100,17 @@ class ProductRepository:
         
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def get_active_with_criteria(self) -> List[Product]:
+        """Get all active products with criteria records."""
+        stmt = (
+            select(Product)
+            .options(selectinload(Product.criteria))
+            .where(Product.is_active == True)
+            .order_by(Product.price)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().unique().all()
     
     async def get_products_by_segment(
         self,
@@ -157,7 +199,7 @@ class ProductRepository:
         
         result = await self.session.execute(stmt)
         return result.scalars().all()
-    
+
     async def update_product(
         self,
         product_id: int,
@@ -167,6 +209,12 @@ class ProductRepository:
         product = await self.get_by_id(product_id)
         if not product:
             return None
+        if "value_props" in updates and updates["value_props"] is not None:
+            updates["value_props"] = [
+                str(item).strip()
+                for item in updates["value_props"]
+                if str(item).strip()
+            ]
         
         for field, value in updates.items():
             if hasattr(product, field):

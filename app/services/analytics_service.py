@@ -22,6 +22,7 @@ from app.models import (
     ABTestStatus,
     ABTestMetric,
 )
+from app.services.ab_testing_service import ABTestingService
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,8 @@ class AnalyticsService:
             )
             tests = (await self.db.execute(tests_stmt)).scalars().unique().all()
 
+            ab_service = ABTestingService(self.db)
+
             summary = {
                 "total": len(tests),
                 "running": sum(
@@ -232,54 +235,52 @@ class AnalyticsService:
 
             tests_payload = []
             for test in tests:
-                metric_raw = (
+                analysis = await ab_service.analyze_test_results(test.id)
+                if analysis.get("error") == "ab_tables_missing":
+                    return {
+                        "summary": summary,
+                        "tests": [],
+                        "error": "ab_tables_missing",
+                    }
+                if analysis.get("error"):
+                    continue
+                metric_raw = analysis.get("metric") or (
                     test.metric.value if isinstance(test.metric, ABTestMetric) else str(test.metric)
                 )
-                status_value = (
+                status_value = analysis.get("status") or (
                     test.status.value if isinstance(test.status, ABTestStatus) else str(test.status)
                 )
-                results_by_variant = {res.variant_code: res for res in test.results}
 
                 variants_payload = []
-                for variant in test.variants:
-                    result = results_by_variant.get(variant.variant_code)
-                    delivered = result.delivered if result else 0
-                    clicks = result.clicks if result else 0
-                    conversions = result.conversions if result else 0
-                    responses = result.responses if result else 0
-                    unsub = result.unsub if result else 0
-                    ctr = round(clicks / delivered, 4) if delivered else 0.0
-                    cr = round(conversions / delivered, 4) if delivered else 0.0
+                for variant in analysis.get("variants", []):
                     variants_payload.append(
                         {
-                            "variant": variant.variant_code,
-                            "delivered": delivered,
-                            "clicks": clicks,
-                            "conversions": conversions,
-                            "responses": responses,
-                            "unsub": unsub,
-                            "ctr": ctr,
-                            "cr": cr,
+                            "variant": variant.get("variant"),
+                            "delivered": variant.get("delivered", 0),
+                            "clicks": variant.get("unique_clicks", 0),
+                            "leads": variant.get("leads", 0),
+                            "responses": variant.get("responses", 0),
+                            "unsub": variant.get("unsubscribed", 0),
+                            "blocked": variant.get("blocked", 0),
+                            "ctr": variant.get("ctr", 0.0),
+                            "cr": variant.get("cr", 0.0),
+                            "unsub_rate": variant.get("unsub_rate", 0.0),
                         }
                     )
 
-                winner = None
-                if variants_payload:
-                    metric_key = "ctr" if metric_raw.upper() == "CTR" else "cr"
-                    winner_variant = max(variants_payload, key=lambda item: item[metric_key])
-                    winner = {
-                        "variant": winner_variant["variant"],
-                        "score": winner_variant[metric_key],
-                        "metric": metric_key,
-                    }
+                winner = analysis.get("winner")
 
                 tests_payload.append(
                     {
                         "id": test.id,
-                        "name": test.name,
+                        "name": analysis.get("name") or test.name,
                         "metric": metric_raw,
                         "status": status_value,
                         "population": test.population,
+                        "audience_size": analysis.get("audience_size"),
+                        "test_size": analysis.get("test_size"),
+                        "started_at": analysis.get("started_at"),
+                        "finished_at": analysis.get("finished_at"),
                         "variants": variants_payload,
                         "winner": winner,
                     }
@@ -292,7 +293,7 @@ class AnalyticsService:
 
         except Exception as exc:
             logger.error("Error getting A/B test metrics", exc_info=exc)
-            return {}
+            return {"summary": {}, "tests": [], "error": "ab_query_failed", "detail": str(exc)}
 
     async def get_comprehensive_report(self, days: int = 30) -> Dict[str, Any]:
         """Get comprehensive analytics report."""

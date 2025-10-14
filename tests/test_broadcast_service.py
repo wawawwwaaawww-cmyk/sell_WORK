@@ -1,12 +1,13 @@
 """Tests for broadcast and A/B testing services."""
 
-import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, ANY
 
-from app.models import User, UserSegment
+import pytest
+
+from app.models import User, UserSegment, ABAssignment, ABEvent, ABEventType, ABVariant
 from app.services.broadcast_service import BroadcastService
-from app.services.ab_testing_service import ABTestingService
-from app.models import ABResult
+from app.services.ab_testing_service import ABTestingService, VariantDefinition
 from sqlalchemy import select
 
 
@@ -112,36 +113,100 @@ async def test_ab_test_broadcast_records_results(db_session):
 
     result = await service.send_ab_test_broadcast(ab_test_id, delay_between_messages=0)
 
-    assert "sent" in result and result["sent"] == 10
-    assert result["failed"] == 0
-    assert bot_mock.send_message.await_count == 10
+    assert "sent" in result and result["failed"] == 0
+    assert result["sent"] == result["total_population"]
+    assert bot_mock.send_message.await_count == result["sent"]
 
-    ab_results = (await db_session.execute(
-        select(ABResult).where(ABResult.ab_test_id == ab_test_id)
-    )).scalars().all()
-    assert ab_results
-    delivered_sum = sum(r.delivered for r in ab_results)
-    assert delivered_sum == 10
+    assignments = (
+        await db_session.execute(
+            select(ABAssignment).where(ABAssignment.test_id == ab_test_id)
+        )
+    ).scalars().all()
+    assert assignments
+    assert len(assignments) == result["sent"]
+    assert all(assignment.delivered_at is not None for assignment in assignments)
 
-    # Должно быть не больше двух результатов (по одному на вариант)
-    assert {r.variant_code for r in ab_results} <= {"A", "B"}
+    ab_service = ABTestingService(db_session)
+    analysis = await ab_service.analyze_test_results(ab_test_id)
+    total_delivered = sum(variant.get("delivered", 0) for variant in analysis.get("variants", []))
+    assert total_delivered == result["sent"]
 
 
 @pytest.mark.asyncio
 async def test_analyze_ab_test_results(db_session):
     """Сервис A/B тестов корректно вычисляет метрики и победителя."""
     service = ABTestingService(db_session)
-    ab_test = await service.create_ab_test(
-        name="CTA", 
-        variant_a_title="A", variant_a_body="BODY A",
-        variant_b_title="B", variant_b_body="BODY B"
+
+    user_a = User(telegram_id=5551)
+    user_b = User(telegram_id=5552)
+    db_session.add_all([user_a, user_b])
+    await db_session.flush()
+
+    test = await service.create_test(
+        name="CTA",
+        creator_user_id=0,
+        variants=[
+            VariantDefinition(title="Вариант A", body="BODY A"),
+            VariantDefinition(title="Вариант B", body="BODY B"),
+        ],
+        start_immediately=False,
     )
-    await service.repository.create_or_update_result(ab_test.id, "A", delivered=100, clicks=30)
-    await service.repository.create_or_update_result(ab_test.id, "B", delivered=90, clicks=45)
 
-    analysis = await service.analyze_test_results(ab_test.id)
+    variants = (
+        await db_session.execute(
+            select(ABVariant).where(ABVariant.ab_test_id == test.id)
+        )
+    ).scalars().all()
+    variants = {v.variant_code: v for v in variants}
 
-    assert analysis["test_id"] == ab_test.id
-    assert analysis["variants"]["A"]["ctr"] == 0.3
-    assert analysis["variants"]["B"]["ctr"] == 0.5
-    assert analysis["winner"] == "B"
+    assignment_a = ABAssignment(
+        test_id=test.id,
+        variant_id=variants["A"].id,
+        user_id=user_a.id,
+        chat_id=user_a.telegram_id,
+        hash_value=0.1,
+        delivered_at=datetime.now(timezone.utc),
+    )
+    assignment_b = ABAssignment(
+        test_id=test.id,
+        variant_id=variants["B"].id,
+        user_id=user_b.id,
+        chat_id=user_b.telegram_id,
+        hash_value=0.2,
+        delivered_at=datetime.now(timezone.utc),
+    )
+    db_session.add_all([assignment_a, assignment_b])
+    await db_session.flush()
+
+    click_event_a = ABEvent(
+        test_id=test.id,
+        variant_id=variants["A"].id,
+        assignment_id=assignment_a.id,
+        user_id=user_a.id,
+        event_type=ABEventType.CLICKED,
+    )
+    click_event_b = ABEvent(
+        test_id=test.id,
+        variant_id=variants["B"].id,
+        assignment_id=assignment_b.id,
+        user_id=user_b.id,
+        event_type=ABEventType.CLICKED,
+    )
+    lead_event_b = ABEvent(
+        test_id=test.id,
+        variant_id=variants["B"].id,
+        assignment_id=assignment_b.id,
+        user_id=user_b.id,
+        event_type=ABEventType.LEAD_CREATED,
+    )
+    db_session.add_all([click_event_a, click_event_b, lead_event_b])
+    await db_session.flush()
+
+    analysis = await service.analyze_test_results(test.id)
+
+    variants_stats = {variant["variant"]: variant for variant in analysis["variants"]}
+
+    assert variants_stats["A"]["ctr"] == pytest.approx(1.0)
+    assert variants_stats["B"]["ctr"] == pytest.approx(1.0)
+    assert variants_stats["B"]["cr"] == pytest.approx(1.0)
+    assert analysis["winner"]["variant"] == "B"

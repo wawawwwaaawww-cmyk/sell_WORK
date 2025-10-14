@@ -45,6 +45,19 @@ class LLMResponse:
     is_safe: bool
 
 
+async def get_embedding(text: str, model: str = "text-embedding-3-small") -> Optional[List[float]]:
+    """Generates an embedding for a given text."""
+    if not text:
+        return None
+    try:
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        response = await client.embeddings.create(input=[text], model=model)
+        return response.data[0].embedding
+    except Exception as e:
+        structlog.get_logger().error("Failed to get embedding", error=str(e))
+        return None
+
+
 class PolicyLayer:
     """Policy layer for deterministic business logic."""
     
@@ -110,7 +123,9 @@ class PolicyLayer:
 class LLMService:
     """Service for LLM interactions with safety and policy enforcement."""
     
-    def __init__(self):
+    def __init__(self, session: Optional[Any] = None, user: Optional[User] = None):
+        self.session = session
+        self.user = user
         self.client = AsyncOpenAI(api_key=settings.openai_api_key)
         self.policy_layer = PolicyLayer()
         self.safety_validator = SafetyValidator()
@@ -134,7 +149,17 @@ class LLMService:
                 self.logger.warning("OpenAI API key is not configured; using fallback response")
                 return self._fallback_response()
             messages = self._build_messages(context)
-            raw_content = await self._call_chat_completion(messages)
+
+            if self._use_responses_api():
+                raw_content = await self._call_responses_api(messages)
+                if not raw_content:
+                    self.logger.info(
+                        "Responses API returned empty result, falling back to chat completions",
+                        model=settings.openai_model,
+                    )
+                    raw_content = await self._call_chat_completion(messages)
+            else:
+                raw_content = await self._call_chat_completion(messages)
             payload = self._try_parse_json(raw_content)
 
             if payload is None:
@@ -197,8 +222,8 @@ class LLMService:
         kwargs: Dict[str, Any] = {
             "model": model_to_use,
             "messages": messages,
-            "max_tokens": max_tokens,
         }
+        kwargs["max_completion_tokens"] = max_tokens
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
         try:
@@ -230,11 +255,52 @@ class LLMService:
                     expect_json=expect_json,
                 )
             raise
+        except Exception as error:
+            self.logger.error(
+                "Chat completions API call failed",
+                model=model_to_use,
+                error=str(error),
+            )
+            raise
+
+    async def _call_responses_api(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        max_tokens: int = 1000,
+        expect_json: bool = True,
+    ) -> str:
+        """Call the Responses API and return raw string content."""
+        formatted_messages = self._build_responses_input(messages)
+        kwargs: Dict[str, Any] = {
+            "model": settings.openai_model,
+            "input": formatted_messages,
+            "max_output_tokens": max_tokens,
+        }
+        if expect_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            response = await self.client.responses.create(**kwargs)
+            return self._extract_responses_content(response)
+        except openai.BadRequestError as error:
+            self.logger.warning(
+                "Responses API rejected request, attempting chat completions fallback",
+                model=settings.openai_model,
+                error=str(error),
+            )
+            return ""
+        except Exception as error:
+            self.logger.error(
+                "Responses API call failed",
+                model=settings.openai_model,
+                error=str(error),
+            )
+            return ""
 
     def _use_responses_api(self) -> bool:
         """Determine whether to call the Responses API instead of Chat Completions."""
         model_name = settings.openai_model or ""
-        use_responses = model_name.startswith(("o", "gpt-4.1"))
+        use_responses = model_name.startswith(("o", "gpt-4.1", "gpt-5"))
         self.logger.debug(
             "llm_responses_api_check",
             model=model_name,
@@ -624,5 +690,67 @@ class LLMService:
         
         return context_str
 
+
+    async def validate_script_relevance(
+        self, user_query: str, candidates: List[Dict[str, Any]]
+    ) -> (bool, Optional[str]):
+        """
+        Uses an LLM to validate if any of the candidate answers are relevant to the user query.
+        """
+        if not candidates:
+            return False, None
+
+        prompt = self._build_validation_prompt(user_query, candidates)
+        messages = [{"role": "system", "content": prompt}]
+
+        try:
+            raw_response = await self._call_chat_completion(
+                messages, model=settings.judge_model, max_tokens=200, expect_json=True
+            )
+            result = self._try_parse_json(raw_response)
+
+            if not result or not isinstance(result, dict):
+                self.logger.warning("LLM validation returned invalid JSON.", response=raw_response)
+                return False, None
+
+            is_relevant = result.get("is_relevant", False)
+            best_id = result.get("best_id")
+
+            if is_relevant and best_id is not None:
+                for candidate in candidates:
+                    if candidate["id"] == best_id:
+                        # Final safety check on the answer from the script
+                        sanitized_text, _ = self.safety_validator.validate_response(candidate["answer"])
+                        return True, sanitized_text
+
+        except Exception:
+            self.logger.exception("Error during LLM validation of script relevance.")
+
+        return False, None
+
+    def _build_validation_prompt(self, user_query: str, candidates: List[Dict[str, Any]]) -> str:
+        """Builds the prompt for the LLM judge."""
+        prompt = (
+            "You are a validation expert. Your task is to determine if any of the provided answers "
+            "are a relevant and helpful response to the user's query. "
+            "Respond in JSON format with 'is_relevant' (boolean) and 'best_id' (integer ID of the best answer if relevant).\n\n"
+            f"User Query: \"{user_query}\"\n\n"
+            "Candidate Answers:\n"
+        )
+        for cand in candidates:
+            prompt += (
+                f"- ID: {cand['id']}\n"
+                f"  - Matched Message: \"{cand['message']}\"\n"
+                f"  - Proposed Answer: \"{cand['answer']}\"\n"
+                f"  - Similarity Score: {cand['similarity']:.4f}\n\n"
+            )
+        prompt += (
+            "Criteria for relevance:\n"
+            "1. The answer must directly address the user's intent.\n"
+            "2. The answer must be factually consistent with the user's query.\n"
+            "3. Ignore answers that are only vaguely related.\n\n"
+            "Your JSON response:"
+        )
+        return prompt
 
 

@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Optional
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -46,22 +46,24 @@ class NotificationService:
         except Exception as e:
             logger.error(f"Error sending lead reminder to manager {manager_id}: {e}")
     
-    async def send_consultation_reminder(self, user_id: int, consultation_time: datetime):
-        """Send consultation reminder to user."""
+    async def send_consultation_reminder(self, user_id: int, appointment_id: int, consultation_time: datetime):
+        """Send an interactive consultation reminder to the user."""
         try:
-            time_str = consultation_time.strftime("%d.%m.%Y в %H:%M")
+            time_str = consultation_time.strftime("%d %B в %H:%M МСК")
             
-            text = "⏰ <b>Напоминание о консультации</b>\n\n"
-            text += f"Ваша консультация назначена на {time_str}\n\n"
-            text += "📞 Наши менеджеры свяжутся с вами в указанное время.\n\n"
-            text += "❓ Если у вас есть вопросы или нужно изменить время, "
-            text += "пожалуйста, свяжитесь с нами заранее."
+            text = (
+                f"👋 Напоминание: ваша консультация начнется через 15 минут - {time_str}.\n\n"
+                "Вы будете на встрече?"
+            )
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="📞 Связаться с поддержкой",
-                    callback_data="contact_support"
-                )]
+                [
+                    InlineKeyboardButton(text="✅ Да, буду", callback_data=f"consult_reminder:confirm:{appointment_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Перенести", callback_data=f"consult_reminder:reschedule:{appointment_id}"),
+                    InlineKeyboardButton(text="❌ Отменить", callback_data=f"consult_reminder:cancel:{appointment_id}"),
+                ]
             ])
             
             await self.bot.send_message(
@@ -72,7 +74,7 @@ class NotificationService:
             )
             
         except Exception as e:
-            logger.error(f"Error sending consultation reminder to user {user_id}: {e}")
+            logger.error(f"Error sending interactive consultation reminder to user {user_id}: {e}")
     
     async def send_reengagement_message(self, user_id: int, segment: str):
         """Send re-engagement message to inactive user."""
@@ -128,6 +130,79 @@ class NotificationService:
             
         except Exception as e:
             logger.error(f"Error sending lead follow-up to manager {manager_id}: {e}")
+
+    async def send_ab_test_summary(self, manager_id: int, summary: Dict[str, Any]):
+        """Send A/B test summary message to initiator."""
+        try:
+            test_name = summary.get("name") or "A/B тест"
+            variants = summary.get("variants") or []
+            started_at = summary.get("started_at")
+            audience_size = summary.get("audience_size") or 0
+            test_size = summary.get("test_size") or 0
+            variants_count = len(variants)
+
+            started_dt: Optional[datetime] = None
+            if isinstance(started_at, datetime):
+                started_dt = started_at
+            elif isinstance(started_at, str):
+                try:
+                    started_dt = datetime.fromisoformat(started_at)
+                except ValueError:
+                    started_dt = None
+
+            started_str = started_dt.astimezone().strftime("%d.%m.%Y %H:%M") if started_dt else "неизвестно"
+            coverage_pct = (test_size / audience_size) * 100 if audience_size else 0.0
+
+            lines = [
+                f"🧪 <b>Итоги A/B теста «{test_name}»</b>",
+                f"Старт: {started_str}",
+                f"Охват: {test_size} из {audience_size} ({coverage_pct:.1f}% аудитории)",
+                f"Вариантов: {variants_count}",
+            ]
+
+            if not variants or all(item.get("delivered", 0) == 0 for item in variants):
+                lines.append("")
+                lines.append("⚠️ Сообщения не были доставлены — данных недостаточно.")
+            else:
+                lines.append("")
+                for variant in variants:
+                    delivered = variant.get("delivered", 0)
+                    clicks = variant.get("unique_clicks", 0)
+                    leads = variant.get("leads", 0)
+                    unsubscribed = variant.get("unsubscribed", 0)
+                    blocked = variant.get("blocked", 0)
+                    ctr_pct = (variant.get("ctr", 0.0) or 0.0) * 100
+                    cr_pct = (variant.get("cr", 0.0) or 0.0) * 100
+                    unsub_rate_pct = (variant.get("unsub_rate", 0.0) or 0.0) * 100
+
+                    lines.append(
+                        f"• Вариант {variant.get('variant')}: доставлено {delivered}, "
+                        f"клики {clicks}, CTR {ctr_pct:.1f}%, лиды {leads}, "
+                        f"CR {cr_pct:.1f}%, отписки {unsubscribed} ({unsub_rate_pct:.1f}%), "
+                        f"блокировки {blocked}"
+                    )
+
+            winner = summary.get("winner")
+            lines.append("")
+            if winner:
+                winner_ctr = (winner.get("ctr", 0.0) or 0.0) * 100
+                winner_cr = (winner.get("cr", 0.0) or 0.0) * 100
+                winner_unsub = (winner.get("unsub_rate", 0.0) or 0.0) * 100
+                lines.append(
+                    f"🏆 Победитель: вариант {winner.get('variant')} "
+                    f"(CTR {winner_ctr:.1f}%, CR {winner_cr:.1f}%, отписки {winner_unsub:.1f}%)"
+                )
+            else:
+                lines.append("🏳️ Победитель не определён.")
+
+            await self.bot.send_message(
+                chat_id=manager_id,
+                text="\n".join(lines),
+                parse_mode="HTML",
+            )
+
+        except Exception as exc:
+            logger.error("Error sending A/B test summary", exc_info=exc)
     
     async def send_payment_notification(self, manager_id: int, user_id: int, amount: float, course_name: str):
         """Send payment notification to manager."""

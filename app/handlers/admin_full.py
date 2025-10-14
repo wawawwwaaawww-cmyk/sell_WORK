@@ -2,6 +2,8 @@
 
 import json
 import logging
+import re
+from itertools import groupby
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -25,6 +27,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select, func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from ..db import get_db
@@ -36,10 +39,16 @@ from ..models import (
     Product,
     Material,
     MaterialStatus,
+    ABTest,
 )
 from ..repositories.admin_repository import AdminRepository
+from ..repositories.system_settings_repository import SystemSettingsRepository
 from ..repositories.product_repository import ProductRepository
+from ..repositories.product_criteria_repository import ProductCriteriaRepository
 from ..repositories.material_repository import MaterialRepository
+from ..repositories.product_match_log_repository import ProductMatchLogRepository
+from ..repositories.user_repository import UserRepository
+from ..services.ab_testing_service import ABTestingService, VariantDefinition
 from ..services.analytics_service import AnalyticsService
 from ..services.analytics_formatter import (
     AB_STATUS_LABELS,
@@ -50,6 +59,11 @@ from ..services.analytics_formatter import (
 )
 from ..services.bonus_content_manager import BonusContentManager
 from ..services.scheduler_service import scheduler_service
+from ..services.sentiment_service import sentiment_service
+from ..services.survey_service import SurveyService
+from ..services.product_matching_service import ProductMatchingService
+from ..services.sendto_service import SendToService
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 seller_logger = structlog.get_logger("seller_krypto")
@@ -59,24 +73,49 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 class AdminStates(StatesGroup):
     """Admin FSM states."""
+    # Consultation settings
+    waiting_for_consultation_slots = State()
+    waiting_for_cutoff_time = State()
+    waiting_for_reminder_offset = State()
+
     # Broadcast states
     waiting_for_broadcast_content = State()
     waiting_for_broadcast_segment = State()
     waiting_for_broadcast_schedule = State()
     waiting_for_broadcast_confirmation = State()
+
+    # A/B testing states
+    waiting_for_ab_test_name = State()
+    waiting_for_ab_test_variant_count = State()
+    waiting_for_ab_test_variant_content = State()
+    waiting_for_ab_test_variant_buttons = State()
+    waiting_for_ab_test_confirmation = State()
     
     # Product states
     waiting_for_product_code = State()
     waiting_for_product_name = State()
     waiting_for_product_price = State()
+    waiting_for_product_currency = State()
+    waiting_for_product_short_desc = State()
     waiting_for_product_description = State()
+    waiting_for_product_value_props = State()
     waiting_for_product_landing_url = State()
     waiting_for_product_edit_price = State()
     waiting_for_product_edit_description = State()
+    waiting_for_product_edit_currency = State()
+    waiting_for_product_edit_short_desc = State()
+    waiting_for_product_edit_value_props = State()
+    waiting_for_product_edit_landing = State()
+    waiting_for_product_criteria = State()
+    waiting_for_product_criteria_check_user = State()
 
     # Bonus management states
     waiting_for_bonus_file = State()
     waiting_for_bonus_description = State()
+
+    # Sendto states
+    waiting_for_sendto_recipients = State()
+    waiting_for_sendto_content = State()
 
 
 
@@ -132,6 +171,31 @@ def role_required(required_role: AdminRole):
     return decorator
 
 
+def broadcast_permission_required(func):
+    """Decorator ensuring admin can manage broadcasts/A/B tests."""
+
+    @wraps(func)
+    async def wrapper(message_or_query, *args, **kwargs):
+        user_id = message_or_query.from_user.id
+
+        async for session in get_db():
+            admin_repo = AdminRepository(session)
+            allowed = await admin_repo.can_manage_broadcasts(user_id)
+            break
+
+        if not allowed:
+            response_text = "❌ Требуются права управления рассылками."
+            if isinstance(message_or_query, Message):
+                await message_or_query.answer(response_text)
+            else:
+                await message_or_query.answer(response_text, show_alert=True)
+            return
+
+        return await func(message_or_query, *args, **kwargs)
+
+    return wrapper
+
+
 MATERIAL_STATUS_LABELS = {
     MaterialStatus.READY.value: "🟢 Опубликован",
     MaterialStatus.DRAFT.value: "📝 Черновик",
@@ -148,6 +212,155 @@ PRODUCT_STATUS_LABELS = {
     True: "🟢 Активен",
     False: "⚪️ Выключен",
 }
+
+AB_VARIANT_CODES = ["A", "B", "C"]
+CANCEL_KEYWORDS = {"/cancel", "cancel", "стоп", "отмена", "stop", "выход"}
+
+
+def _get_variant_code(index: int) -> str:
+    """Return human-friendly variant label."""
+    if 0 <= index < len(AB_VARIANT_CODES):
+        return AB_VARIANT_CODES[index]
+    return f"V{index + 1}"
+
+
+def _summarize_text(text: str, limit: int = 140) -> str:
+    """Trim text for preview."""
+    clean = (text or "").strip()
+    if len(clean) <= limit:
+        return clean or "[без текста]"
+    return clean[: limit - 1] + "…"
+
+
+def _count_media_items(items: List[Dict[str, Any]]) -> int:
+    """Count non-text items in content list."""
+    return sum(1 for item in items if item.get("type") != "text")
+
+
+def _summarize_variant_entry(entry: Dict[str, Any]) -> str:
+    """Create preview snippet for variant."""
+    snippet = _summarize_text(entry.get("body") or "")
+    media_count = _count_media_items(entry.get("content") or [])
+    if media_count:
+        snippet += f" (+{media_count} влож.)"
+    return snippet
+
+
+def _is_cancel_text(text: Optional[str]) -> bool:
+    """Check if user input means cancellation."""
+    if not text:
+        return False
+    return text.strip().lower() in CANCEL_KEYWORDS
+
+
+def _parse_cta_buttons(raw: str) -> List[Dict[str, str]]:
+    """Parse CTA button definitions from user input."""
+    buttons: List[Dict[str, str]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            raise ValueError("Каждая кнопка должна быть в формате «Текст | действие».")
+        text_part, action_part = [part.strip() for part in line.split("|", 1)]
+        if not text_part or not action_part:
+            raise ValueError("Нужно указать и текст, и действие для кнопки.")
+
+        action_lower = action_part.lower()
+        if action_lower.startswith("url:"):
+            url_value = action_part.split(":", 1)[1].strip()
+            buttons.append({"text": text_part, "url": url_value})
+        elif action_lower.startswith("http://") or action_lower.startswith("https://"):
+            buttons.append({"text": text_part, "url": action_part})
+        else:
+            if action_lower.startswith("callback:"):
+                action_part = action_part.split(":", 1)[1].strip()
+            buttons.append({"text": text_part, "callback_data": action_part})
+
+    return buttons
+
+
+def _extract_body_from_items(items: List[Dict[str, Any]], fallback: str) -> str:
+    """Extract primary text body from content items."""
+    for item in items:
+        if item.get("type") == "text":
+            return item.get("plain_text") or item.get("text") or fallback or ""
+    return fallback or "[без текста]"
+
+
+def _build_ab_test_preview_text(name: str, variants: List[Dict[str, Any]]) -> str:
+    """Render preview text for confirmation step."""
+    lines = [
+        "🧪 <b>Предпросмотр A/B теста</b>",
+        f"Название: {escape(name)}",
+        f"Вариантов: {len(variants)}",
+        "",
+    ]
+
+    for index, variant in enumerate(variants):
+        code = variant.get("code") or _get_variant_code(index)
+        lines.append(f"{code}) {_summarize_variant_entry(variant)}")
+        buttons = variant.get("buttons") or []
+        if buttons:
+            lines.append("   CTA: " + ", ".join(btn.get("text") for btn in buttons))
+        lines.append("")
+
+    lines.append("📤 Рассылка будет отправлена 30% активной аудитории (равномерно по вариантам).")
+    return "\n".join(lines)
+
+
+def _coerce_datetime(value: Optional[Any]) -> Optional[datetime]:
+    """Convert ISO string to datetime if needed."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_ab_test_result_text(analysis: Dict[str, Any]) -> str:
+    """Format detailed statistics for an A/B test."""
+    name = analysis.get("name") or "A/B тест"
+    status_value = analysis.get("status", "unknown")
+    status_label = AB_STATUS_LABELS.get(clean_enum_value(status_value), status_value)
+    started_at = _format_datetime(_coerce_datetime(analysis.get("started_at")))
+    finished_at = _format_datetime(_coerce_datetime(analysis.get("finished_at")))
+    audience = analysis.get("audience_size") or 0
+    test_size = analysis.get("test_size") or 0
+
+    lines = [
+        f"🧪 <b>{escape(name)}</b>",
+        f"Статус: {status_label}",
+        f"Старт: {started_at}",
+        f"Завершение: {finished_at}",
+        f"Охват теста: {test_size} из {audience}",
+        "",
+        "Показатели по вариантам:",
+    ]
+
+    for variant in analysis.get("variants", []):
+        lines.append(
+            f"• {variant.get('variant')}: доставлено {variant.get('delivered', 0)}, "
+            f"клики {variant.get('unique_clicks', 0)}, CTR {format_percent(variant.get('ctr'))}, "
+            f"лиды {variant.get('leads', 0)} (CR {format_percent(variant.get('cr'))}), "
+            f"отписки {variant.get('unsubscribed', 0)} ({format_percent(variant.get('unsub_rate'))}), "
+            f"блокировки {variant.get('blocked', 0)}"
+        )
+
+    winner = analysis.get("winner")
+    lines.append("")
+    if winner:
+        lines.append(
+            f"🏆 Победитель: вариант {winner.get('variant')} "
+            f"(CTR {format_percent(winner.get('ctr'))}, CR {format_percent(winner.get('cr'))})"
+        )
+    else:
+        lines.append("🏳️ Победитель не определён.")
+
+    return "\n".join(lines)
 
 
 def _extract_broadcast_items(message: Message) -> List[Dict[str, Any]]:
@@ -515,16 +728,215 @@ def _build_material_detail(material: Material) -> Tuple[str, InlineKeyboardMarku
 
 
 async def _get_product_by_id(session, product_id: int) -> Optional[Product]:
-    stmt = select(Product).where(Product.id == product_id)
+    stmt = (
+        select(Product)
+        .options(selectinload(Product.criteria))
+        .where(Product.id == product_id)
+    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
+def _normalize_markdown(text: str) -> str:
+    """Remove markdown symbols for admin previews."""
+    if not text:
+        return ""
+    # Basic removal of emphasis markers
+    cleaned = re.sub(r"[*_`]+", "", text)
+    return cleaned.strip()
+
+
+def _build_survey_catalog(survey_service) -> Dict[int, Dict[str, Any]]:
+    """Return catalog of survey questions with answer indices."""
+    catalog: Dict[int, Dict[str, Any]] = {}
+    for idx, (code, question) in enumerate(survey_service.questions.items(), start=1):
+        answers = []
+        for answer_idx, (answer_code, option) in enumerate(question.get("options", {}).items(), start=1):
+            answers.append(
+                {
+                    "id": answer_idx,
+                    "question_code": code,
+                    "code": answer_code,
+                    "text": _normalize_markdown(option.get("text", "")),
+                }
+            )
+        catalog[idx] = {
+            "code": code,
+            "text": _normalize_markdown(question.get("text", "")),
+            "answers": answers,
+        }
+    return catalog
+
+
+def _format_survey_reference(catalog: Dict[int, Dict[str, Any]]) -> str:
+    """Format survey catalog for admin display."""
+    lines: list[str] = []
+    for q_idx in sorted(catalog):
+        entry = catalog[q_idx]
+        lines.append(f"Q{q_idx}. {entry['text']}")
+        for answer in entry["answers"]:
+            lines.append(f"  {answer['id']}) {answer['text']} ({answer['code']})")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+_CRITERIA_ENTRY_SPLIT = re.compile(r"[;\n]+")
+_QUESTION_HEADER = re.compile(r"^\s*(?:Q)?(?P<question>\d+)\s*:\s*(?P<body>.+)$", re.IGNORECASE)
+_GROUP_WEIGHT = re.compile(r"\(\s*(?:вес|weight|w)\s*=?\s*(?P<weight>[-+]?\d+)\s*\)", re.IGNORECASE)
+_INLINE_NOTE = re.compile(r"(?:note|коммент|причина)\s*[:=]\s*(?P<note>.+)", re.IGNORECASE)
+
+
+def _parse_criteria_input(raw: str, catalog: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Parse admin input into structured criteria."""
+    entries: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    segments = [segment.strip() for segment in _CRITERIA_ENTRY_SPLIT.split(raw or "") if segment.strip()]
+    if not segments:
+        raise ValueError("Не найдено ни одного критерия. Используйте формат 'Q1: 2,4'.")
+
+    for segment in segments:
+        match = _QUESTION_HEADER.match(segment)
+        if not match:
+            errors.append(f"Не могу распознать строку: {segment}")
+            continue
+
+        question_id = int(match.group("question"))
+        body = match.group("body").strip()
+        catalog_entry = catalog.get(question_id)
+        if not catalog_entry:
+            errors.append(f"Вопрос Q{question_id} не найден в анкете.")
+            continue
+
+        group_weight: Optional[int] = None
+        # Extract group-level weight if present
+        group_match = _GROUP_WEIGHT.search(body)
+        if group_match:
+            group_weight = int(group_match.group("weight"))
+            body = _GROUP_WEIGHT.sub("", body).strip()
+
+        tokens = [token.strip() for token in body.split(",") if token.strip()]
+        if not tokens:
+            errors.append(f"Для Q{question_id} не указаны ответы.")
+            continue
+
+        for token in tokens:
+            answer_weight = group_weight if group_weight is not None else 1
+            note: Optional[str] = None
+            inner = None
+
+            # Extract inline data in parentheses
+            if "(" in token and token.endswith(")"):
+                token_body, inner_body = token.split("(", 1)
+                inner = inner_body[:-1]  # drop closing )
+                token = token_body.strip()
+            elif "[" in token and token.endswith("]"):
+                token_body, inner_body = token.split("[", 1)
+                inner = inner_body[:-1]
+                token = token_body.strip()
+
+            if not token.isdigit():
+                errors.append(f"Ответ '{token}' должен быть числом. См. Q{question_id}.")
+                continue
+
+            answer_id = int(token)
+            answers = catalog_entry["answers"]
+            if answer_id < 1 or answer_id > len(answers):
+                errors.append(f"Ответ {answer_id} отсутствует в Q{question_id}.")
+                continue
+
+            if inner:
+                parts = [part.strip() for part in re.split(r"[|;]", inner) if part.strip()]
+                for part in parts:
+                    if _GROUP_WEIGHT.match(f"(вес {part})"):
+                        answer_weight = int(part)
+                        continue
+                    if re.fullmatch(r"[-+]?\d+", part):
+                        answer_weight = int(part)
+                        continue
+                    inline_note = _INLINE_NOTE.search(part)
+                    if inline_note:
+                        note = inline_note.group("note")
+                        continue
+                    if part.lower().startswith("вес"):
+                        digits = re.findall(r"[-+]?\d+", part)
+                        if digits:
+                            answer_weight = int(digits[0])
+                        continue
+                    note = part.strip("\"' ")
+
+            answer_entry = answers[answer_id - 1]
+            entries.append(
+                {
+                    "question_id": question_id,
+                    "question_code": answer_entry.get("question_code") or catalog_entry["code"],
+                    "answer_id": answer_id,
+                    "answer_code": answer_entry["code"],
+                    "weight": answer_weight,
+                    "note": note,
+                }
+            )
+
+    if errors:
+        raise ValueError("\n".join(errors))
+
+    return entries
+
+
+def _format_criteria_table(criteria: List) -> str:
+    """Pretty-print criteria grouped by question."""
+    if not criteria:
+        return "Критерии не заданы."
+
+    lines: list[str] = []
+    sorted_criteria = sorted(criteria, key=lambda item: (item.question_id, item.answer_id))
+    for question_id, group in groupby(sorted_criteria, key=lambda item: item.question_id):
+        entries = list(group)
+        line_parts = []
+        for item in entries:
+            note = f" ({item.note})" if item.note else ""
+            line_parts.append(f"A{item.answer_id}[{item.weight:+d}]{note}")
+        lines.append(f"Q{question_id}: " + ", ".join(line_parts))
+    return "\n".join(lines)
+
+
 def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
     status_label = PRODUCT_STATUS_LABELS.get(product.is_active, "—")
-    price = _format_currency(product.price)
+    price_display = _format_currency(product.price)
+    currency = escape(product.currency or "RUB")
+    price_text = f"{price_display} {currency}"
+    slug = escape(product.slug) if product.slug else "—"
+    short_desc = escape(_shorten(product.short_desc, 240)) if product.short_desc else "—"
     description = escape(_shorten(product.description, 500)) if product.description else "—"
-    landing_url = product.payment_landing_url
+    landing_url = product.landing_url or product.payment_landing_url
+    payment_url = product.payment_landing_url
+    value_props = product.value_props or []
+    if isinstance(value_props, str):
+        try:
+            value_props = json.loads(value_props)
+        except json.JSONDecodeError:
+            value_props = [value_props]
+    if not isinstance(value_props, list):
+        value_props = [str(value_props)]
+    value_props_lines = "\n".join(f"• {escape(str(item))}" for item in value_props[:5]) or "—"
+
+    criteria_summary = "Критерии не настроены"
+    criteria_lines: list[str] = []
+    if product.criteria:
+        positives = sum(1 for c in product.criteria if c.weight >= 0)
+        negatives = sum(1 for c in product.criteria if c.weight < 0)
+        criteria_summary = f"{len(product.criteria)} правил · +{positives} / −{negatives}"
+        for criterion in product.criteria[:8]:
+            note = f" ({escape(criterion.note)})" if criterion.note else ""
+            criteria_lines.append(
+                f"Q{criterion.question_id} → A{criterion.answer_id} [{criterion.weight:+d}]{note}"
+            )
+        if len(product.criteria) > 8:
+            criteria_lines.append("…")
+    criteria_details = "\n".join(criteria_lines) if criteria_lines else ""
+    preview_props = [escape(str(item)) for item in value_props[:2]]
+    preview_block = "\n".join(f"• {item}" for item in preview_props) if preview_props else "• Добавьте ключевые выгоды"
+
     meta_json = "—"
     if product.meta:
         try:
@@ -539,16 +951,28 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
         f"💰 <b>{escape(product.name)}</b>\n"
         f"ID: <code>{product.id}</code>\n"
         f"Код: <code>{escape(product.code)}</code>\n"
+        f"Slug: {slug}\n"
         f"Статус: {status_label}\n"
-        f"Цена: {price}\n"
+        f"Цена: {price_text}\n"
         f"Лендинг: {landing_url or '—'}\n"
-        f"\n<b>Описание</b>\n{description}\n\n"
-        f"<b>Meta</b>\n<pre>{meta_json}</pre>"
+        f"Оплата: {payment_url or '—'}\n"
+        f"\n<b>Коротко</b>\n{short_desc}\n"
+        f"\n<b>Ключевые выгоды</b>\n{value_props_lines}\n"
+        f"\n<b>Предпросмотр для клиента</b>\n"
+        f"{escape(product.name)} — {price_text}\n"
+        f"{preview_block}\n"
+        "Кнопка: «Хочу программу»\n"
+        f"\n<b>Описание</b>\n{description}\n"
+        f"\n<b>Критерии подбора</b>\n{criteria_summary}\n"
+        f"{criteria_details}\n"
+        f"\n<b>Meta</b>\n<pre>{meta_json}</pre>"
     )
 
     builder = InlineKeyboardBuilder()
     if landing_url:
         builder.add(InlineKeyboardButton(text="🌐 Ленд", url=landing_url))
+    if payment_url and payment_url != landing_url:
+        builder.add(InlineKeyboardButton(text="💳 Оплата", url=payment_url))
 
     builder.add(
         InlineKeyboardButton(
@@ -557,8 +981,20 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
         )
     )
     builder.row(
+        InlineKeyboardButton(text="💱 Валюта", callback_data=f"product_edit_currency:{product.id}"),
+        InlineKeyboardButton(text="🪪 Коротко", callback_data=f"product_edit_short:{product.id}"),
+    )
+    builder.row(
         InlineKeyboardButton(text="✏️ Изменить цену", callback_data=f"product_edit_price:{product.id}"),
         InlineKeyboardButton(text="📝 Описание", callback_data=f"product_edit_description:{product.id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🎯 Value props", callback_data=f"product_edit_value:{product.id}"),
+        InlineKeyboardButton(text="🔗 Лендинг", callback_data=f"product_edit_landing:{product.id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🧠 Настроить критерии", callback_data=f"product_criteria:{product.id}"),
+        InlineKeyboardButton(text="🧪 Проверить пользователя", callback_data=f"product_match_check:{product.id}"),
     )
     builder.row(InlineKeyboardButton(text="⬅️ К списку", callback_data="product_list"))
     builder.row(InlineKeyboardButton(text="💰 Раздел", callback_data="admin_products"))
@@ -607,6 +1043,9 @@ async def admin_panel(message: Message):
     # Admin management (owners only)
     if capabilities.get("can_manage_admins"):
         buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
+
+    buttons.append([InlineKeyboardButton(text="⚙️ Системные настройки", callback_data="admin_settings")])
+    buttons.append([InlineKeyboardButton(text="📅 Настройки консультаций", callback_data="admin_consult_settings")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
@@ -619,6 +1058,68 @@ async def admin_panel(message: Message):
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+
+
+async def _render_settings_panel(callback: CallbackQuery, session) -> None:
+    """Render settings overview with sentiment toggle."""
+    local_session = None
+    target_session = session
+    if target_session is None:
+        async for db_session in get_db():
+            local_session = db_session
+            target_session = db_session
+            break
+
+    repo = SystemSettingsRepository(target_session)
+    enabled = await repo.get_value(sentiment_service.AUTO_SETTING_KEY, default=True)
+    enabled_bool = bool(enabled)
+    toggle_text = "🛑 Выключить авто-оценку" if enabled_bool else "🟢 Включить авто-оценку"
+    status_text = "включена" if enabled_bool else "выключена"
+
+    lines = [
+        "⚙️ <b>Системные настройки</b>",
+        "",
+        f"🤖 Авто-оценка сообщений: <b>{status_text}</b>",
+        "",
+        "При выключении новые сообщения не будут отправляться в LLM — "
+        "метки фиксируются как нейтральные.",
+    ]
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text=toggle_text, callback_data="settings:sentiment_toggle"))
+    keyboard.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back"))
+    keyboard.adjust(1)
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=keyboard.as_markup(),
+        parse_mode="HTML",
+    )
+
+    if local_session is not None:
+        await local_session.commit()
+        await local_session.close()
+
+
+@router.callback_query(F.data == "admin_settings")
+@admin_required
+async def admin_settings_menu(callback: CallbackQuery, **kwargs):
+    """Show system settings panel."""
+    session = kwargs.get("session")
+    await _render_settings_panel(callback, session)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:sentiment_toggle")
+@admin_required
+async def admin_toggle_sentiment(callback: CallbackQuery, **kwargs):
+    """Toggle automatic sentiment classification."""
+    session = kwargs.get("session")
+    current = await sentiment_service.is_auto_enabled()
+    new_state = not current
+    await sentiment_service.set_auto_enabled(new_state)
+    await _render_settings_panel(callback, session)
+    await callback.answer("Настройка обновлена")
 
 
 @router.message(Command("dashboard"))
@@ -685,13 +1186,40 @@ async def show_analytics(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_abtests")
 @admin_required
 async def show_abtests(callback: CallbackQuery):
-    """Show detailed A/B testing metrics."""
+    """Show A/B testing hub with quick stats and actions."""
     try:
         ab_report: Dict[str, Any] = {}
+        can_create = False
         async for session in get_db():
             service = AnalyticsService(session)
             ab_report = await service.get_ab_test_metrics()
+            admin_repo = AdminRepository(session)
+            can_create = await admin_repo.can_manage_broadcasts(callback.from_user.id)
             break
+
+        if ab_report.get("error") == "ab_tables_missing":
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]
+            )
+            await callback.message.edit_text(
+                "🧪 A/B тесты недоступны. Требуется выполнить миграции БД (например, <code>alembic upgrade head</code>).",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            await callback.answer()
+            return
+
+        if ab_report.get("error") == "ab_query_failed":
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]
+            )
+            await callback.message.edit_text(
+                "⚠️ Не удалось получить данные A/B тестов. Проверьте миграции и повторите позже.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            await callback.answer()
+            return
 
         summary = ab_report.get("summary") or {}
         tests = ab_report.get("tests") or []
@@ -701,53 +1229,537 @@ async def show_abtests(callback: CallbackQuery):
             f"Всего: {summary.get('total', 0)} | Активные: {summary.get('running', 0)} | Завершённые: {summary.get('completed', 0)}",
         ]
 
-        if not tests:
+        if tests:
             lines.append("")
-            lines.append("📭 Активных тестов нет.")
-        else:
-            for test in tests:
+            lines.append("Последние тесты:")
+            for test in tests[:3]:
                 status_value = test.get("status", "unknown")
                 status_label = AB_STATUS_LABELS.get(
                     clean_enum_value(status_value),
                     status_value,
                 )
-                metric_value = str(test.get("metric", "CTR")).upper()
-                lines.extend(
-                    [
-                        "",
-                        f"#{test.get('id')} <b>{test.get('name', 'Без названия')}</b>",
-                        f"• Статус: {status_label} | Метрика: {metric_value} | Популяция: {test.get('population', 0)}%",
-                    ]
+                total_delivered = sum(variant.get("delivered", 0) for variant in test.get("variants", []))
+                lines.append(
+                    f"• #{test.get('id')} {test.get('name', 'Без названия')} — {status_label}, доставлено {total_delivered}"
                 )
+        else:
+            lines.append("")
+            lines.append("📭 Тесты еще не запускались.")
 
-                winner = test.get("winner")
-                if winner:
-                    metric = str(winner.get("metric", "ctr")).upper()
-                    lines.append(
-                        f"• Лидер: вариант {winner.get('variant')} ({metric} {format_percent(winner.get('score'))})"
-                    )
-
-                for variant in test.get("variants", []):
-                    lines.append(
-                        "   "
-                        + f"{variant.get('variant')}: доставлено {variant.get('delivered', 0)}, "
-                        + f"CTR {format_percent(variant.get('ctr'))}, CR {format_percent(variant.get('cr'))}, "
-                        + f"конверсии {variant.get('conversions', 0)}"
-                    )
+        lines.append("")
+        lines.append("Выберите действие:")
 
         text = "\n".join(lines)
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_abtests")],
-            [InlineKeyboardButton(text="⬅️ К аналитике", callback_data="admin_analytics")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
-        ])
+        keyboard_rows = []
+        if can_create:
+            keyboard_rows.append([InlineKeyboardButton(text="➕ Создать тест", callback_data="admin_abtests_create")])
+        keyboard_rows.append([InlineKeyboardButton(text="📊 Результаты", callback_data="admin_abtests_results")])
+        keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_abtests")])
+        keyboard_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        await callback.answer()
 
     except Exception:
         logger.exception("Error showing A/B tests")
         await callback.answer("❌ Ошибка при загрузке A/B тестов", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_abtests_create")
+@broadcast_permission_required
+async def admin_abtests_create(callback: CallbackQuery, state: FSMContext):
+    """Start A/B test creation wizard."""
+    try:
+        await state.clear()
+        await state.update_data(
+            ab_test={
+                "variants": [],
+                "current_index": 0,
+                "total_variants": 0,
+            }
+        )
+        await state.set_state(AdminStates.waiting_for_ab_test_name)
+
+        await callback.message.edit_text(
+            "🧪 <b>Создание A/B теста</b>\n\n"
+            "Введите название теста (для отчётов и админки).",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("Error initializing A/B test wizard")
+        await callback.answer("❌ Не удалось начать создание теста", show_alert=True)
+
+
+@router.message(AdminStates.waiting_for_ab_test_name)
+@broadcast_permission_required
+async def admin_abtests_set_name(message: Message, state: FSMContext):
+    """Handle A/B test name input."""
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("❌ Создание теста отменено.")
+        return
+
+    name = (message.text or "").strip()
+    if len(name) < 3:
+        await message.answer("Название должно содержать минимум 3 символа. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    ab_data = data.get("ab_test", {})
+    ab_data["name"] = name
+    ab_data["creator_id"] = message.from_user.id
+    await state.update_data(ab_test=ab_data)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="2 варианта", callback_data="admin_abtests_variants:2"),
+                InlineKeyboardButton(text="3 варианта", callback_data="admin_abtests_variants:3"),
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_abtests_cancel")],
+        ]
+    )
+
+    await state.set_state(AdminStates.waiting_for_ab_test_variant_count)
+    await message.answer(
+        "Выберите количество вариантов для теста.",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(
+    AdminStates.waiting_for_ab_test_variant_count,
+    F.data.startswith("admin_abtests_variants:")
+)
+@broadcast_permission_required
+async def admin_abtests_set_variant_count(callback: CallbackQuery, state: FSMContext):
+    """Persist number of variants and request first variant content."""
+    try:
+        _, raw_count = callback.data.split(":")
+        variant_count = int(raw_count)
+    except (ValueError, AttributeError):
+        await callback.answer("⚠️ Выберите количество вариантов кнопкой.", show_alert=True)
+        return
+
+    if variant_count not in (2, 3):
+        await callback.answer("⚠️ Допустимо выбирать 2 или 3 варианта.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    ab_data = data.get("ab_test", {})
+    ab_data["total_variants"] = variant_count
+    ab_data["current_index"] = 0
+    ab_data["variants"] = []
+    ab_data.pop("pending_variant", None)
+    await state.update_data(ab_test=ab_data)
+
+    variant_label = _get_variant_code(0)
+    await state.set_state(AdminStates.waiting_for_ab_test_variant_content)
+    await callback.message.edit_text(
+        f"Вариант {variant_label}.\n"
+        "Отправьте <b>одним сообщением</b> текст и вложения для этого варианта.\n\n"
+        "Поддерживаются текст, фото, видео, документы. После отправки вы настроите CTA-кнопки.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_abtests_cancel")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_ab_test_variant_content)
+@broadcast_permission_required
+async def admin_abtests_collect_variant_content(message: Message, state: FSMContext):
+    """Capture message content for current variant."""
+    if _is_cancel_text(message.text or message.caption):
+        await state.clear()
+        await message.answer("❌ Создание теста отменено.")
+        return
+
+    items = _extract_broadcast_items(message)
+    fallback_body = message.html_text or message.text or message.html_caption or message.caption or ""
+    body = _extract_body_from_items(items, fallback_body)
+
+    data = await state.get_data()
+    ab_data = data.get("ab_test", {})
+    current_index = int(ab_data.get("current_index", 0))
+    variant_entry = {
+        "code": _get_variant_code(current_index),
+        "body": body,
+        "content": items,
+        "buttons": [],
+    }
+    ab_data["pending_variant"] = variant_entry
+    await state.update_data(ab_test=ab_data)
+
+    await state.set_state(AdminStates.waiting_for_ab_test_variant_buttons)
+    await message.answer(
+        "Добавьте CTA-кнопки для этого варианта.\n"
+        "Формат: <code>Текст кнопки | действие</code>\n"
+        "• Для ссылок можно указать полную ссылку или <code>Текст | url:https://...</code>\n"
+        "• Для внутренних действий: <code>Текст | callback_data</code>\n\n"
+        "Отправьте «нет», если кнопки не требуются.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_abtests_cancel")]]
+        ),
+    )
+
+
+@router.message(AdminStates.waiting_for_ab_test_variant_buttons)
+@broadcast_permission_required
+async def admin_abtests_collect_variant_buttons(message: Message, state: FSMContext):
+    """Handle CTA buttons definition for current variant."""
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("❌ Создание теста отменено.")
+        return
+
+    data = await state.get_data()
+    ab_data = data.get("ab_test", {})
+    pending_variant = ab_data.get("pending_variant")
+    if not pending_variant:
+        await message.answer("⚠️ Не удалось найти вариант. Начните заново /cancel.")
+        return
+
+    raw_text = (message.text or "").strip()
+    buttons: List[Dict[str, str]] = []
+    if raw_text and raw_text.lower() not in {"нет", "no", "-"}:
+        try:
+            buttons = _parse_cta_buttons(raw_text)
+        except ValueError as err:
+            await message.answer(f"⚠️ {err}\nПопробуйте снова или отправьте «нет».")
+            return
+
+    pending_variant["buttons"] = buttons
+    ab_data.setdefault("variants", []).append(pending_variant)
+    ab_data["pending_variant"] = None
+    ab_data["current_index"] = int(ab_data.get("current_index", 0)) + 1
+    await state.update_data(ab_test=ab_data)
+
+    if ab_data["current_index"] < ab_data.get("total_variants", 0):
+        variant_label = _get_variant_code(ab_data["current_index"])
+        await state.set_state(AdminStates.waiting_for_ab_test_variant_content)
+        await message.answer(
+            f"Вариант {variant_label}. Отправьте содержимое одним сообщением.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_abtests_cancel")]]
+            ),
+        )
+        return
+
+    preview_text = _build_ab_test_preview_text(ab_data.get("name", "Без названия"), ab_data["variants"])
+    await state.update_data(ab_test=ab_data)
+    await state.set_state(AdminStates.waiting_for_ab_test_confirmation)
+    await message.answer(
+        preview_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Запустить тест", callback_data="admin_abtests_confirm")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_abtests_cancel")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    AdminStates.waiting_for_ab_test_confirmation,
+    F.data == "admin_abtests_confirm",
+)
+@broadcast_permission_required
+async def admin_abtests_confirm(callback: CallbackQuery, state: FSMContext):
+    """Finalize A/B test creation and trigger delivery."""
+    data = await state.get_data()
+    ab_data = data.get("ab_test") or {}
+    variants_data = ab_data.get("variants") or []
+    name = ab_data.get("name")
+
+    if not name or not variants_data:
+        await state.clear()
+        await callback.answer("⚠️ Данные теста не найдены, начните заново.", show_alert=True)
+        return
+
+    variant_defs = []
+    for idx, variant in enumerate(variants_data):
+        code = variant.get("code") or _get_variant_code(idx)
+        title = f"{code}: {_summarize_text(variant.get('body') or '', 40)}"
+        variant_defs.append(
+            VariantDefinition(
+                title=title,
+                body=variant.get("body") or "",
+                content=variant.get("content"),
+                buttons=variant.get("buttons"),
+                code=code,
+            )
+        )
+
+    delivery_summary: Dict[str, Any] = {}
+    analysis: Dict[str, Any] = {}
+    job_id: Optional[str] = None
+
+    try:
+        async for session in get_db():
+            seller_logger.info("ab_test.create.start", test_name=name, variants=len(variant_defs))
+            logger.info(
+                "ab_test.create.start",
+                extra={"test_name": name, "variants": len(variant_defs)},
+            )
+            ab_service = ABTestingService(session)
+            ab_test = await ab_service.create_test(
+                name=name,
+                creator_user_id=callback.from_user.id,
+                variants=variant_defs,
+                start_immediately=False,
+            )
+
+            delivery_summary = await ab_service.start_test(
+                ab_test.id,
+                bot=callback.bot,
+                send_messages=True,
+                throttle=0.1,
+            )
+            seller_logger.info("ab_test.start.result", test_id=ab_test.id, delivery=delivery_summary)
+            logger.info(
+                "ab_test.start.result",
+                extra={"test_id": ab_test.id, "delivery": delivery_summary},
+            )
+
+            summary_time = datetime.now(timezone.utc) + timedelta(hours=24)
+            job_id = await scheduler_service.schedule_ab_test_summary(ab_test.id, summary_time)
+            if job_id:
+                ab_test.notification_job_id = job_id
+
+            analysis = await ab_service.analyze_test_results(ab_test.id)
+            seller_logger.info(
+                "ab_test.analysis.result",
+                test_id=ab_test.id,
+                analysis_error=analysis.get("error"),
+                variants_count=len(analysis.get("variants", [])),
+            )
+            logger.info(
+                "ab_test.analysis.result",
+                extra={
+                    "test_id": ab_test.id,
+                    "analysis_error": analysis.get("error"),
+                    "variants_count": len(analysis.get("variants", [])),
+                },
+            )
+
+            await session.flush()
+            await session.commit()
+            break
+    except Exception as exc:
+        seller_logger.error("ab_test.error", error=str(exc), exc_info=True)
+        async for session in get_db():
+            await session.rollback()
+            break
+        await callback.answer("❌ Не удалось запустить тест", show_alert=True)
+        return
+
+    await state.clear()
+    delivery = delivery_summary.get("delivery", {})
+    assignments = delivery_summary.get("assignments", 0)
+    sent = delivery.get("sent", 0)
+    failed = delivery.get("failed", 0)
+
+    lines = [
+        "✅ <b>A/B тест запущен!</b>",
+        f"Название: {escape(name)}",
+        f"Охват (30%): {assignments}",
+        f"Успешно отправлено: {sent} | Ошибок: {failed}",
+    ]
+
+    if job_id is None:
+        lines.append("⚠️ Не удалось запланировать автоматическое уведомление — проверьте планировщик.")
+
+    if analysis.get("variants"):
+        lines.append("")
+        lines.append("Текущие показатели:")
+        for variant in analysis["variants"]:
+            lines.append(
+                f"• {variant.get('variant')}: доставлено {variant.get('delivered', 0)}, "
+                f"CTR {format_percent(variant.get('ctr'))}, "
+                f"CR {format_percent(variant.get('cr'))}"
+            )
+
+    lines.append("")
+    lines.append("📬 Итоговый отчёт придёт автоматически через 24 часа.")
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Перейти к результатам", callback_data="admin_abtests_results")],
+            [InlineKeyboardButton(text="⬅️ В меню A/B тестов", callback_data="admin_abtests")],
+        ]
+    )
+
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_abtests_cancel")
+async def admin_abtests_cancel(callback: CallbackQuery, state: FSMContext):
+    """Abort A/B test creation wizard."""
+    await state.clear()
+    await callback.message.edit_text(
+        "❌ Создание A/B теста отменено.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню A/B тестов", callback_data="admin_abtests")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_abtests_results")
+@admin_required
+async def admin_abtests_results(callback: CallbackQuery):
+    """Show list of available A/B tests."""
+    try:
+        async for session in get_db():
+            admin_repo = AdminRepository(session)
+            admin_record = await admin_repo.get_by_telegram_id(callback.from_user.id)
+            role_value = getattr(admin_record, "role", None)
+            can_view_all = False
+            if role_value in {AdminRole.ADMIN, AdminRole.OWNER}:
+                can_view_all = True
+            else:
+                can_view_all = await admin_repo.can_manage_broadcasts(callback.from_user.id)
+
+            stmt = select(ABTest).order_by(ABTest.created_at.desc()).limit(12)
+            if not can_view_all:
+                stmt = stmt.where(ABTest.creator_user_id == callback.from_user.id)
+
+            tests = list((await session.execute(stmt)).scalars().all())
+            break
+    except SQLAlchemyError as exc:
+        logger.warning("ab_tests.list_failed", error=str(exc))
+        await callback.message.edit_text(
+            "🧪 Список A/B тестов недоступен. Выполните миграции базы данных и попробуйте снова.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+        if not tests:
+            await callback.message.edit_text(
+                "🧪 <b>A/B тесты</b>\n\nПока нет тестов, доступных для просмотра.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_abtests")]]
+                ),
+            )
+            await callback.answer()
+            return
+
+        lines = ["🧪 <b>Список A/B тестов</b>", ""]
+        builder = InlineKeyboardBuilder()
+
+        for test in tests:
+            status_value = test.status if isinstance(test.status, str) else getattr(test.status, "value", str(test.status))
+            status_label = AB_STATUS_LABELS.get(clean_enum_value(status_value), status_value)
+            created = _format_datetime(test.created_at)
+            creator_hint = f"(initiator: {test.creator_user_id})" if can_view_all else ""
+            lines.append(f"• #{test.id} {escape(test.name)} — {status_label} {creator_hint}")
+            lines.append(f"  Запущен: {created}")
+            lines.append("")
+
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"#{test.id} {test.name[:20]}",
+                    callback_data=f"admin_abtests_result:{test.id}",
+                )
+            )
+
+        builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_abtests"))
+
+        await callback.message.edit_text(
+            "\n".join(lines).strip(),
+            parse_mode="HTML",
+            reply_markup=builder.as_markup(),
+        )
+        await callback.answer()
+
+    except Exception:
+        logger.exception("Error showing A/B test list")
+        await callback.answer("❌ Не удалось получить список тестов", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_abtests_result:"))
+@admin_required
+async def admin_abtests_result_detail(callback: CallbackQuery):
+    """Show detailed metrics for specific A/B test."""
+    try:
+        _, raw_test_id = callback.data.split(":")
+        test_id = int(raw_test_id)
+    except (ValueError, AttributeError):
+        await callback.answer("⚠️ Некорректный идентификатор теста.", show_alert=True)
+        return
+
+    try:
+        async for session in get_db():
+            admin_repo = AdminRepository(session)
+            admin_record = await admin_repo.get_by_telegram_id(callback.from_user.id)
+            role_value = getattr(admin_record, "role", None)
+            can_view_all = role_value in {AdminRole.ADMIN, AdminRole.OWNER}
+
+            ab_service = ABTestingService(session)
+            analysis = await ab_service.analyze_test_results(test_id)
+
+            if analysis.get("error") == "ab_tables_missing":
+                await callback.message.edit_text(
+                    "🧪 Детализация теста недоступна. Требуется выполнить миграции БД.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_abtests_results")]]
+                    ),
+                )
+                await callback.answer()
+                return
+
+            if analysis.get("error"):
+                await callback.message.edit_text(
+                    "⚠️ Не удалось загрузить статистику A/B теста.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_abtests_results")]]
+                    ),
+                )
+                await callback.answer()
+                return
+
+            creator_id = analysis.get("creator_user_id")
+            if not can_view_all and creator_id and creator_id != callback.from_user.id:
+                await callback.answer("❌ У вас нет доступа к этому тесту.", show_alert=True)
+                return
+
+            detail_text = _build_ab_test_result_text(analysis)
+            break
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_abtests_result:{test_id}")],
+                [InlineKeyboardButton(text="⬅️ К списку тестов", callback_data="admin_abtests_results")],
+            ]
+        )
+
+        await callback.message.edit_text(
+            detail_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        await callback.answer()
+
+    except Exception:
+        logger.exception("Error showing A/B test detail")
+        await callback.answer("❌ Не удалось загрузить данные теста", show_alert=True)
 
 
 # Materials Management
@@ -1136,8 +2148,69 @@ async def product_create_price(message: Message, state: FSMContext):
         return
 
     await state.update_data(product_price=str(price))
+    await state.set_state(AdminStates.waiting_for_product_currency)
+    await message.answer(
+        "Введите валюту цены (например, RUB, USD). Оставьте пустым для RUB:",
+    )
+
+
+@router.message(AdminStates.waiting_for_product_currency)
+@role_required(AdminRole.ADMIN)
+async def product_create_currency(message: Message, state: FSMContext):
+    currency = (message.text or "").strip().upper() or "RUB"
+    if not re.fullmatch(r"[A-Z]{3,5}", currency):
+        await message.answer("❌ Валюта должна быть указана в формате ISO, например RUB или USD.")
+        return
+
+    await state.update_data(product_currency=currency)
+    await state.set_state(AdminStates.waiting_for_product_short_desc)
+    await message.answer(
+        "Напишите короткое описание (1–2 предложения) как увидит пользователь.\n"
+        "Если хотите пропустить, отправьте '-'.",
+    )
+
+
+@router.message(AdminStates.waiting_for_product_short_desc)
+@role_required(AdminRole.ADMIN)
+async def product_create_short_desc(message: Message, state: FSMContext):
+    short_desc_raw = (message.text or "").strip()
+    short_desc = None if short_desc_raw in {"", "-"} else short_desc_raw
+    await state.update_data(product_short_desc=short_desc)
+    await state.set_state(AdminStates.waiting_for_product_value_props)
+    await message.answer(
+        "Перечислите 2–4 ключевых выгоды через запятую или каждую с новой строки.\n"
+        "Можно отправить JSON-массив. Чтобы пропустить, отправьте '-'.",
+    )
+
+
+def _parse_value_props_payload(raw: str) -> List[str]:
+    """Parse admin input into list of value props."""
+    candidate = raw.strip()
+    if not candidate or candidate == "-":
+        return []
+    if candidate.startswith("["):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, list):
+                return [str(item).strip() for item in data if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+    separators = "\n;,|"
+    for sep in separators:
+        if sep in candidate:
+            parts = [part.strip() for part in candidate.split(sep) if part.strip()]
+            if parts:
+                return parts
+    return [candidate]
+
+
+@router.message(AdminStates.waiting_for_product_value_props)
+@role_required(AdminRole.ADMIN)
+async def product_create_value_props(message: Message, state: FSMContext):
+    value_props = _parse_value_props_payload(message.text or "")
+    await state.update_data(product_value_props=value_props)
     await state.set_state(AdminStates.waiting_for_product_description)
-    await message.answer("Введите описание продукта (или '-' чтобы пропустить):")
+    await message.answer("Введите подробное описание продукта (или '-' чтобы пропустить):")
 
 
 @router.message(AdminStates.waiting_for_product_description)
@@ -1163,6 +2236,9 @@ async def product_create_finalize(message: Message, state: FSMContext):
     name = data.get("product_name")
     price = Decimal(data.get("product_price", "0"))
     description = data.get("product_description") or None
+    currency = data.get("product_currency") or "RUB"
+    short_desc = data.get("product_short_desc")
+    value_props = data.get("product_value_props") or []
 
     try:
         async for session in get_db():
@@ -1178,9 +2254,13 @@ async def product_create_finalize(message: Message, state: FSMContext):
                 name=name,
                 price=price,
                 description=description,
+                currency=currency,
+                short_desc=short_desc,
+                value_props=value_props,
+                landing_url=landing_url,
+                payment_landing_url=landing_url,
+                slug=code,
             )
-            if landing_url:
-                product.payment_landing_url = landing_url
             await session.flush()
             await session.refresh(product)
             await session.commit()
@@ -1219,6 +2299,443 @@ async def product_toggle(callback: CallbackQuery):
     except Exception as exc:
         logger.exception("Error toggling product", exc_info=exc)
         await callback.answer("❌ Ошибка при обновлении продукта", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("product_edit_currency:"))
+@role_required(AdminRole.ADMIN)
+async def product_edit_currency(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_edit_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_edit_currency)
+    await callback.message.answer("Введите валюту (например, RUB, USD):")
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_edit_currency)
+@role_required(AdminRole.ADMIN)
+async def product_edit_currency_commit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_edit_id")
+    currency = (message.text or "").strip().upper() or "RUB"
+    if not re.fullmatch(r"[A-Z]{3,5}", currency):
+        await message.answer("❌ Некорректная валюта. Используйте формат например RUB или USD.")
+        return
+
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await message.answer("❌ Продукт не найден")
+                await state.clear()
+                return
+            product.currency = currency
+            await session.flush()
+            await session.refresh(product)
+            await session.commit()
+            text, markup = _build_product_detail(product)
+            await message.bot.edit_message_text(
+                text,
+                chat_id=data.get("product_detail_chat_id"),
+                message_id=data.get("product_detail_message_id"),
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            await message.answer("✅ Валюта обновлена")
+            break
+    except Exception as exc:
+        logger.exception("Error updating product currency", exc_info=exc)
+        await message.answer("❌ Ошибка при обновлении валюты")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("product_edit_short:"))
+@role_required(AdminRole.ADMIN)
+async def product_edit_short(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_edit_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_edit_short_desc)
+    await callback.message.answer("Введите новое короткое описание (или '-' для очистки):")
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_edit_short_desc)
+@role_required(AdminRole.ADMIN)
+async def product_edit_short_commit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_edit_id")
+    short_desc = (message.text or "").strip()
+    if short_desc in {"", "-"}:
+        short_desc = None
+
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await message.answer("❌ Продукт не найден")
+                await state.clear()
+                return
+            product.short_desc = short_desc
+            await session.flush()
+            await session.refresh(product)
+            await session.commit()
+            text, markup = _build_product_detail(product)
+            await message.bot.edit_message_text(
+                text,
+                chat_id=data.get("product_detail_chat_id"),
+                message_id=data.get("product_detail_message_id"),
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            await message.answer("✅ Короткое описание обновлено")
+            break
+    except Exception as exc:
+        logger.exception("Error updating short description", exc_info=exc)
+        await message.answer("❌ Ошибка при обновлении описания")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("product_edit_value:"))
+@role_required(AdminRole.ADMIN)
+async def product_edit_value(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_edit_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_edit_value_props)
+    await callback.message.answer(
+        "Перечислите выгоды через запятую/строки или отправьте JSON-массив. '-' очистит список.",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_edit_value_props)
+@role_required(AdminRole.ADMIN)
+async def product_edit_value_commit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_edit_id")
+    value_props = _parse_value_props_payload(message.text or "")
+
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await message.answer("❌ Продукт не найден")
+                await state.clear()
+                return
+            product.value_props = value_props
+            await session.flush()
+            await session.refresh(product)
+            await session.commit()
+            text, markup = _build_product_detail(product)
+            await message.bot.edit_message_text(
+                text,
+                chat_id=data.get("product_detail_chat_id"),
+                message_id=data.get("product_detail_message_id"),
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            await message.answer("✅ Ключевые выгоды обновлены")
+            break
+    except Exception as exc:
+        logger.exception("Error updating value props", exc_info=exc)
+        await message.answer("❌ Ошибка при обновлении списка выгод")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("product_edit_landing:"))
+@role_required(AdminRole.ADMIN)
+async def product_edit_landing(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_edit_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_edit_landing)
+    await callback.message.answer("Введите ссылку на лендинг (или '-' для очистки):")
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_edit_landing)
+@role_required(AdminRole.ADMIN)
+async def product_edit_landing_commit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_edit_id")
+    landing = (message.text or "").strip()
+    if landing in {"", "-"}:
+        landing = None
+
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await message.answer("❌ Продукт не найден")
+                await state.clear()
+                return
+            product.landing_url = landing
+            if not product.payment_landing_url:
+                product.payment_landing_url = landing
+            await session.flush()
+            await session.refresh(product)
+            await session.commit()
+            text, markup = _build_product_detail(product)
+            await message.bot.edit_message_text(
+                text,
+                chat_id=data.get("product_detail_chat_id"),
+                message_id=data.get("product_detail_message_id"),
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            await message.answer("✅ Лендинг обновлён")
+            break
+    except Exception as exc:
+        logger.exception("Error updating landing", exc_info=exc)
+        await message.answer("❌ Ошибка при обновлении ссылки")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("product_criteria:"))
+@role_required(AdminRole.ADMIN)
+async def product_criteria_menu(callback: CallbackQuery, state: FSMContext):
+    """Show current product criteria and instructions."""
+    product_id = int(callback.data.split(":", 1)[1])
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await callback.answer("Продукт не найден", show_alert=True)
+                return
+
+            survey_service = SurveyService(session)
+            catalog = _build_survey_catalog(survey_service)
+            reference_text = _format_survey_reference(catalog)
+            current_rules = _format_criteria_table(product.criteria or [])
+
+            keyboard = InlineKeyboardBuilder()
+            keyboard.row(
+                InlineKeyboardButton(
+                    text="✏️ Редактировать",
+                    callback_data=f"product_criteria_edit:{product.id}",
+                )
+            )
+            keyboard.row(
+                InlineKeyboardButton(
+                    text="⬅️ К продукту",
+                    callback_data=f"product_detail:{product.id}",
+                )
+            )
+
+            message_text = (
+                f"🧠 <b>{escape(product.name)}</b> — критерии анкеты\n\n"
+                f"<b>Текущие правила:</b>\n<pre>{escape(current_rules)}</pre>\n"
+                "<b>Формат:</b>\n"
+                "Q1: 2,4\n"
+                "Q3: 3(-1) // отрицательный ответ\n\n"
+                "<b>Расшифровка вопросов:</b>\n"
+                f"<pre>{escape(reference_text)}</pre>"
+            )
+
+            await callback.message.answer(message_text, parse_mode="HTML", reply_markup=keyboard.as_markup())
+            break
+    except Exception as exc:
+        logger.exception("Error viewing product criteria", exc_info=exc)
+        await callback.answer("❌ Ошибка загрузки критериев", show_alert=True)
+        return
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("product_criteria_edit:"))
+@role_required(AdminRole.ADMIN)
+async def product_criteria_edit(callback: CallbackQuery, state: FSMContext):
+    """Prompt admin to send new criteria definition."""
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_edit_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_criteria)
+    await callback.message.answer(
+        "Отправьте критерии в формате:\n"
+        "Q1: 2,4\n"
+        "Q3: 3(-1)\n\n"
+        "Используйте запятую для нескольких ответов, (-1) для отрицательного веса.\n"
+        "Можно добавить комментарий: Q2: 1(-1|note=слишком мало)\n\n"
+        "Чтобы очистить все правила, отправьте '-'.",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_criteria)
+@role_required(AdminRole.ADMIN)
+async def product_criteria_commit(message: Message, state: FSMContext):
+    """Persist new criteria set."""
+    data = await state.get_data()
+    product_id = data.get("product_edit_id")
+    payload = (message.text or "").strip()
+
+    try:
+        async for session in get_db():
+            product = await _get_product_by_id(session, product_id)
+            if not product:
+                await message.answer("❌ Продукт не найден")
+                await state.clear()
+                return
+
+            survey_service = SurveyService(session)
+            catalog = _build_survey_catalog(survey_service)
+
+            if payload in {"", "-"}:
+                repo = ProductCriteriaRepository(session)
+                await repo.delete_for_product(product.id)
+                await session.commit()
+                updated = await _get_product_by_id(session, product.id)
+                text, markup = _build_product_detail(updated)
+                await message.bot.edit_message_text(
+                    text,
+                    chat_id=data.get("product_detail_chat_id"),
+                    message_id=data.get("product_detail_message_id"),
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+                await message.answer("✅ Критерии очищены")
+                break
+
+            try:
+                parsed_entries = _parse_criteria_input(payload, catalog)
+            except ValueError as parse_error:
+                await message.answer(f"❌ Ошибка разбора:\n{parse_error}")
+                return
+
+            repo = ProductCriteriaRepository(session)
+            await repo.replace_for_product(product.id, parsed_entries)
+            await session.commit()
+
+            updated = await _get_product_by_id(session, product.id)
+            text, markup = _build_product_detail(updated)
+            await message.bot.edit_message_text(
+                text,
+                chat_id=data.get("product_detail_chat_id"),
+                message_id=data.get("product_detail_message_id"),
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            await message.answer(
+                "✅ Критерии сохранены\n\n"
+                f"<pre>{escape(_format_criteria_table(updated.criteria))}</pre>",
+                parse_mode="HTML",
+            )
+            break
+    except Exception as exc:
+        logger.exception("Error updating product criteria", exc_info=exc)
+        await message.answer("❌ Не удалось сохранить критерии.")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("product_match_check:"))
+@role_required(AdminRole.ADMIN)
+async def product_match_check(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(
+        product_check_id=product_id,
+        product_detail_message_id=callback.message.message_id,
+        product_detail_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(AdminStates.waiting_for_product_criteria_check_user)
+    await callback.message.answer(
+        "Введите ID пользователя (цифрами) или @username для проверки рекомендаций:",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_criteria_check_user)
+@role_required(AdminRole.ADMIN)
+async def product_match_check_commit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_check_id")
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("❌ Введите корректный ID пользователя")
+        return
+
+    try:
+        async for session in get_db():
+            user: Optional[User] = None
+            if query.lstrip("-").isdigit():
+                user = await session.get(User, int(query))
+            elif query.startswith("@"):
+                user_repo = UserRepository(session)
+                user = await user_repo.get_by_username(query[1:])
+            else:
+                await message.answer("❌ Введите числовой ID или @username")
+                await state.clear()
+                return
+
+            if not user:
+                await message.answer("❌ Пользователь не найден")
+                await state.clear()
+                return
+
+            matching_service = ProductMatchingService(session)
+            _, match_result = await matching_service.evaluate_for_user_id(
+                user.id,
+                trigger="admin_probe",
+                limit=10,
+                log_result=False,
+            )
+
+            candidate_lines = []
+            for index, candidate in enumerate(match_result.candidates, start=1):
+                highlight = " ✅" if candidate.product.id == product_id else ""
+                candidate_lines.append(
+                    f"{index}. {candidate.product.name} — {candidate.score:.2f}{highlight}"
+                )
+            if not candidate_lines:
+                candidate_lines.append("Нет активных продуктов для рекомендаций")
+
+            best_line = "Лучший продукт не найден"
+            if match_result.best_product:
+                best_line = (
+                    f"Top-1: {match_result.best_product.name}"
+                    f" (score {match_result.score:.2f})"
+                )
+
+            explanation = (match_result.explanation or "").replace("\n", " ").strip()
+
+            lines = [
+                "🧠 <b>Проверка рекомендаций</b>",
+                f"Пользователь: <code>{user.id}</code> ({escape(user.username) if user.username else '—'})",
+                f"Сегмент: {user.segment or '—'}",
+                best_line,
+                f"Причина: {escape(explanation) if explanation else '—'}",
+                "",
+                "Top кандидаты:",
+            ]
+            lines.extend(candidate_lines)
+
+            await message.answer("\n".join(lines), parse_mode="HTML")
+            break
+    except Exception as exc:
+        logger.exception("Error checking product match", exc_info=exc)
+        await message.answer("❌ Не удалось выполнить проверку")
+
+    await state.clear()
 
 
 @router.callback_query(F.data.startswith("product_edit_price:"))
@@ -2850,3 +4367,255 @@ async def remove_admin_command(message: Message):
 def register_full_admin_handlers(dp):
     """Register full admin handlers."""
     dp.include_router(router)
+
+
+# --- Consultation Settings ---
+
+CONSULTATION_SETTINGS_KEY = "consultation_settings"
+
+async def _render_consultation_settings(message: Message, session):
+    """Render the consultation settings panel."""
+    repo = SystemSettingsRepository(session)
+    settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
+    
+    slots = settings.get("slots", ["12:00", "14:00", "16:00", "18:00"])
+    cutoff_time = settings.get("cutoff_time", "17:45")
+    reminder_offset = settings.get("reminder_offset", 15)
+
+    text = (
+        "📅 <b>Настройки консультаций</b>\n\n"
+        f"<b>Текущие слоты (МСК):</b> {', '.join(slots)}\n"
+        f"<b>Время среза для 'сегодня':</b> {cutoff_time} МСК\n"
+        f"<b>Смещение напоминания:</b> за {reminder_offset} минут\n"
+    )
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text="✏️ Изменить слоты", callback_data="consult_set:slots"))
+    keyboard.add(InlineKeyboardButton(text="✏️ Изменить время среза", callback_data="consult_set:cutoff"))
+    keyboard.add(InlineKeyboardButton(text="✏️ Изменить смещение", callback_data="consult_set:reminder"))
+    keyboard.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back"))
+    keyboard.adjust(1)
+
+    if isinstance(message, CallbackQuery):
+        await message.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+
+@router.callback_query(F.data == "admin_consult_settings")
+@role_required(AdminRole.ADMIN)
+async def admin_consultation_settings(callback: CallbackQuery, **kwargs):
+    """Show consultation settings."""
+    async for session in get_db():
+        await _render_consultation_settings(callback, session)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("consult_set:"))
+@role_required(AdminRole.ADMIN)
+async def edit_consultation_setting(callback: CallbackQuery, state: FSMContext):
+    """Handle editing of a consultation setting."""
+    setting = callback.data.split(":")[1]
+    prompts = {
+        "slots": ("Введите новые слоты времени через запятую (например, 12:00, 14:00, 18:00):", AdminStates.waiting_for_consultation_slots),
+        "cutoff": ("Введите новое время среза в формате ЧЧ:ММ (например, 17:45):", AdminStates.waiting_for_cutoff_time),
+        "reminder": ("Введите новое смещение для напоминания в минутах (например, 15):", AdminStates.waiting_for_reminder_offset),
+    }
+    if setting in prompts:
+        prompt, new_state = prompts[setting]
+        await state.set_state(new_state)
+        await callback.message.answer(prompt)
+        await callback.answer()
+
+@router.message(AdminStates.waiting_for_consultation_slots)
+@role_required(AdminRole.ADMIN)
+async def set_consultation_slots(message: Message, state: FSMContext):
+    """Set new consultation time slots."""
+    slots = [s.strip() for s in message.text.split(",")]
+    # Basic validation
+    if not all(re.match(r"^\d{2}:\d{2}$", s) for s in slots):
+        await message.answer("Неверный формат. Введите слоты через запятую, например: 12:00, 14:00")
+        return
+    
+    async for session in get_db():
+        repo = SystemSettingsRepository(session)
+        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
+        settings["slots"] = slots
+        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
+        await session.commit()
+        await _render_consultation_settings(message, session)
+    await state.clear()
+
+@router.message(AdminStates.waiting_for_cutoff_time)
+@role_required(AdminRole.ADMIN)
+async def set_cutoff_time(message: Message, state: FSMContext):
+    """Set new cutoff time."""
+    cutoff_time = message.text.strip()
+    if not re.match(r"^\d{2}:\d{2}$", cutoff_time):
+        await message.answer("Неверный формат. Введите время в формате ЧЧ:ММ, например: 17:45")
+        return
+
+    async for session in get_db():
+        repo = SystemSettingsRepository(session)
+        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
+        settings["cutoff_time"] = cutoff_time
+        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
+        await session.commit()
+        await _render_consultation_settings(message, session)
+    await state.clear()
+
+@router.message(AdminStates.waiting_for_reminder_offset)
+@role_required(AdminRole.ADMIN)
+async def set_reminder_offset(message: Message, state: FSMContext):
+    """Set new reminder offset."""
+    try:
+        reminder_offset = int(message.text.strip())
+        if reminder_offset <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Неверный формат. Введите целое число минут (например, 15)")
+        return
+
+    async for session in get_db():
+        repo = SystemSettingsRepository(session)
+        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
+        settings["reminder_offset"] = reminder_offset
+        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
+        await session.commit()
+        await _render_consultation_settings(message, session)
+    await state.clear()
+
+
+# --- SendTo Command ---
+
+def _parse_usernames(text: str) -> List[str]:
+    """Extract usernames from a string."""
+    text = text.replace(",", " ").replace("\n", " ")
+    raw_usernames = [part.strip() for part in text.split() if part.strip().startswith("@")]
+    # Remove @ and duplicates, case-insensitive
+    return sorted(list({uname[1:].lower() for uname in raw_usernames}))
+
+
+@router.message(Command("sendto"))
+@role_required(AdminRole.MANAGER)
+async def sendto_command(message: Message, state: FSMContext):
+    """Handle /sendto command to initiate a direct message to users."""
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        usernames = _parse_usernames(args[1])
+        if not usernames:
+            await message.answer("Не найдены получатели. Укажите @username получателей через пробел или запятую.")
+            return
+
+        if len(usernames) > settings.sendto_max_recipients:
+            await message.answer(f"❌ Слишком много получателей. Максимум: {settings.sendto_max_recipients}.")
+            return
+        
+        await state.update_data(sendto_recipients=usernames)
+        await state.set_state(AdminStates.waiting_for_sendto_content)
+        await message.answer(
+            f"Ок, получатели: {len(usernames)}. Отправьте следующим сообщением текст/медиа для доставки.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="sendto_cancel")]
+            ])
+        )
+    else:
+        await state.set_state(AdminStates.waiting_for_sendto_recipients)
+        await message.answer(
+            "Введите @username получателей (через пробел, запятую или с новой строки).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="sendto_cancel")]
+            ])
+        )
+
+
+@router.message(AdminStates.waiting_for_sendto_recipients)
+@role_required(AdminRole.MANAGER)
+async def sendto_recipients_received(message: Message, state: FSMContext):
+    """Handle recipients list for /sendto command."""
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("❌ Отправка отменена.")
+        return
+        
+    usernames = _parse_usernames(message.text)
+    if not usernames:
+        await message.answer("Не найдены получатели. Укажите @username получателей.")
+        return
+
+    if len(usernames) > settings.sendto_max_recipients:
+        await message.answer(f"❌ Слишком много получателей. Максимум: {settings.sendto_max_recipients}.")
+        return
+
+    await state.update_data(sendto_recipients=usernames)
+    await state.set_state(AdminStates.waiting_for_sendto_content)
+    await message.answer(
+        f"Ок, получатели: {len(usernames)}. Отправьте следующим сообщением текст/медиа для доставки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="sendto_cancel")]
+        ])
+    )
+
+
+@router.message(AdminStates.waiting_for_sendto_content)
+@role_required(AdminRole.MANAGER)
+async def sendto_content_received(message: Message, state: FSMContext):
+    """Handle content for /sendto command and dispatch sending."""
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("❌ Отправка отменена.")
+        return
+
+    if message.text and message.text.startswith("/"):
+        await message.answer("Пожалуйста, отправьте контент для рассылки, а не команду. Или отмените отправку.")
+        return
+
+    try:
+        content_items = _extract_broadcast_items(message)
+    except ValueError:
+        await message.answer("❌ Этот тип сообщения не поддерживается для отправки.")
+        return
+
+    data = await state.get_data()
+    usernames = data.get("sendto_recipients", [])
+    await state.clear()
+
+    if not usernames:
+        await message.answer("❌ Не найдены получатели. Начните заново с команды /sendto.")
+        return
+
+    async for session in get_db():
+        service = SendToService(session, message.bot)
+        found_users, not_found_usernames = await service.find_recipients(usernames)
+
+        summary_lines = []
+        if not found_users:
+            await message.answer("Не удалось найти ни одного из указанных пользователей.")
+            return
+
+        await message.answer(f"Начинаю отправку {len(found_users)} пользователям...")
+
+        send_results = await service.send_messages(
+            admin_user_id=message.from_user.id,
+            recipients=found_users,
+            content_items=content_items,
+            throttle_rate=settings.sendto_throttle_rate,
+        )
+        
+        sent_count = send_results.get(AdminRole.SENT, 0)
+        failed_count = send_results.get(AdminRole.FAILED, 0) + send_results.get(AdminRole.BLOCKED, 0)
+        
+        summary_lines.append(f"✅ Отправлено: {sent_count}")
+        if failed_count > 0:
+            summary_lines.append(f"❌ Не доставлено: {failed_count}")
+        if not_found_usernames:
+            summary_lines.append(f"🤷‍♂️ Не найдены: {len(not_found_usernames)} ({', '.join(not_found_usernames)})")
+
+        await message.answer("\n".join(summary_lines))
+        break
+
+
+@router.callback_query(F.data == "sendto_cancel", StateFilter("*"))
+async def sendto_cancel(callback: CallbackQuery, state: FSMContext):
+    """Cancel sendto operation."""
+    await state.clear()
+    await callback.message.edit_text("❌ Отправка отменена.")
+    await callback.answer()

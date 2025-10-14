@@ -1,0 +1,6 @@
+{
+    "frequency": "daily_1",
+    "paused": false,
+    "window_start_h_msk": 11,
+    "window_end_h_msk": 20
+}

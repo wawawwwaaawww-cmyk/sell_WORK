@@ -170,6 +170,16 @@ class EventService:
             }
         )
     
+    async def log_consultation_reminder_response(
+        self, user_id: int, appointment_id: int, response: str
+    ) -> Event:
+        """Log user's response to a consultation reminder."""
+        return await self.log_event(
+            user_id=user_id,
+            event_type="consultation_reminder_response",
+            payload={"appointment_id": appointment_id, "response": response},
+        )
+
     async def log_payment_initiated(
         self,
         user_id: int,

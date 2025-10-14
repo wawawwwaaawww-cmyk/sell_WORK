@@ -9,7 +9,7 @@ class Settings:
     def __init__(self) -> None:
         try:
             from dotenv import load_dotenv
-            load_dotenv(dotenv_path='/home/botseller/.env')
+            load_dotenv()
         except ImportError:
             pass
 
@@ -55,11 +55,29 @@ class Settings:
         # Timings
         self.bonus_followup_delay: int = int(os.getenv("BONUS_FOLLOWUP_DELAY", "3"))
 
+        # Timings
+        self.bonus_followup_delay: int = int(os.getenv("BONUS_FOLLOWUP_DELAY", "3"))
+
+        # Sendto command settings
+        self.sendto_max_recipients: int = int(os.getenv("SENDTO_MAX_RECIPIENTS", "50"))
+        self.sendto_throttle_rate: float = float(os.getenv("SENDTO_THROTTLE_RATE", "0.05"))
+        self.sendto_cooldown_seconds: int = int(os.getenv("SENDTO_COOLDOWN_SECONDS", "5"))
+        
         # Compatibility properties
         self.bot_token = self.telegram_bot_token
         self.webhook_url = self.telegram_webhook_url
         self.openai_model = self.llm_model
 
+        # Script settings
+        self.scripts_enabled: bool = os.getenv("SCRIPTS_ENABLED", "true").lower() == "true"
+        self.scripts_index_path: str = os.getenv("SCRIPTS_INDEX_PATH", "/home/botseller/sell/data/sell_scripts.xlsx")
+        self.retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+        self.retrieval_threshold: float = float(os.getenv("RETRIEVAL_THRESHOLD", "0.78"))
+        self.retrieval_strong_hit: float = float(os.getenv("RETRIEVAL_STRONG_HIT", "0.85"))
+        self.retrieval_delta_margin: float = float(os.getenv("RETRIEVAL_DELTA_MARGIN", "0.05"))
+        self.judge_model: str = os.getenv("JUDGE_MODEL", self.llm_model)
+        self.judge_max_candidates: int = int(os.getenv("JUDGE_MAX_CANDIDATES", "3"))
+ 
     def _derive_sync_database_url(self, database_url: str) -> str:
         """Derive a synchronous SQLAlchemy URL from an async one."""
         if not database_url:

@@ -3,12 +3,15 @@
 from typing import List, Optional, Dict, Any
 
 from datetime import datetime, timezone, date
+from decimal import Decimal
 
 import structlog
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Lead, LeadNote, LeadStatus, User
+from app.services.ab_testing_service import ABTestingService, ABEventType
+from app.services.product_matching_service import ProductMatchingService, MatchResult
 from app.config import settings
 
 
@@ -211,10 +214,14 @@ class LeadService:
     ) -> Lead:
         """Create a lead from user with summary."""
         
+        match_result = await self._match_product(user, trigger="lead_creation", log_result=True)
+
         # Generate summary if not provided
         if not conversation_summary:
-            conversation_summary = await self._generate_lead_summary(user, trigger_event)
-        
+            conversation_summary = await self._generate_lead_summary(user, trigger_event, match_result)
+        else:
+            conversation_summary = self._append_recommendation_to_summary(conversation_summary, match_result)
+
         priority = self._calculate_priority(user, trigger_event)
         lead = await self.repository.create_lead(
             user_id=user.id,
@@ -222,6 +229,14 @@ class LeadService:
             handoff_trigger=trigger_event,
             priority=priority,
             handoff_channel='bot'
+        )
+
+        ab_service = ABTestingService(self.session)
+        await ab_service.record_event_for_latest_assignment(
+            user.id,
+            ABEventType.LEAD_CREATED,
+            {"lead_id": lead.id, "trigger": trigger_event},
+            within_hours=72,
         )
 
         return lead
@@ -241,8 +256,23 @@ class LeadService:
             priority = 40
 
             user = await self.session.get(User, user_id)
+            match_result: Optional[MatchResult] = None
             if user:
                 priority = self._calculate_priority(user, trigger)
+                try:
+                    match_result = await self._match_product(
+                        user,
+                        trigger=f"lead_{trigger}",
+                        log_result=True,
+                    )
+                    enhanced_summary = self._append_recommendation_to_summary(enhanced_summary, match_result)
+                except Exception as match_err:
+                    self.logger.warning(
+                        "Lead recommendation failed",
+                        error=str(match_err),
+                        user_id=user_id,
+                        trigger=trigger,
+                    )
 
             lead = await self.repository.create_lead(
                 user_id=user_id,
@@ -261,14 +291,27 @@ class LeadService:
                 handoff_channel=channel,
             )
 
+            ab_service = ABTestingService(self.session)
+            await ab_service.record_event_for_latest_assignment(
+                user_id,
+                ABEventType.LEAD_CREATED,
+                {"lead_id": lead.id, "trigger": trigger},
+                within_hours=72,
+            )
+
             return lead
             
         except Exception as e:
             self.logger.error("Error creating lead", error=str(e), user_id=user_id)
             raise
     
-    async def _generate_lead_summary(self, user: User, trigger_event: str) -> str:
-        """Generate lead summary based on user profile and trigger."""
+    async def _generate_lead_summary(
+        self,
+        user: User,
+        trigger_event: str,
+        match_result: Optional[MatchResult] = None,
+    ) -> str:
+        """Generate lead summary based on user profile, trigger, and recommendation."""
         
         # Basic user info
         name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Не указано"
@@ -304,10 +347,115 @@ class LeadService:
 • Email: {'указан' if user.email else 'не указан'}
 • {survey_info}
 • Этап воронки: {user.funnel_stage}
+"""
 
-Готов к работе с менеджером."""
-        
+        recommendation_block = self._build_recommendation_summary(match_result)
+        if recommendation_block:
+            summary = f"{summary}\n\n{recommendation_block}"
+
+        summary = f"{summary}\n\nГотов к работе с менеджером."
+
         return summary
+
+    def _append_recommendation_to_summary(self, summary: str, match_result: Optional[MatchResult]) -> str:
+        if not match_result:
+            return summary
+        block = self._build_recommendation_summary(match_result)
+        if not block or block in summary:
+            return summary
+        return f"{summary}\n\n{block}" if summary else block
+
+    def _build_recommendation_summary(self, match_result: Optional[MatchResult]) -> str:
+        if not match_result:
+            return ""
+        if match_result.best_product:
+            product = match_result.best_product
+            price = self._format_price(product.price, product.currency)
+            lines = [
+                "Рекомендация:",
+                f"• Продукт: {product.name} ({price}, score {match_result.score:.2f})",
+            ]
+            if match_result.explanation:
+                lines.append(f"• Причина: {match_result.explanation}")
+        else:
+            lines = [
+                "Рекомендация:",
+                f"• Консультация (score {match_result.score:.2f})",
+            ]
+            if match_result.explanation:
+                lines.append(f"• Причина: {match_result.explanation}")
+        return "\n".join(lines)
+
+    def _build_recommendation_card(self, match_result: Optional[MatchResult]) -> str:
+        if not match_result:
+            return ""
+        if match_result.best_product:
+            product = match_result.best_product
+            price = self._format_price(product.price, product.currency)
+            name = self._md_escape(product.name)
+            lines = [
+                "🏆 **Рекомендованный продукт**",
+                f"• {name} — {price}",
+                f"• Совпадение: {int(round(match_result.score * 100))}%",
+            ]
+            if match_result.explanation:
+                lines.append(f"• Причина: {self._md_escape(match_result.explanation)}")
+        else:
+            lines = [
+                "🏆 **Рекомендация: консультация**",
+                f"• Совпадение: {int(round(match_result.score * 100))}%",
+            ]
+            if match_result.explanation:
+                lines.append(f"• Причина: {self._md_escape(match_result.explanation)}")
+        return "\n".join(lines)
+
+    async def _match_product(self, user: User, *, trigger: str, log_result: bool) -> MatchResult:
+        service = ProductMatchingService(self.session)
+        return await service.match_for_user(user, trigger=trigger, log_result=log_result)
+
+    @staticmethod
+    def _format_price(amount: Optional[Decimal], currency: Optional[str]) -> str:
+        if amount is None:
+            return "—"
+        try:
+            value = float(amount)
+        except (TypeError, ValueError):
+            return str(amount)
+        if abs(value - int(value)) < 1e-6:
+            formatted = f"{int(value):,}".replace(",", " ")
+        else:
+            formatted = f"{value:,.2f}".replace(",", " ")
+        return f"{formatted} {(currency or 'RUB').upper()}"
+
+    @staticmethod
+    def _md_escape(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        replacements = {
+            "\\": "\\\\",
+            "_": "\\_",
+            "*": "\\*",
+            "[": "\\[",
+            "]": "\\]",
+            "(": "\\(",
+            ")": "\\)",
+            "~": "\\~",
+            "`": "\\`",
+            ">": "\\>",
+            "#": "\\#",
+            "+": "\\+",
+            "-": "\\-",
+            "=": "\\=",
+            "|": "\\|",
+            "{": "\\{",
+            "}": "\\}",
+            ".": "\\.",
+            "!": "\\!",
+        }
+        escaped = value
+        for char, replacement in replacements.items():
+            escaped = escaped.replace(char, replacement)
+        return escaped
     
     async def format_lead_card(self, lead: Lead, user: User) -> str:
         """Format lead card for manager channel."""
@@ -349,6 +497,9 @@ class LeadService:
         if len(summary_trimmed) > 400:
             summary_trimmed = summary_trimmed[:400].rstrip() + "…"
 
+        sentiment_lines = self._build_sentiment_snapshot(user)
+        sentiment_block = "\n".join(sentiment_lines)
+
         lead_card = f"""👤 **Лид #{lead.id} — {heat_label}**
 
 📋 **Профиль**
@@ -358,13 +509,23 @@ class LeadService:
 • Email: {email}
 • Сегмент: {segment_label}
 • Этап: {status_info}
+{sentiment_block}
 
 📝 **Кратко по диалогу**
 {summary_trimmed}
-
-🕐 Создан: {lead.created_at.strftime('%d.%m.%Y %H:%M')}
-📎 История переписки доступна по кнопке ниже
 """
+
+        try:
+            match_result = await self._match_product(user, trigger="lead_card", log_result=False)
+        except Exception as match_err:
+            self.logger.warning("Failed to build recommendation block", error=str(match_err), user_id=user.id)
+            match_result = None
+
+        recommendation_block = self._build_recommendation_card(match_result)
+        if recommendation_block:
+            lead_card = f"{lead_card}\n{recommendation_block}"
+
+        lead_card = f"{lead_card}\n\n🕐 Создан: {lead.created_at.strftime('%d.%m.%Y %H:%M')}\n📎 История переписки доступна по кнопке ниже\n"
         
         return lead_card
     
@@ -489,3 +650,25 @@ class LeadService:
             return max(priority, 40)
 
         return priority
+
+    def _build_sentiment_snapshot(self, user: User) -> list[str]:
+        """Generate sentiment summary lines for lead-related messages."""
+        total = user.scored_total or 0
+        if user.lead_level_percent is None or total < 10:
+            lead_level = f"недостаточно данных ({total}/10)"
+        else:
+            lead_level = f"{user.lead_level_percent}%"
+
+        counter_value = user.counter or 0
+        pos = user.pos_count or 0
+        neu = user.neu_count or 0
+        neg = user.neg_count or 0
+        lines = [
+            f"• Уровень лида: {lead_level}",
+            f"• Баланс сообщений: {counter_value:+d} (позитив {pos} / нейтр {neu} / негатив {neg})",
+        ]
+        if user.lead_level_updated_at:
+            lines.append(
+                f"• Обновлено: {user.lead_level_updated_at.strftime('%d.%m.%Y %H:%M')}"
+            )
+        return lines

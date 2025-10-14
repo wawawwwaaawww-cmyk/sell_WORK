@@ -27,6 +27,12 @@ class UserRepository:
         stmt = select(User).where(User.id == user_id)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_by_username(self, username: str) -> Optional[User]:
+        """Get user by username (case-insensitive)."""
+        stmt = select(User).where(User.username.ilike(username))
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
     
     async def create(
         self,

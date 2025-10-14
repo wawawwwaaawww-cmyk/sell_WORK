@@ -1,11 +1,17 @@
 """Consultation scheduling handlers."""
 
-from datetime import date, time
+from datetime import date, time, datetime
 from typing import Dict, Any
 
 import structlog
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram import Router, F, Bot
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -14,470 +20,317 @@ from app.models import User, FunnelStage
 from app.services.user_service import UserService
 from app.services.consultation_service import ConsultationService
 from app.services.event_service import EventService
+from app.services.manager_notification_service import ManagerNotificationService
 from app.utils.callbacks import Callbacks
-from app.handlers.scene_dispatcher import try_process_callback
 
 
 class ConsultationStates(StatesGroup):
-    waiting_custom_date = State()
-    waiting_custom_time = State()
+    """FSM for consultation booking."""
+
+    choosing_date = State()
+    choosing_time = State()
+    free_form_datetime = State()
+    confirmation = State()
+    waiting_for_phone = State()
 
 
 router = Router()
 logger = structlog.get_logger()
 
 
-@router.callback_query(F.data == "consult:offer")
-async def offer_consultation(callback: CallbackQuery, user: User, **kwargs):
-    """Offer consultation to user."""
-    try:
-        session = kwargs.get("session")
-        if await try_process_callback(callback, session=session, user=user):
-            return
-        consultation_service = ConsultationService(session)
-        
-        # Check if user already has upcoming appointment
-        upcoming = await consultation_service.repository.get_upcoming_appointments(user.id)
-        if upcoming:
-            appointment = upcoming[0]
-            details = consultation_service.format_appointment_details(appointment)
-            
-            keyboard = InlineKeyboardBuilder()
-            keyboard.add(InlineKeyboardButton(
-                text="📅 Перенести консультацию",
-                callback_data="consult:reschedule"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="❌ Отменить консультацию",
-                callback_data="consult:cancel"
-            ))
-            keyboard.adjust(1)
-            
-            await callback.message.edit_text(
-                f"✅ **У тебя уже запланирована консультация!**\n\n{details}",
-                reply_markup=keyboard.as_markup(),
-                parse_mode="Markdown"
+async def start_consultation_booking(
+    message: Message, state: FSMContext, user: User, session
+):
+    """Starts the consultation booking flow."""
+    consultation_service = ConsultationService(session)
+    date_options = consultation_service.get_consultation_date_options()
+
+    keyboard = InlineKeyboardBuilder()
+    for option in date_options:
+        keyboard.add(
+            InlineKeyboardButton(
+                text=option["label"],
+                callback_data=f"consult_date:{option['date'].isoformat()}",
             )
-            await callback.answer("У вас уже есть консультация")
-            return
-        
-        # Get next 2 available dates
-        available_dates = consultation_service.get_next_available_dates(days_ahead=5)
-        
-        offer_text = f"""📞 **Отлично, {user.first_name or 'друг'}! Запишем тебя на консультацию**
+        )
+    keyboard.add(
+        InlineKeyboardButton(
+            text="Нет подходящей даты", callback_data="consult_date:custom"
+        )
+    )
+    keyboard.adjust(1)
 
-👨‍💼 **Что даст консультация:**
-✅ Персональный анализ твоих целей
-✅ Подбор оптимальной программы обучения  
-✅ Ответы на все вопросы о криптовалютах
-✅ Конкретный план действий
+    await message.answer(
+        "📅 Выберите удобную дату для консультации (время московское):",
+        reply_markup=keyboard.as_markup(),
+    )
+    await state.set_state(ConsultationStates.choosing_date)
 
-⏱ **Формат:** 15 минут в Telegram
-💰 **Стоимость:** Бесплатно
 
-📅 **Выбери удобную дату:**"""
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        # Add first 2 dates
-        for i, date_option in enumerate(available_dates[:2]):
-            formatted_date = date_option.strftime("%d.%m (%a)")
-            keyboard.add(InlineKeyboardButton(
-                text=f"📅 {formatted_date}",
-                callback_data=f"consult:date:{date_option.isoformat()}"
-            ))
-        
-        keyboard.add(InlineKeyboardButton(
-            text="📝 Другая дата",
-            callback_data="consult:custom_date"
-        ))
-        keyboard.add(InlineKeyboardButton(
-            text="🔙 Назад",
-            callback_data="back:main_menu"
-        ))
-        keyboard.adjust(1)
-        
+@router.callback_query(F.data.startswith("consult_date:"))
+async def handle_date_choice(
+    callback: CallbackQuery, state: FSMContext, session, **kwargs
+):
+    """Handles the user's choice of a consultation date."""
+    await callback.answer()
+    choice = callback.data.split(":")[1]
+
+    if choice == "custom":
         await callback.message.edit_text(
-            offer_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="Markdown"
+            "Напишите желаемую дату и время одним сообщением (например, 'завтра в 14:30' или '15.10 18:00').\n\nМы постараемся подобрать для вас удобный слот."
         )
-        
-        # Log event
-        event_service = EventService(kwargs.get("session"))
-        await event_service.log_event(
-            user_id=user.id,
-            event_type="consultation_offered",
-            payload={}
+        await state.set_state(ConsultationStates.free_form_datetime)
+        return
+
+    selected_date = date.fromisoformat(choice)
+    await state.update_data(selected_date=selected_date.isoformat())
+
+    consultation_service = ConsultationService(session)
+    time_slots = consultation_service.available_slots
+
+    keyboard = InlineKeyboardBuilder()
+    for slot in time_slots:
+        keyboard.add(
+            InlineKeyboardButton(
+                text=slot.strftime("%H:%M"),
+                callback_data=f"consult_time:{slot.isoformat()}",
+            )
         )
-        
-        await callback.answer("📞 Консультация!")
-        
-    except Exception as e:
-        logger.error("Error offering consultation", error=str(e), user_id=user.id, exc_info=True)
-        await callback.answer("Произошла ошибка")
+    keyboard.add(
+        InlineKeyboardButton(
+            text="Нет подходящего времени", callback_data="consult_time:custom"
+        )
+    )
+    keyboard.adjust(2)
+
+    await callback.message.edit_text(
+        f"Вы выбрали: {selected_date.strftime('%d %B (%a)')}. Теперь выберите удобное время (МСК):",
+        reply_markup=keyboard.as_markup(),
+    )
+    await state.set_state(ConsultationStates.choosing_time)
 
 
-@router.callback_query(F.data.startswith("consult:date:"))
-async def select_consultation_date(callback: CallbackQuery, user: User, **kwargs):
-    """Handle consultation date selection."""
-    try:
-        session = kwargs.get("session")
-        date_str = callback.data.split(":")[-1]
-        selected_date = date.fromisoformat(date_str)
-        
-        consultation_service = ConsultationService(session)
-        
-        # Get available slots for selected date
-        available_slots = await consultation_service.get_available_slots_for_date(selected_date)
-        
-        if not available_slots:
-            await callback.answer("К сожалению, на эту дату нет свободных слотов")
-            return
-        
-        formatted_date = selected_date.strftime("%d.%m.%Y (%A)")
-        
-        time_text = f"""📅 **Дата выбрана: {formatted_date}**
+@router.callback_query(F.data.startswith("consult_time:"))
+async def handle_time_choice(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Handles the user's choice of a consultation time."""
+    await callback.answer()
+    choice = callback.data.split(":")[1]
 
-⏰ **Выбери удобное время:**
-
-{consultation_service.get_time_slots_text()}
-
-Все время указано по Москве 🇷🇺"""
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        for slot in available_slots:
-            formatted_time = consultation_service.format_slot_time(slot)
-            keyboard.add(InlineKeyboardButton(
-                text=f"⏰ {formatted_time}",
-                callback_data=f"consult:time:{date_str}:{slot.isoformat()}"
-            ))
-        
-        keyboard.add(InlineKeyboardButton(
-            text="🔙 Выбрать другую дату",
-            callback_data="consult:offer"
-        ))
-        keyboard.adjust(1)
-        
+    if choice == "custom":
         await callback.message.edit_text(
-            time_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="Markdown"
+            "Напишите желаемую дату и время одним сообщением (например, 'завтра в 14:30' или '15.10 18:00').\n\nМы постараемся подобрать для вас удобный слот."
         )
-        
-        await callback.answer()
-        
-    except Exception as e:
-        logger.error("Error selecting consultation date", error=str(e), user_id=user.id, exc_info=True)
-        await callback.answer("Произошла ошибка при выборе даты")
+        await state.set_state(ConsultationStates.free_form_datetime)
+        return
+
+    selected_time = time.fromisoformat(choice)
+    user_data = await state.get_data()
+    selected_date = date.fromisoformat(user_data["selected_date"])
+
+    await state.update_data(
+        selected_time=selected_time.isoformat(), final_date=selected_date.isoformat()
+    )
+
+    await show_confirmation(callback.message, state)
+    await state.set_state(ConsultationStates.confirmation)
 
 
-@router.callback_query(F.data.startswith("consult:time:"))
-async def select_consultation_time(callback: CallbackQuery, user: User, user_service: UserService, **kwargs):
-    """Handle consultation time selection."""
-    try:
-        parts = callback.data.split(":")
-        date_str = parts[2]
-        time_str = parts[3]
-        
-        session = kwargs.get("session")
-        selected_date = date.fromisoformat(date_str)
-        selected_time = time.fromisoformat(time_str)
-        
-        consultation_service = ConsultationService(session)
-        
-        # Book consultation
-        success, appointment, message = await consultation_service.book_consultation(
-            user_id=user.id,
-            consultation_date=selected_date,
-            slot=selected_time
-        )
-        
-        if success and appointment:
-            # Update user funnel stage
-            await user_service.advance_funnel_stage(user, FunnelStage.CONSULTATION)
-            
-            # Format confirmation message
-            details = consultation_service.format_appointment_details(appointment)
-            
-            confirmation_text = f"""✅ **Консультация успешно запланирована!**
+@router.message(ConsultationStates.free_form_datetime)
+async def handle_free_form_datetime(
+    message: Message, state: FSMContext, session, **kwargs
+):
+    """Handles free-form date and time input."""
+    consultation_service = ConsultationService(session)
+    parsed_dt, error_message = consultation_service.parse_free_text_datetime(
+        message.text
+    )
 
-{details}
+    if not parsed_dt:
+        user_data = await state.get_data()
+        attempts = user_data.get("free_form_attempts", 0) + 1
+        await state.update_data(free_form_attempts=attempts)
 
-🎉 **Что дальше:**
-📱 За 15 минут до встречи пришлю напоминание
-💬 Эксперт свяжется с тобой точно в назначенное время  
-📝 Подготовь вопросы для максимальной пользы
-
-💡 *Если планы изменятся — можешь перенести встречу заранее*
-
-Увидимся на консультации! 👋"""
-            
-            keyboard = InlineKeyboardBuilder()
-            keyboard.add(InlineKeyboardButton(
-                text="📅 Перенести консультацию",
-                callback_data="consult:reschedule"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="💬 Задать вопросы до встречи",
-                callback_data="llm:pre_consult_questions"
-            ))
-            keyboard.adjust(1)
-            
-            await callback.message.edit_text(
-                confirmation_text,
-                reply_markup=keyboard.as_markup(),
-                parse_mode="Markdown"
+        if attempts >= 2:
+            # TODO: Implement manager handoff
+            await message.answer(
+                f"К сожалению, не удалось распознать время. Давайте я соединю вас с менеджером, чтобы он подобрал удобное время.\n\n{error_message}"
             )
-            
-            # Log successful booking
-            event_service = EventService(kwargs.get("session"))
-            await event_service.log_consultation_booked(
-                user_id=user.id,
-                date=date_str,
-                time=time_str
-            )
-            
-            await callback.answer("✅ Консультация запланирована!")
-            
+            await state.clear()
         else:
-            await callback.message.edit_text(
-                f"❌ **Ошибка при записи**\n\n{message}\n\nПопробуй выбрать другое время или обратись к менеджеру.",
-                parse_mode="Markdown"
+            await message.answer(
+                f"Не удалось распознать дату и время. Попробуйте еще раз.\n\n{error_message}"
             )
-            await callback.answer("Ошибка при записи")
-            
-    except Exception as e:
-        logger.error("Error selecting consultation time", error=str(e), user_id=user.id, exc_info=True)
-        await callback.answer("Произошла ошибка при записи")
+        return
+
+    await state.update_data(
+        final_date=parsed_dt.date().isoformat(),
+        selected_time=parsed_dt.time().isoformat(),
+    )
+    await show_confirmation(message, state)
+    await state.set_state(ConsultationStates.confirmation)
 
 
-@router.callback_query(F.data == "consult:custom_date")
-async def request_custom_date(callback: CallbackQuery, state: FSMContext, **kwargs):
-    """Request custom date input."""
-    try:
-        await state.set_state(ConsultationStates.waiting_custom_date)
-        
-        custom_date_text = """📝 **Введи желаемую дату консультации**
+async def show_confirmation(message: Message, state: FSMContext):
+    """Shows the confirmation message and buttons."""
+    user_data = await state.get_data()
+    final_date = date.fromisoformat(user_data["final_date"])
+    selected_time = time.fromisoformat(user_data["selected_time"])
 
-Формат: ДД.ММ.ГГГГ (например: 25.12.2024)
+    confirmation_text = f"Вы выбрали: {final_date.strftime('%d %B (%A)')}, {selected_time.strftime('%H:%M')} МСК. Всё верно?"
 
-⚠️ **Обрати внимание:**
-• Консультации проводятся только в будние дни
-• Доступное время: 12:00, 14:00, 16:00, 18:00 МСК
-• Нельзя записаться на сегодня
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data="consult_confirm:yes")
+    )
+    keyboard.add(
+        InlineKeyboardButton(text="✏️ Изменить", callback_data="consult_confirm:no")
+    )
 
-Введи дату:"""
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.add(InlineKeyboardButton(
-            text="🔙 Назад к выбору дат",
-            callback_data="consult:offer"
-        ))
-        
-        await callback.message.edit_text(
-            custom_date_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="Markdown"
+    await message.answer(confirmation_text, reply_markup=keyboard.as_markup())
+
+
+@router.callback_query(F.data.startswith("consult_confirm:"))
+async def handle_confirmation(
+    callback: CallbackQuery,
+    state: FSMContext,
+    user: User,
+    session,
+    bot: Bot,
+    user_service: UserService,
+    **kwargs,
+):
+    """Handles the final confirmation of the consultation slot."""
+    await callback.answer()
+    choice = callback.data.split(":")[1]
+
+    if choice == "no":
+        await callback.message.delete()
+        await start_consultation_booking(callback.message, state, user, session)
+        return
+
+    if not user.phone:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📱 Отправить телефон", request_contact=True)]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
         )
-        
-        await callback.answer()
-        
-    except Exception as e:
-        logger.error("Error requesting custom date", error=str(e), exc_info=True)
-        await callback.answer("Произошла ошибка")
+        await callback.message.edit_text(
+            "Для подтверждения записи, пожалуйста, отправьте ваш номер телефона.",
+            reply_markup=keyboard,
+        )
+        await state.set_state(ConsultationStates.waiting_for_phone)
+    else:
+        await create_appointment(callback.message, state, user, session, bot, user_service)
 
 
-@router.message(ConsultationStates.waiting_custom_date)
-async def handle_custom_date(message: Message, user: User, state: FSMContext, **kwargs):
-    """Handle custom date input."""
-    try:
-        session = kwargs.get("session")
-        date_text = message.text.strip()
-        
-        # Parse date
-        try:
-            selected_date = datetime.strptime(date_text, "%d.%m.%Y").date()
-        except ValueError:
-            await message.answer(
-                "❌ Неверный формат даты. Используй формат ДД.ММ.ГГГГ (например: 25.12.2024)"
-            )
-            return
-        
-        # Validate date
-        if selected_date <= date.today():
-            await message.answer(
-                "❌ Нельзя записаться на прошедшую дату или сегодня. Выбери дату начиная с завтра."
-            )
-            return
-        
-        if selected_date.weekday() >= 5:
-            await message.answer(
-                "❌ Консультации проводятся только в будние дни (понедельник-пятница)."
-            )
-            return
-        
-        # Clear state
+@router.message(F.contact, ConsultationStates.waiting_for_phone)
+async def handle_phone_contact(
+    message: Message,
+    state: FSMContext,
+    user: User,
+    session,
+    bot: Bot,
+    user_service: UserService,
+    **kwargs,
+):
+    """Handles receiving the user's phone number."""
+    user.phone = message.contact.phone_number
+    await user_service.update_user(user, phone=user.phone)
+    await create_appointment(message, state, user, session, bot, user_service)
+
+
+async def create_appointment(
+    message: Message,
+    state: FSMContext,
+    user: User,
+    session,
+    bot: Bot,
+    user_service: UserService,
+):
+    """Creates the appointment and notifies the user and managers."""
+    user_data = await state.get_data()
+    final_date = date.fromisoformat(user_data["final_date"])
+    selected_time = time.fromisoformat(user_data["selected_time"])
+
+    consultation_service = ConsultationService(session)
+    success, appointment, error_msg = await consultation_service.book_consultation(
+        user_id=user.id,
+        consultation_date=final_date,
+        slot=selected_time,
+        source="bot_survey",
+    )
+
+    if not success:
+        await message.answer(f"❌ Произошла ошибка при записи: {error_msg}")
         await state.clear()
-        
-        # Show time slots for selected date
-        consultation_service = ConsultationService(session)
-        available_slots = await consultation_service.get_available_slots_for_date(selected_date)
-        
-        if not available_slots:
-            await message.answer(
-                f"❌ К сожалению, на {selected_date.strftime('%d.%m.%Y')} нет свободных слотов. Выбери другую дату."
-            )
-            return
-        
-        formatted_date = selected_date.strftime("%d.%m.%Y (%A)")
-        
-        time_text = f"""📅 **Дата выбрана: {formatted_date}**
+        return
 
-⏰ **Выбери удобное время:**
+    await user_service.advance_funnel_stage(user, FunnelStage.CONSULTATION)
+    event_service = EventService(session)
+    await event_service.log_consultation_booked(
+        user_id=user.id,
+        date=final_date.isoformat(),
+        time=selected_time.isoformat(),
+    )
 
-{consultation_service.get_time_slots_text()}
+    confirmation_text = (
+        f"✅ **Отлично!**\n\n"
+        f"Вы записаны на консультацию **{final_date.strftime('%d %B (%A)')} в {selected_time.strftime('%H:%M')} по МСК**.\n\n"
+        f"За 15 минут до начала я пришлю напоминание."
+    )
+    await message.answer(confirmation_text, parse_mode="Markdown")
 
-Все время указано по Москве 🇷🇺"""
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        for slot in available_slots:
-            formatted_time = consultation_service.format_slot_time(slot)
-            keyboard.add(InlineKeyboardButton(
-                text=f"⏰ {formatted_time}",
-                callback_data=f"consult:time:{selected_date.isoformat()}:{slot.isoformat()}"
-            ))
-        
-        keyboard.add(InlineKeyboardButton(
-            text="🔙 Выбрать другую дату",
-            callback_data="consult:offer"
-        ))
-        keyboard.adjust(1)
-        
-        await message.answer(
-            time_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        logger.error("Error handling custom date", error=str(e), user_id=user.id, exc_info=True)
-        await message.answer("Произошла ошибка при обработке даты")
-
-
-@router.callback_query(F.data == "consult:reschedule")
-async def reschedule_consultation(callback: CallbackQuery, user: User, **kwargs):
-    """Handle consultation rescheduling."""
+    # Notify managers
     try:
-        session = kwargs.get("session")
-        consultation_service = ConsultationService(session)
-        
-        # Get user's upcoming appointment
-        upcoming = await consultation_service.repository.get_upcoming_appointments(user.id)
-        if not upcoming:
-            await callback.answer("У вас нет запланированных консультаций")
-            return
-        
-        appointment = upcoming[0]
-        current_details = consultation_service.format_appointment_details(appointment)
-        
-        # Get available dates for rescheduling
-        available_dates = consultation_service.get_next_available_dates(days_ahead=7)
-        
-        reschedule_text = f"""📅 **Перенос консультации**
-
-**Текущая консультация:**
-{current_details}
-
-📅 **Выбери новую дату:**"""
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        # Add date options
-        for date_option in available_dates[:3]:
-            formatted_date = date_option.strftime("%d.%m (%a)")
-            keyboard.add(InlineKeyboardButton(
-                text=f"📅 {formatted_date}",
-                callback_data=f"reschedule:date:{date_option.isoformat()}:{appointment.id}"
-            ))
-        
-        keyboard.add(InlineKeyboardButton(
-            text="❌ Отменить консультацию",
-            callback_data="consult:cancel"
-        ))
-        keyboard.add(InlineKeyboardButton(
-            text="🔙 Назад",
-            callback_data="back:main_menu"
-        ))
-        keyboard.adjust(1)
-        
-        await callback.message.edit_text(
-            reschedule_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="Markdown"
-        )
-        
-        await callback.answer()
-        
+        manager_notifier = ManagerNotificationService(bot, session)
+        await manager_notifier.notify_new_consultation(appointment)
     except Exception as e:
-        logger.error("Error rescheduling consultation", error=str(e), user_id=user.id, exc_info=True)
-        await callback.answer("Произошла ошибка")
+        logger.error("Failed to notify managers about new consultation", error=e, appointment_id=appointment.id)
+
+    await state.clear()
 
 
-@router.callback_query(F.data == "consult:cancel")
-async def cancel_consultation(callback: CallbackQuery, user: User, **kwargs):
-    """Handle consultation cancellation."""
-    try:
-        session = kwargs.get("session")
-        consultation_service = ConsultationService(session)
-        
-        # Get user's upcoming appointment
-        upcoming = await consultation_service.repository.get_upcoming_appointments(user.id)
-        if not upcoming:
-            await callback.answer("У вас нет запланированных консультаций")
-            return
-        
-        appointment = upcoming[0]
-        
-        # Cancel appointment
-        success = await consultation_service.cancel_appointment(appointment)
-        
-        if success:
-            cancel_text = f"""❌ **Консультация отменена**
+# Handlers for reminders
+@router.callback_query(F.data.startswith("consult_reminder:"))
+async def handle_reminder_response(
+    callback: CallbackQuery, state: FSMContext, user: User, session, bot: Bot, **kwargs
+):
+    """Handles user's response to the 15-minute reminder."""
+    await callback.answer()
+    parts = callback.data.split(":")
+    action = parts[1]
+    appointment_id = int(parts[2])
 
-Твоя консультация на {appointment.date.strftime('%d.%m.%Y')} в {appointment.slot.strftime('%H:%M')} МСК была отменена.
+    consultation_service = ConsultationService(session)
+    appointment = await consultation_service.process_reminder_response(
+        appointment_id, action
+    )
 
-💭 **Если передумаешь — всегда можешь записаться снова!**
+    if not appointment or appointment.user_id != user.id:
+        await callback.message.edit_text("Не удалось найти вашу запись. Возможно, она была отменена.")
+        return
 
-Нужна помощь? Обратись к менеджеру 👤"""
-            
-            keyboard = InlineKeyboardBuilder()
-            keyboard.add(InlineKeyboardButton(
-                text="📞 Записаться на новую консультацию",
-                callback_data="consult:offer"
-            ))
-            keyboard.add(InlineKeyboardButton(
-                text="👤 Связаться с менеджером",
-                callback_data="manager:request"
-            ))
-            keyboard.adjust(1)
-            
-            await callback.message.edit_text(
-                cancel_text,
-                reply_markup=keyboard.as_markup(),
-                parse_mode="Markdown"
-            )
-            
-            await callback.answer("✅ Консультация отменена")
-            
-        else:
-            await callback.answer("Произошла ошибка при отмене")
-            
-    except Exception as e:
-        logger.error("Error canceling consultation", error=str(e), user_id=user.id, exc_info=True)
-        await callback.answer("Произошла ошибка")
+    event_service = EventService(session)
+    await event_service.log_consultation_reminder_response(
+        user_id=user.id, appointment_id=appointment_id, response=action
+    )
+
+    manager_notifier = ManagerNotificationService(bot, session)
+
+    if action == "confirm":
+        await callback.message.edit_text("👍 Отлично, ждем вас на консультации!")
+        await manager_notifier.notify_consultation_confirmed(appointment)
+    elif action == "reschedule":
+        # Cancel the old appointment before booking a new one
+        await consultation_service.cancel_appointment(appointment)
+        await callback.message.edit_text("Чтобы перенести консультацию, давайте выберем новую дату.")
+        await start_consultation_booking(callback.message, state, user, session)
+        await manager_notifier.notify_consultation_rescheduled(appointment)
+    elif action == "cancel":
+        await callback.message.edit_text("Жаль, что у вас не получается. Консультация отменена.")
+        await manager_notifier.notify_consultation_cancelled(appointment)
 
 
 def register_handlers(dp):

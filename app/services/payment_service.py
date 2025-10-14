@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.models import User, Product, Payment, PaymentStatus
+from app.services.ab_testing_service import ABTestingService, ABEventType
 
 
 logger = structlog.get_logger()
@@ -144,7 +145,16 @@ class PaymentRepository:
             order_id=payment.order_id,
             status=status
         )
-        
+
+        if status == PaymentStatus.PAID:
+            ab_service = ABTestingService(self.session)
+            await ab_service.record_event_for_latest_assignment(
+                payment.user_id,
+                ABEventType.PAYMENT_CONFIRMED,
+                {"payment_id": payment.id},
+                within_hours=120,
+            )
+
         return payment
 
 
@@ -280,6 +290,14 @@ class PaymentService:
                 payload=payload or None,
             )
 
+            ab_service = ABTestingService(self.session)
+            await ab_service.record_event_for_latest_assignment(
+                user_id,
+                ABEventType.PAYMENT_STARTED,
+                {"payment_id": payment.id, "status": status.value},
+                within_hours=72,
+            )
+
             if payment_link:
                 message = "Ссылка на оплату готова"
             else:
@@ -315,7 +333,7 @@ class PaymentService:
             payment_status = status_mapping.get(status.lower(), PaymentStatus.FAILED)
             
             # Update payment
-            payment = await self.payment_repo.update_payment_status(
+            payment = await self.update_payment_status(
                 payment,
                 payment_status,
                 webhook_data

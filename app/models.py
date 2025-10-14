@@ -8,11 +8,12 @@ from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger, Integer, String, Text, Boolean, DateTime, Date, Time, 
-    Numeric, JSON, SmallInteger, ARRAY, ForeignKey, UniqueConstraint, Index
+    Numeric, JSON, SmallInteger, ARRAY, ForeignKey, UniqueConstraint, Index, Float
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
 
 from app.db import Base
 
@@ -53,6 +54,14 @@ class LeadStatus(str, Enum):
     CANCELED = "canceled"
 
 
+class AttendanceStatus(str, Enum):
+    """User attendance confirmation status."""
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    CANCELED = "canceled"
+    NO_RESPONSE = "no_response"
+
+
 class AppointmentStatus(str, Enum):
     """Appointment status enum."""
     SCHEDULED = "scheduled"
@@ -86,12 +95,38 @@ class ABTestStatus(str, Enum):
     DRAFT = "draft"
     RUNNING = "running"
     COMPLETED = "completed"
+    FINISHED = "finished"  # Alias for legacy references
+
+    @classmethod
+    def normalize(cls, value: str) -> "ABTestStatus":
+        """Normalize stored string to enum member."""
+        if not value:
+            return cls.DRAFT
+        try:
+            return cls(value)
+        except ValueError:
+            lowered = value.lower()
+            if lowered == "finished":
+                return cls.COMPLETED
+            return cls(value)  # will raise
 
 
 class ABTestMetric(str, Enum):
     """A/B test metric enum."""
     CTR = "CTR"
     CR = "CR"
+
+
+class ABEventType(str, Enum):
+    """Event types tracked for A/B testing."""
+    DELIVERED = "delivered"
+    CLICKED = "clicked"
+    REPLIED = "replied"
+    LEAD_CREATED = "lead_created"
+    PAYMENT_STARTED = "payment_started"
+    PAYMENT_CONFIRMED = "payment_confirmed"
+    UNSUBSCRIBED = "unsubscribed"
+    BLOCKED = "blocked"
 
 
 class AdminRole(str, Enum):
@@ -118,6 +153,13 @@ class User(Base):
     funnel_stage: Mapped[FunnelStage] = mapped_column(String(20), default=FunnelStage.NEW)
     source: Mapped[Optional[str]] = mapped_column(String(100))
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    counter: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pos_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    neu_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    neg_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scored_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lead_level_percent: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    lead_level_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -128,6 +170,12 @@ class User(Base):
     leads: Mapped[List["Lead"]] = relationship("Lead", back_populates="user")
     appointments: Mapped[List["Appointment"]] = relationship("Appointment", back_populates="user")
     payments: Mapped[List["Payment"]] = relationship("Payment", back_populates="user")
+    sentiment_scores: Mapped[List["UserMessageScore"]] = relationship(
+        "UserMessageScore",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
     
     __table_args__ = (
         Index("ix_users_telegram_id", "telegram_id"),
@@ -185,6 +233,29 @@ class Message(Base):
     user: Mapped["User"] = relationship("User", back_populates="messages")
 
 
+class UserMessageScore(Base):
+    """Audit record for user message sentiment classification."""
+    __tablename__ = "user_message_scores"
+    __table_args__ = (
+        UniqueConstraint("hash", name="uq_user_message_scores_hash"),
+        UniqueConstraint("user_id", "message_id", name="uq_user_message_scores_message"),
+        Index("ix_user_message_scores_user_id", "user_id"),
+        Index("ix_user_message_scores_evaluated_at", "evaluated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    label: Mapped[str] = mapped_column(String(20), nullable=False)
+    score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False, default="gpt-4o-mini")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    hash: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    user: Mapped["User"] = relationship("User", back_populates="sentiment_scores")
+
+
 class Lead(Base):
     """Lead model."""
     __tablename__ = "leads"
@@ -233,6 +304,9 @@ class Appointment(Base):
     tz: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
     status: Mapped[AppointmentStatus] = mapped_column(String(20), default=AppointmentStatus.SCHEDULED)
     reminder_job_id: Mapped[Optional[str]] = mapped_column(String(255))
+    slot_utc: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    attendance: Mapped[AttendanceStatus] = mapped_column(String(20), server_default=AttendanceStatus.PENDING, nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -246,14 +320,86 @@ class Product(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     code: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
+    short_desc: Mapped[Optional[str]] = mapped_column(String(500))
     description: Mapped[Optional[str]] = mapped_column(Text)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), default="RUB")
     meta: Mapped[Optional[dict]] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    value_props: Mapped[Optional[List[str]]] = mapped_column(JSON, default=list)
     payment_landing_url: Mapped[Optional[str]] = mapped_column(String(500))
+    landing_url: Mapped[Optional[str]] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # Relationships
     payments: Mapped[List["Payment"]] = relationship("Payment", back_populates="product")
+    criteria: Mapped[List["ProductCriteria"]] = relationship(
+        "ProductCriteria",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    match_logs: Mapped[List["ProductMatchLog"]] = relationship(
+        "ProductMatchLog",
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProductCriteria(Base):
+    """Mapping between products and survey answers."""
+    __tablename__ = "product_criteria"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    question_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    answer_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[int] = mapped_column(Integer, default=1)
+    note: Mapped[Optional[str]] = mapped_column(String(255))
+    question_code: Mapped[Optional[str]] = mapped_column(String(50))
+    answer_code: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    product: Mapped["Product"] = relationship("Product", back_populates="criteria")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "product_id",
+            "question_id",
+            "answer_id",
+            name="uq_product_criteria_unique_answer",
+        ),
+        Index(
+            "ix_product_criteria_product_question",
+            "product_id",
+            "question_id",
+        ),
+    )
+
+
+class ProductMatchLog(Base):
+    """Audit log for fuzzy product matching."""
+    __tablename__ = "product_match_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    product_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("products.id", ondelete="SET NULL"))
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    top3: Mapped[dict] = mapped_column(JSON, nullable=False)
+    explanation: Mapped[Optional[str]] = mapped_column(Text)
+    matched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    threshold_used: Mapped[Optional[float]] = mapped_column(Float)
+    trigger: Mapped[Optional[str]] = mapped_column(String(50))
+
+    product: Mapped[Optional["Product"]] = relationship("Product", back_populates="match_logs")
+    user: Mapped["User"] = relationship("User")
 
 
 class Payment(Base):
@@ -499,16 +645,35 @@ class ABTest(Base):
     population: Mapped[int] = mapped_column(nullable=False)  # Percentage of users
     metric: Mapped[ABTestMetric] = mapped_column(String(10), nullable=False)
     status: Mapped[ABTestStatus] = mapped_column(String(20), default=ABTestStatus.DRAFT)
+    creator_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    variants_count: Mapped[int] = mapped_column(SmallInteger, default=2)
+    audience_size: Mapped[Optional[int]] = mapped_column(Integer)
+    test_size: Mapped[Optional[int]] = mapped_column(Integer)
+    notification_job_id: Mapped[Optional[str]] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     variants: Mapped[List["ABVariant"]] = relationship("ABVariant", back_populates="ab_test")
     results: Mapped[List["ABResult"]] = relationship("ABResult", back_populates="ab_test")
+    assignments: Mapped[List["ABAssignment"]] = relationship("ABAssignment", back_populates="ab_test")
+    events: Mapped[List["ABEvent"]] = relationship("ABEvent", back_populates="ab_test")
+
+    @property
+    def status_enum(self) -> ABTestStatus:
+        """Return status as normalized enum value."""
+        if isinstance(self.status, ABTestStatus):
+            return self.status
+        return ABTestStatus.normalize(str(self.status))
 
 
 class ABVariant(Base):
     """A/B test variant model."""
     __tablename__ = "ab_variants"
+    __table_args__ = (
+        UniqueConstraint("ab_test_id", "variant_code", name="uq_ab_variant_code"),
+    )
     
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     ab_test_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_tests.id"), nullable=False)
@@ -516,27 +681,95 @@ class ABVariant(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     buttons: Mapped[Optional[dict]] = mapped_column(JSON)
+    content: Mapped[Optional[list]] = mapped_column(JSON)
     weight: Mapped[int] = mapped_column(default=50)  # Percentage weight
+    order_index: Mapped[int] = mapped_column(SmallInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="variants")
+    assignments: Mapped[List["ABAssignment"]] = relationship("ABAssignment", back_populates="variant")
+    events: Mapped[List["ABEvent"]] = relationship("ABEvent", back_populates="variant")
+    result_snapshot: Mapped[Optional["ABResult"]] = relationship("ABResult", back_populates="variant", uselist=False)
+
+
+class ABAssignment(Base):
+    """Assignment of user to specific A/B test variant."""
+    __tablename__ = "ab_assignments"
+    __table_args__ = (
+        UniqueConstraint("test_id", "user_id", name="uq_ab_assignment_user"),
+        Index("ix_ab_assignments_test", "test_id"),
+        Index("ix_ab_assignments_variant", "variant_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_tests.id", ondelete="CASCADE"), nullable=False)
+    variant_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_variants.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    hash_value: Mapped[Optional[float]] = mapped_column(Numeric(precision=12, scale=6))
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    delivery_error: Mapped[Optional[str]] = mapped_column(Text)
+    message_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    chat_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+
+    # Relationships
+    ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="assignments")
+    variant: Mapped["ABVariant"] = relationship("ABVariant", back_populates="assignments")
+    user: Mapped["User"] = relationship("User")
+    events: Mapped[List["ABEvent"]] = relationship("ABEvent", back_populates="assignment", cascade="all, delete-orphan")
+
+
+class ABEvent(Base):
+    """Event captured for a specific A/B assignment."""
+    __tablename__ = "ab_events"
+    __table_args__ = (
+        Index("ix_ab_events_test_type", "test_id", "event_type"),
+        Index("ix_ab_events_assignment_type", "assignment_id", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_tests.id", ondelete="CASCADE"), nullable=False)
+    variant_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_variants.id", ondelete="CASCADE"), nullable=False)
+    assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("ab_assignments.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    event_type: Mapped[ABEventType] = mapped_column(String(40), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    meta: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    # Relationships
+    ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="events")
+    variant: Mapped["ABVariant"] = relationship("ABVariant", back_populates="events")
+    assignment: Mapped["ABAssignment"] = relationship("ABAssignment", back_populates="events")
+    user: Mapped["User"] = relationship("User")
 
 
 class ABResult(Base):
     """A/B test result model."""
     __tablename__ = "ab_results"
+    __table_args__ = (
+        UniqueConstraint("ab_test_id", "variant_code", name="uq_ab_result_variant"),
+    )
     
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     ab_test_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_tests.id"), nullable=False)
     variant_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("ab_variants.id"))
     delivered: Mapped[int] = mapped_column(default=0)
     clicks: Mapped[int] = mapped_column(default=0)
     conversions: Mapped[int] = mapped_column(default=0)
     responses: Mapped[int] = mapped_column(default=0)
     unsub: Mapped[int] = mapped_column(default=0)
+    payment_started: Mapped[int] = mapped_column(default=0)
+    payment_confirmed: Mapped[int] = mapped_column(default=0)
+    blocked: Mapped[int] = mapped_column(default=0)
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="results")
+    variant: Mapped[Optional["ABVariant"]] = relationship("ABVariant", back_populates="result_snapshot")
 
 
 class Admin(Base):
@@ -600,4 +833,73 @@ class BroadcastDelivery(Base):
         UniqueConstraint("broadcast_id", "user_id", name="uq_broadcast_user_delivery"),
         Index("ix_broadcast_deliveries_status", "status"),
         Index("ix_broadcast_deliveries_broadcast_id", "broadcast_id"),
+    )
+
+
+class SystemSetting(Base):
+    """Simple key-value storage for application-wide settings."""
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    description: Mapped[Optional[str]] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class AdminOutboundStatus(str, Enum):
+    """Status of a message sent via /sendto."""
+    SENT = "sent"
+    FAILED = "failed"
+    NOT_FOUND = "not_found"
+    BLOCKED = "blocked"
+
+
+class AdminOutboundMessage(Base):
+    """Log of a message sent by an admin via /sendto."""
+    __tablename__ = "admin_outbound_messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    admin_user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("admins.telegram_id"), nullable=False)
+    recipients: Mapped[List[str]] = mapped_column(ARRAY(String), nullable=False)
+    content_kind: Mapped[str] = mapped_column(String(50), nullable=False)
+    text_snippet: Mapped[Optional[str]] = mapped_column(String(500))
+    media_ids: Mapped[Optional[List[str]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    results: Mapped[List["AdminOutboundResult"]] = relationship("AdminOutboundResult", back_populates="outbound_message")
+
+
+class AdminOutboundResult(Base):
+    """Result of a single message delivery from an AdminOutboundMessage."""
+    __tablename__ = "admin_outbound_results"
+    __table_args__ = (
+        Index("ix_admin_outbound_results_outbound_id", "outbound_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    outbound_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("admin_outbound_messages.id", ondelete="CASCADE"), nullable=False)
+    recipient_user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    status: Mapped[AdminOutboundStatus] = mapped_column(String(20), nullable=False)
+    error_code: Mapped[Optional[str]] = mapped_column(String(255))
+    delivered_message_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    ts: Mapped[datetime] = mapped_column("ts", DateTime(timezone=True), server_default=func.now())
+
+    outbound_message: Mapped["AdminOutboundMessage"] = relationship("AdminOutboundMessage", back_populates="results")
+    recipient: Mapped["User"] = relationship("User")
+
+
+class SellScript(Base):
+    """Sell scripts for vector search."""
+    __tablename__ = "sell_scripts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    sheet: Mapped[str] = mapped_column(String(100), nullable=False)
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Vector] = mapped_column(Vector(1536), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_sell_scripts_updated_at", "updated_at"),
     )

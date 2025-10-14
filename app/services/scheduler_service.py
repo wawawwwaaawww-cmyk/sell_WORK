@@ -10,17 +10,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import and_, select
+import random
+from app.services.excel_material_service import excel_material_service
 
 from app.config import settings
 from app.db import get_db
 from app.models import Appointment, Lead, User
 from app.services.notification_service import NotificationService
 from app.services.ab_testing_service import ABTestingService
-from app.services.broadcast_service import BroadcastService
+from app.services.sentiment_service import sentiment_service
+
 
 logger = logging.getLogger(__name__)
-
 
 SCHEDULER_REGISTRY: Dict[str, AsyncIOScheduler] = {}
 DEFAULT_SCHEDULER_ID = "scheduler_service_main"
@@ -104,6 +107,13 @@ class SchedulerService:
             )
 
             self.scheduler.add_job(
+                sentiment_service.reconcile,
+                IntervalTrigger(hours=1, timezone=self.timezone),
+                id="sentiment_reconcile",
+                replace_existing=True,
+            )
+
+            self.scheduler.add_job(
                 cleanup_orphan_jobs,
                 IntervalTrigger(hours=12, timezone=self.timezone),
                 id="scheduler_job_cleanup",
@@ -116,6 +126,8 @@ class SchedulerService:
                 "Scheduler started successfully (timezone=%s)",
                 self.timezone,
             )
+
+            self.reschedule_excel_materials_mailing()
 
         except Exception as exc:
             logger.error("Error starting scheduler", exc_info=exc)
@@ -278,6 +290,38 @@ class SchedulerService:
             )
             raise
 
+    async def schedule_ab_test_summary(self, test_id: int, summary_time: datetime) -> Optional[str]:
+        """Schedule summary notification for A/B test."""
+        try:
+            if summary_time.tzinfo is None:
+                run_date = self.timezone.localize(summary_time)
+            else:
+                run_date = summary_time.astimezone(self.timezone)
+
+            job = self.scheduler.add_job(
+                send_ab_test_summary,
+                trigger=DateTrigger(run_date=run_date, timezone=self.timezone),
+                args=[test_id],
+                id=f"ab_test_summary_{test_id}",
+                replace_existing=True,
+            )
+
+            logger.info(
+                "Scheduled A/B test summary",
+                test_id=test_id,
+                run_at=run_date.isoformat(),
+                job_id=job.id,
+            )
+            return job.id
+
+        except Exception as exc:
+            logger.error(
+                "Error scheduling A/B test summary (test_id=%s)",
+                test_id,
+                exc_info=exc,
+            )
+            return None
+
 
     def cancel_job(self, job_id: Optional[str]) -> None:
         """Cancel a scheduled job if it exists."""
@@ -294,14 +338,173 @@ class SchedulerService:
                 exc,
             )
 
+    def get_excel_material_job_id(self, suffix: str) -> str:
+       return f"excel_material_mailing_{suffix}"
+
+    def reschedule_excel_materials_mailing(self):
+       """Schedules or re-schedules the mailing based on config."""
+       config = excel_material_service.get_schedule_config()
+       
+       # Remove all existing mailing jobs first to ensure clean state
+       for i in range(2): # Max 2 jobs for "2 times a day"
+           job_id = self.get_excel_material_job_id(str(i))
+           try:
+               self.scheduler.remove_job(job_id)
+           except JobLookupError:
+               pass # Job doesn't exist, which is fine
+
+       if config.get('paused'):
+           logger.info("Excel material mailing is paused. No jobs scheduled.")
+           return
+
+       freq = config.get('frequency', 'daily_1')
+       start_h = config.get('window_start_h_msk', 11)
+       end_h = config.get('window_end_h_msk', 20)
+
+       # Convert MSK hours to UTC for the scheduler
+       # Moscow is UTC+3
+       start_h_utc = (start_h - 3 + 24) % 24
+       end_h_utc = (end_h - 3 + 24) % 24
+
+       if freq == 'daily_1':
+           hour = random.randint(start_h_utc, end_h_utc -1)
+           minute = random.randint(0, 59)
+           trigger = CronTrigger(hour=hour, minute=minute, timezone='UTC')
+           self.scheduler.add_job(
+               dispatch_excel_material_mailing,
+               trigger=trigger,
+               id=self.get_excel_material_job_id("0"),
+               replace_existing=True,
+           )
+           logger.info(f"Scheduled daily excel material mailing at {hour:02d}:{minute:02d} UTC")
+
+       elif freq == 'daily_2':
+           # Schedule two different random times
+           for i in range(2):
+               hour = random.randint(start_h_utc, end_h_utc - 1)
+               minute = random.randint(0, 59)
+               trigger = CronTrigger(hour=hour, minute=minute, timezone='UTC')
+               self.scheduler.add_job(
+                   dispatch_excel_material_mailing,
+                   trigger=trigger,
+                   id=self.get_excel_material_job_id(str(i)),
+                   replace_existing=True,
+               )
+               logger.info(f"Scheduled twice-daily excel material mailing #{i+1} at {hour:02d}:{minute:02d} UTC")
+
+       elif freq.startswith('every_'):
+           days = int(freq.split('_')[1])
+           hour = random.randint(start_h_utc, end_h_utc - 1)
+           minute = random.randint(0, 59)
+           trigger = CronTrigger(day=f"*/{days}", hour=hour, minute=minute, timezone='UTC')
+           self.scheduler.add_job(
+               dispatch_excel_material_mailing,
+               trigger=trigger,
+               id=self.get_excel_material_job_id("0"),
+               replace_existing=True,
+           )
+           logger.info(f"Scheduled excel material mailing every {days} days at {hour:02d}:{minute:02d} UTC")
+
+       elif freq == 'weekly':
+           # Default to a random day of the week if not set
+           day_of_week = config.get('base_day_of_week', random.randint(0, 6))
+           hour = random.randint(start_h_utc, end_h_utc - 1)
+           minute = random.randint(0, 59)
+           trigger = CronTrigger(day_of_week=day_of_week, hour=hour, minute=minute, timezone='UTC')
+           self.scheduler.add_job(
+               dispatch_excel_material_mailing,
+               trigger=trigger,
+               id=self.get_excel_material_job_id("0"),
+               replace_existing=True,
+           )
+           logger.info(f"Scheduled weekly excel material mailing on day {day_of_week} at {hour:02d}:{minute:02d} UTC")
+
 # Background job implementations
 
+
+async def dispatch_excel_material_mailing():
+    """The actual job that sends one material to all active users."""
+    from app.bot import bot
+    logger.info("Starting excel material mailing dispatch...")
+    
+    try:
+        async for db in get_db():
+            # Get all active users
+            result = await db.execute(
+                select(User).where(User.is_blocked == False)
+            )
+            active_users = result.scalars().all()
+            break # Exit async generator
+        if not active_users:
+            logger.info("No active users found to send materials to.")
+            return
+        total_users = len(active_users)
+        success_count = 0
+        fail_count = 0
+        for user in active_users:
+            material = excel_material_service.get_next_material_for_user(user.id)
+            
+            if not material:
+                logger.warning(f"No next material found for user {user.id}. Skipping.")
+                excel_material_service.log_send_attempt(
+                    user_id=user.id,
+                    username=user.username,
+                    material=None, # Or a dummy material object
+                    status='skipped',
+                    error='No valid material available'
+                )
+                fail_count += 1
+                continue
+            try:
+                from aiogram.types import FSInputFile
+                
+                caption = material.text
+                
+                if material.media_type == 'photo':
+                    await bot.send_photo(
+                        chat_id=user.telegram_id,
+                        photo=FSInputFile(material.media_path),
+                        caption=caption
+                    )
+                elif material.media_type == 'video':
+                    await bot.send_video(
+                        chat_id=user.telegram_id,
+                        video=FSInputFile(material.media_path),
+                        caption=caption
+                    )
+                
+                excel_material_service.update_user_progress(user.id, material.row_index)
+                excel_material_service.log_send_attempt(
+                    user_id=user.id,
+                    username=user.username,
+                    material=material,
+                    status='success'
+                )
+                success_count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to send material to user {user.id}: {e}", exc_info=True)
+                excel_material_service.log_send_attempt(
+                    user_id=user.id,
+                    username=user.username,
+                    material=material,
+                    status='failed',
+                    error=str(e)
+                )
+                fail_count += 1
+        
+        logger.info(
+            f"Excel material mailing finished. Total: {total_users}, Success: {success_count}, Failed: {fail_count}"
+        )
+    except Exception as e:
+        logger.error(f"Critical error in dispatch_excel_material_mailing: {e}", exc_info=True)
 
 async def send_scheduled_broadcast(broadcast_id: int) -> None:
     """Deliver a scheduled broadcast."""
     try:
         notification_service = get_notification_service()
         async for db in get_db():
+            from app.services.broadcast_service import BroadcastService
             broadcast_service = BroadcastService(notification_service.bot, db)
             result = await broadcast_service.send_simple_broadcast(broadcast_id)
             await db.commit()
@@ -438,8 +641,9 @@ async def send_appointment_reminder(appointment_id: int) -> None:
                     datetime.combine(appointment.date, appointment.slot)
                 )
                 await notification_service.send_consultation_reminder(
-                    telegram_id,
-                    reminder_datetime,
+                    user_id=telegram_id,
+                    appointment_id=appointment.id,
+                    consultation_time=reminder_datetime,
                 )
                 appointment.reminder_job_id = None
                 await db.flush()
@@ -491,18 +695,10 @@ async def process_ab_tests() -> None:
         notification_service = get_notification_service()
         async for db in get_db():
             ab_service = ABTestingService(db)
-            running_tests = await ab_service.repository.get_running_tests()
+            running_tests = await ab_service.get_running_tests()
 
             if not running_tests:
                 break
-
-            if not settings.telegram_bot_token:
-                logger.warning(
-                    "Skipping winner broadcast: bot token not configured"
-                )
-                break
-
-            broadcast_service = BroadcastService(notification_service.bot, db)
 
             for test in running_tests:
                 try:
@@ -520,25 +716,16 @@ async def process_ab_tests() -> None:
 
                     await db.commit()
 
-                    if not analysis.get("winner"):
+                    if analysis.get("winner"):
                         logger.info(
-                            "A/B test completed without winner (test_id=%s)",
-                            test.id,
-                        )
-                        continue
-
-                    send_result = await broadcast_service.send_winner_broadcast(test.id)
-                    if send_result.get("error"):
-                        logger.warning(
-                            "Winner broadcast delivery failed (test_id=%s, error=%s)",
-                            test.id,
-                            send_result["error"],
+                            "A/B test winner available",
+                            test_id=test.id,
+                            winner=analysis["winner"],
                         )
                     else:
                         logger.info(
-                            "Winner broadcast delivered (test_id=%s, stats=%s)",
+                            "A/B test completed without winner (test_id=%s)",
                             test.id,
-                            send_result,
                         )
                 except Exception as job_exc:
                     logger.error(
@@ -550,6 +737,38 @@ async def process_ab_tests() -> None:
 
     except Exception as exc:
         logger.error("Error processing A/B tests", exc_info=exc)
+
+
+async def send_ab_test_summary(test_id: int) -> None:
+    """Aggregate A/B test metrics and notify initiator."""
+    try:
+        notification_service = get_notification_service()
+        async for db in get_db():
+            ab_service = ABTestingService(db)
+            success, detail, analysis = await ab_service.complete_test(test_id)
+            if not success:
+                logger.warning(
+                    "A/B test summary skipped",
+                    test_id=test_id,
+                    detail=detail,
+                )
+                await db.rollback()
+                break
+
+            creator_id = analysis.get("creator_user_id")
+            if creator_id:
+                await notification_service.send_ab_test_summary(creator_id, analysis)
+            else:
+                logger.warning(
+                    "A/B test summary has no creator",
+                    test_id=test_id,
+                )
+
+            await db.commit()
+            break
+
+    except Exception as exc:
+        logger.error("Error sending A/B test summary", exc_info=exc)
 
 
 async def cleanup_orphan_jobs(scheduler_id: str) -> None:

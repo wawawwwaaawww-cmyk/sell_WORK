@@ -12,7 +12,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import User, Broadcast, UserSegment
-from app.services.ab_testing_service import ABTestingService
+from app.services.ab_testing_service import ABTestingService, VariantDefinition, DEFAULT_POPULATION_PERCENT
 
 
 class BroadcastRepository:
@@ -108,22 +108,27 @@ class BroadcastService:
     ) -> Tuple[bool, str, Optional[int]]:
         """Create A/B test broadcast."""
         try:
-            # Convert buttons to format for A/B testing
-            a_buttons = {"buttons": variant_a_buttons} if variant_a_buttons else None
-            b_buttons = {"buttons": variant_b_buttons} if variant_b_buttons else None
-            
-            # Create A/B test
-            ab_test = await self.ab_testing_service.create_ab_test(
+            variant_defs = [
+                VariantDefinition(
+                    title=variant_a_title,
+                    body=variant_a_body,
+                    buttons=variant_a_buttons,
+                ),
+                VariantDefinition(
+                    title=variant_b_title,
+                    body=variant_b_body,
+                    buttons=variant_b_buttons,
+                ),
+            ]
+
+            ab_test = await self.ab_testing_service.create_test(
                 name=test_name,
-                variant_a_title=variant_a_title,
-                variant_a_body=variant_a_body,
-                variant_b_title=variant_b_title,
-                variant_b_body=variant_b_body,
-                population=population,
-                variant_a_buttons=a_buttons,
-                variant_b_buttons=b_buttons
+                creator_user_id=0,
+                variants=variant_defs,
+                population_percent=population or DEFAULT_POPULATION_PERCENT,
+                start_immediately=False,
             )
-            
+
             return True, "A/B test broadcast created", ab_test.id
             
         except Exception as e:
@@ -293,94 +298,31 @@ class BroadcastService:
     ) -> Dict[str, Any]:
         """Send A/B test broadcast to test population."""
         try:
-            # Start the A/B test
-            success, message = await self.ab_testing_service.start_ab_test(ab_test_id)
-            if not success:
-                return {"error": message}
-            
-            # Get test and variants
-            ab_test = await self.ab_testing_service.repository.get_ab_test_by_id(ab_test_id)
-            variants = await self.ab_testing_service.repository.get_test_variants(ab_test_id)
-            
-            if not ab_test or len(variants) < 2:
-                return {"error": "Invalid A/B test setup"}
-            
-            # Get all users (no segment filter for now - can be added later)
-            all_users = await self._get_target_users(None)
-            
-            # Select test population
-            test_users = await self.ab_testing_service.select_test_users(
-                all_users, ab_test.population
+            summary = await self.ab_testing_service.start_test(
+                ab_test_id,
+                bot=self.bot,
+                send_messages=True,
+                throttle=delay_between_messages,
             )
-            
-            sent_stats = {"A": 0, "B": 0}
-            failed_stats = {"A": 0, "B": 0}
-            
-            # Send messages to test users
-            for user in test_users:
-                try:
-                    # Assign variant to user
-                    variant = await self.ab_testing_service.assign_variant(user, variants)
-                    
-                    # Build keyboard for variant
-                    keyboard = self._build_keyboard(variant.buttons)
-                    
-                    # Send message
-                    await self.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=variant.body,
-                        reply_markup=keyboard,
-                        parse_mode="Markdown"
-                    )
-                    
-                    # Record delivery
-                    await self.ab_testing_service.record_delivery(
-                        ab_test_id, variant.variant_code, user.id
-                    )
-                    
-                    sent_stats[variant.variant_code] += 1
-                    
-                    # Delay to avoid rate limits
-                    if delay_between_messages > 0:
-                        await asyncio.sleep(delay_between_messages)
-                        
-                except Exception as e:
-                    variant_code = "A"  # Default for error tracking
-                    try:
-                        variant = await self.ab_testing_service.assign_variant(user, variants)
-                        variant_code = variant.variant_code
-                    except:
-                        pass
-                    
-                    self.logger.warning(
-                        "Failed to send A/B test message",
-                        user_id=user.id,
-                        variant=variant_code,
-                        error=str(e)
-                    )
-                    failed_stats[variant_code] += 1
-            
-            total_sent = sum(sent_stats.values())
-            total_failed = sum(failed_stats.values())
-            
-            self.logger.info(
-                "A/B test broadcast completed",
-                test_id=ab_test_id,
-                sent_stats=sent_stats,
-                failed_stats=failed_stats,
-                total_population=len(test_users)
-            )
-            
-            return {
-                "sent": total_sent,
-                "failed": total_failed,
-                "total_population": len(test_users),
-                "variant_stats": {
-                    "A": {"sent": sent_stats["A"], "failed": failed_stats["A"]},
-                    "B": {"sent": sent_stats["B"], "failed": failed_stats["B"]}
+
+            analysis = await self.ab_testing_service.analyze_test_results(ab_test_id)
+            variants_payload = {
+                variant["variant"]: {
+                    "sent": variant["delivered"],
+                    "clicks": variant["unique_clicks"],
+                    "leads": variant["leads"],
                 }
+                for variant in analysis.get("variants", [])
             }
-            
+
+            delivery = summary.get("delivery", {})
+            return {
+                "sent": delivery.get("sent", 0),
+                "failed": delivery.get("failed", 0),
+                "total_population": summary.get("assignments", 0),
+                "variant_stats": variants_payload,
+            }
+
         except Exception as e:
             self.logger.error("Error sending A/B test broadcast", error=str(e))
             return {"error": str(e)}

@@ -143,7 +143,7 @@ class SurveyService:
                 "text": "*А как думаешь, если будет видно, что обучение ускоряет прогресс — готов ли ты в него инвестировать?*",
                 "options": {
                     "ready_to_learn": {"text": "Да", "points": 2},
-                    "not_ready": {"text": "Нет", "points": 0}
+                    "not_ready": {"text": "Не сейчас", "points": 0}
                 }
             }
         }

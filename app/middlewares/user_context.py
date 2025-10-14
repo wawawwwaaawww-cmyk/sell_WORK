@@ -6,8 +6,11 @@ import structlog
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, TelegramObject
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.db import AsyncSessionLocal
 from app.services.user_service import UserService
+from app.services.ab_testing_service import ABTestingService, ABEventType
 
 
 class UserContextMiddleware(BaseMiddleware):
@@ -45,10 +48,47 @@ class UserContextMiddleware(BaseMiddleware):
                     first_name=user.first_name,
                     last_name=user.last_name,
                 )
-                
+
                 data["user"] = db_user
                 data["user_service"] = user_service
-                
+
+                try:
+                    async with session.begin_nested():
+                        ab_service = ABTestingService(session)
+
+                        if isinstance(event, CallbackQuery) and event.message:
+                            chat_id = event.message.chat.id
+                            msg_id = event.message.message_id
+                            assignment = await ab_service.get_assignment_by_message(chat_id, msg_id)
+                            if assignment:
+                                await ab_service.record_user_event(
+                                    assignment.test_id,
+                                    assignment.user_id,
+                                    ABEventType.CLICKED,
+                                    {"callback_data": event.data},
+                                )
+
+                        elif isinstance(event, Message):
+                            text_value = event.text or event.caption or ""
+                            if not text_value.startswith("/"):
+                                await ab_service.record_event_for_latest_assignment(
+                                    db_user.id,
+                                    ABEventType.REPLIED,
+                                    {"message_id": event.message_id},
+                                )
+                except SQLAlchemyError as ab_exc:  # pragma: no cover - defensive
+                    self.logger.warning(
+                        "user_context.ab_tracking_failed",
+                        error=str(ab_exc),
+                        user_id=db_user.id,
+                    )
+                except Exception as ab_exc:  # pragma: no cover - defensive
+                    self.logger.warning(
+                        "user_context.ab_tracking_failed",
+                        error=str(ab_exc),
+                        user_id=db_user.id,
+                    )
+
                 # Process the event
                 result = await handler(event, data)
                 

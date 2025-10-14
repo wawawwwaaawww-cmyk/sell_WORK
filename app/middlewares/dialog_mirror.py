@@ -73,6 +73,7 @@ class DialogsMirrorMiddleware(BaseMiddleware):
             await conversation_logger.log_user_message(
                 user_id=user.id,
                 text=fallback_text,
+                 metadata={"source": "auto_mirror"},
                 bot=bot_instance,
                 user=user,
                 telegram_user=telegram_user,
