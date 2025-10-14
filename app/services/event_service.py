@@ -107,6 +107,15 @@ class EventService:
         self.repository = EventRepository(session)
         self.logger = structlog.get_logger()
     
+    async def create_event(
+        self,
+        user_id: int,
+        type: str,
+        payload: Optional[Dict[str, Any]] = None
+    ) -> Event:
+        """Create a new event."""
+        return await self.repository.create_event(user_id, type, payload)
+
     async def log_event(
         self,
         user_id: int,

@@ -18,9 +18,10 @@ from app.models import User
 from app.services.bonus_content_manager import BonusContentManager
 from app.services.logging_service import ConversationLoggingService
 from app.services.priority_analysis_service import (ConfirmationIntent,
-                                                    PriorityAnalysisService,
-                                                    PriorityIntent)
+                                                     PriorityAnalysisService,
+                                                     PriorityIntent)
 from app.services.user_service import UserService
+from app.services.survey_offer_service import SurveyOfferService
 from app.utils.callbacks import Callbacks
 
 router = Router()
@@ -206,6 +207,10 @@ async def handle_bonus_followup_no(
 
     try:
         await callback.answer()
+
+        if target_user and session:
+            survey_offer_service = SurveyOfferService(session, user_service)
+            await survey_offer_service.mark_survey_skipped(target_user)
 
         response_text = (
             "Понял тебя. Даже если сейчас не готов выбирать инструмент, "

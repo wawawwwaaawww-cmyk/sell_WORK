@@ -8,7 +8,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from ..config import settings
-from ..models import Lead
+from ..models import Lead, User, LeadStatus
 
 logger = logging.getLogger(__name__)
 
@@ -222,3 +222,21 @@ class NotificationService:
             
         except Exception as e:
             logger.error(f"Error sending payment notification: {e}")
+
+    async def send_incomplete_lead_to_managers(self, lead: Lead, card_text: str):
+        """Send notification about an incomplete lead to the admin channel."""
+        try:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Взять заявку", callback_data=f"lead:take:{lead.id}")],
+                # Optional buttons can be added here based on user data
+            ])
+
+            await self.bot.send_message(
+                chat_id=settings.incomplete_leads_admin_channel_id,
+                text=card_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            logger.info("Sent incomplete lead notification to managers", lead_id=lead.id)
+        except Exception as e:
+            logger.error(f"Error sending incomplete lead notification for lead {lead.id}: {e}")

@@ -9,10 +9,11 @@ import structlog
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Lead, LeadNote, LeadStatus, User
+from app.models import Lead, LeadNote, LeadStatus, User, Message
 from app.services.ab_testing_service import ABTestingService, ABEventType
 from app.services.product_matching_service import ProductMatchingService, MatchResult
 from app.config import settings
+from app.services.event_service import EventService
 
 
 class LeadRepository:
@@ -85,8 +86,8 @@ class LeadRepository:
         manager_id: int
     ) -> Lead:
         """Assign lead to a manager and timestamp the takeover."""
-        lead.status = LeadStatus.TAKEN
-        lead.assigned_manager_id = manager_id
+        lead.status = LeadStatus.ASSIGNED
+        lead.assignee_id = manager_id
         lead.taken_at = datetime.now(timezone.utc)
 
         await self.session.flush()
@@ -173,7 +174,109 @@ class LeadService:
         self.session = session
         self.repository = LeadRepository(session)
         self.logger = structlog.get_logger()
+
+    async def start_incomplete_lead_timer(self, user: User, trigger: str) -> Optional[Lead]:
+        """Create a draft lead and schedule a check."""
+        try:
+            existing_leads = await self.repository.get_user_leads(user.id)
+            active_draft = next((l for l in existing_leads if l.status == LeadStatus.DRAFT), None)
+
+            if active_draft and not settings.incomplete_leads_extend_on_activity:
+                self.logger.info("Draft lead already exists, timer fixed.", lead_id=active_draft.id)
+                return active_draft
+
+            if active_draft:
+                lead = active_draft
+                from app.services.scheduler_service import scheduler_service
+                scheduler_service.cancel_job(lead.incomplete_job_id)
+            else:
+                lead = Lead(user_id=user.id, status=LeadStatus.DRAFT, handoff_trigger=trigger)
+                self.session.add(lead)
+                await self.session.flush()
+                await self.session.refresh(lead)
+                event_service = EventService(self.session)
+                await event_service.create_event(user.id, "lead_created_draft", {"lead_id": lead.id})
+
+            check_time = datetime.now(timezone.utc) + timedelta(minutes=settings.incomplete_leads_wait_minutes)
+            job_id = await scheduler_service.schedule_incomplete_lead_check(lead.id, check_time)
+            lead.incomplete_job_id = job_id
+            await self.session.commit()
+
+            self.logger.info("Started incomplete lead timer", lead_id=lead.id, user_id=user.id, job_id=job_id)
+            return lead
+        except Exception as e:
+            self.logger.error("Error starting incomplete lead timer", error=str(e), user_id=user.id)
+            await self.session.rollback()
+            return None
+
+    async def complete_lead(self, lead: Lead, summary: str, status: LeadStatus = LeadStatus.SCHEDULED):
+        """Finalize a lead, cancel the incomplete timer, and update status."""
+        if lead.status == LeadStatus.DRAFT:
+            from app.services.scheduler_service import scheduler_service
+            scheduler_service.cancel_job(lead.incomplete_job_id)
+            lead.status = status
+            lead.summary = summary
+            lead.incomplete_job_id = None
+            await self.session.commit()
+            self.logger.info("Lead completed from draft", lead_id=lead.id, new_status=status)
+        elif lead.status == LeadStatus.INCOMPLETE:
+            lead.status = status
+            lead.summary = summary
+            await self.session.commit()
+            self.logger.info("Lead updated after being incomplete", lead_id=lead.id, new_status=status)
+            # Logic to send update to manager channel thread will be in notification service
     
+    async def mark_lead_as_incomplete(self, lead: Lead) -> Lead:
+        """Mark a lead as incomplete."""
+        lead.status = LeadStatus.INCOMPLETE
+        await self.session.commit()
+        self.logger.info("Lead marked as incomplete", lead_id=lead.id)
+        return lead
+
+    async def format_incomplete_lead_card(self, lead: Lead, user: User) -> str:
+        """Format a card for an incomplete lead."""
+        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Не указано"
+        username = f"@{user.username}" if user.username else "Не указан"
+        phone = user.phone or "не указан"
+        
+        last_messages = await self.get_last_user_messages(user.id, settings.incomplete_leads_show_last_user_msgs)
+        messages_text = "\n".join([f"- _{msg.text}_" for msg in last_messages]) if last_messages else "Нет сообщений"
+
+        card = f"""🚨 **Заявка (незавершённая)**
+Клиент не завершил заполнение заявки.
+
+**Пользователь:**
+• Имя: {name}
+• Telegram: {username}
+• User ID: {user.telegram_id}
+
+**Контакты:**
+• Телефон: {phone}
+
+**Контекст:**
+• Последние сообщения:
+{messages_text}
+
+**Служебно:**
+• Lead ID: {lead.id}
+• Время создания: {lead.created_at.strftime('%d.%m.%Y %H:%M')}
+• Статус: {lead.status.value}
+"""
+        return card
+
+    async def get_last_user_messages(self, user_id: int, limit: int) -> List[Message]:
+        """Fetch the last N messages from a user."""
+        if limit == 0:
+            return []
+        stmt = (
+            select(Message)
+            .where(Message.user_id == user_id)
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().all()[::-1]  # Reverse to get chronological order
+
     async def should_create_lead(self, user: User, context: Dict[str, Any]) -> bool:
         """Determine if a lead should be created based on user behavior."""
         
@@ -536,8 +639,8 @@ class LeadService:
             if not lead:
                 return False, "Лид не найден"
 
-            if lead.status != LeadStatus.NEW:
-                return False, "Лид уже взят другим менеджером"
+            if lead.status not in [LeadStatus.NEW, LeadStatus.INCOMPLETE]:
+                return False, "Лид уже взят другим менеджером или завершен."
 
             await self.repository.assign_lead_to_manager(lead, manager_id)
 

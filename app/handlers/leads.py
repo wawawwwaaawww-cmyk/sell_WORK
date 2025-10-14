@@ -123,7 +123,7 @@ async def handle_lead_take(callback: CallbackQuery, **kwargs):
                 await manager_service.notify_lead_taken(lead, user, manager_id)
                 await event_service.log_event(
                     user_id=user.id,
-                    event_type="lead_taken",
+                    event_type="lead_assigned",
                     payload={"lead_id": lead.id, "manager_id": manager_id},
                 )
 
@@ -140,11 +140,14 @@ async def handle_lead_take(callback: CallbackQuery, **kwargs):
             keyboard.adjust(1)
 
             manager_name = callback.from_user.full_name or callback.from_user.first_name or 'Менеджер'
+            
+            original_text = callback.message.text
+            new_text = f"{original_text}\n\n---\n✅ **Взят в работу**\nМенеджер: {manager_name}"
 
             await callback.message.edit_text(
-                f"✅ **Лид #{lead_id} взят в работу**\n\nМенеджер: {manager_name}\nID: {manager_id}",
+                new_text,
                 parse_mode='Markdown',
-                reply_markup=keyboard.as_markup(),
+                reply_markup=None,  # Remove buttons after taking
             )
 
             await callback.answer('✅ Лид назначен на вас!')

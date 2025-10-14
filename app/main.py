@@ -16,9 +16,10 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from app.api import api_router
 from app.config import settings
-from app.db import close_db, init_db
+from app.db import close_db, init_db, get_db
 from app.bot import bot, dp, on_startup, on_shutdown
 from app.services.scheduler_service import scheduler_service
+from app.services.redis_service import redis_service
 
 logger = structlog.get_logger(__name__)
 
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Startup
     logger.info("Starting Telegram Sales Bot application")
     await init_db()
+    await redis_service.initialize()
     await on_startup()
     scheduler_service.start()
     
@@ -38,6 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down Telegram Sales Bot application")
     scheduler_service.stop()
     await on_shutdown()
+    await redis_service.close()
     await close_db()
 
 
@@ -57,6 +60,40 @@ app.include_router(api_router)
 async def health_check() -> dict:
     """Health check endpoint."""
     return {"status": "healthy", "service": "telegram-sales-bot"}
+
+
+@app.get("/readyz")
+async def ready_check() -> Response:
+    """Readiness check endpoint."""
+    # Check DB connection
+    db_ok = False
+    try:
+        async for db in get_db():
+            await db.execute("SELECT 1")
+            db_ok = True
+            break
+    except Exception as e:
+        logger.error("Readiness check failed: DB connection error", error=str(e))
+        db_ok = False
+
+    # Check Redis connection
+    redis_ok = False
+    try:
+        redis_client = redis_service.get_client()
+        if redis_client:
+            await redis_client.ping()
+            redis_ok = True
+    except Exception as e:
+        logger.error("Readiness check failed: Redis connection error", error=str(e))
+        redis_ok = False
+
+    if db_ok and redis_ok:
+        return JSONResponse({"status": "ready"})
+    else:
+        return JSONResponse(
+            {"status": "not_ready", "checks": {"database": db_ok, "redis": redis_ok}},
+            status_code=503
+        )
 
 
 @app.get("/metrics")

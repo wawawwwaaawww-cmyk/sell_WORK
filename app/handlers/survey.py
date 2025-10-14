@@ -15,6 +15,7 @@ from app.services.survey_service import SurveyService
 from app.services.event_service import EventService
 from app.services.llm_service import LLMService, LLMContext
 from app.services.product_matching_service import ProductMatchingService
+from app.services.survey_offer_service import SurveyOfferService
 from app.services.logging_service import ConversationLoggingService
 from app.utils.callbacks import Callbacks, CallbackData
 from app.handlers.scene_dispatcher import try_process_callback
@@ -153,7 +154,7 @@ async def _render_survey_step(
         )
 
 
-@router.callback_query(F.data == Callbacks.SURVEY_START)
+@router.callback_query(F.data.in_({Callbacks.SURVEY_START, Callbacks.SURVEY_START_FROM_OFFER}))
 async def start_survey(callback: CallbackQuery, user: User, user_service: UserService, **kwargs):
     """Start the survey process."""
     try:
@@ -164,10 +165,14 @@ async def start_survey(callback: CallbackQuery, user: User, user_service: UserSe
         
         # Log event
         event_service = EventService(session)
+        event_type = "survey_started"
+        if callback.data == Callbacks.SURVEY_START_FROM_OFFER:
+            event_type = "survey_started_from_invite"
+
         await event_service.log_event(
             user_id=user.id,
-            event_type="survey_started",
-            payload={}
+            event_type=event_type,
+            payload={"attempt": user.offer_attempt}
         )
         
         # Get first question
@@ -377,6 +382,9 @@ async def complete_survey(
                 event_type="survey_completed",
                 payload=summary
             )
+            # Mark survey as completed for offer logic
+            survey_offer_service = SurveyOfferService(session, user_service)
+            await survey_offer_service.mark_survey_completed(user)
         except Exception as log_error:
             logger.warning("Failed to log survey completion", error=str(log_error), user_id=user.id)
         
@@ -469,6 +477,15 @@ async def complete_survey(
 
         results_text = "\n\n".join(part for part in sections if part)
         
+        if match_result.best_product and match_result.best_product.media:
+            for media in match_result.best_product.media:
+                if media.media_type == 'photo':
+                    await callback.message.answer_photo(media.file_id)
+                elif media.media_type == 'video':
+                    await callback.message.answer_video(media.file_id)
+                elif media.media_type == 'document':
+                    await callback.message.answer_document(media.file_id)
+
         await _render_survey_step(
             callback,
             session=session,
@@ -567,6 +584,24 @@ async def handle_llm_interaction(callback: CallbackQuery, user: User, **kwargs):
         logger.error("Error in LLM interaction", error=str(e), user_id=user.id, exc_info=True)
         # Use a simple text answer as a fallback, as the original callback is already answered
         await callback.message.answer("Произошла ошибка. Попробуйте еще раз.")
+
+
+@router.callback_query(F.data == Callbacks.SURVEY_OFFER_LATER)
+async def handle_survey_offer_later(callback: CallbackQuery, user: User, **kwargs):
+    """Handle the 'Later' button on a survey offer."""
+    try:
+        session = kwargs.get("session")
+        event_service = EventService(session)
+        await event_service.log_event(
+            user_id=user.id,
+            event_type="survey_invite_clicked",
+            payload={"btn": "later", "attempt": user.offer_attempt},
+        )
+        await callback.message.edit_text("Хорошо, вернемся к этому позже.", reply_markup=None)
+        await callback.answer()
+    except Exception as e:
+        logger.error("Error handling survey offer 'Later'", error=str(e), user_id=user.id)
+        await callback.answer("Произошла ошибка.")
 
 
 def register_handlers(dp):

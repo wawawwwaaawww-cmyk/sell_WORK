@@ -43,6 +43,8 @@ class LLMResponse:
     confidence: float
     safety_issues: List[SafetyIssue]
     is_safe: bool
+    intent: Optional[str] = None
+    need_reask: bool = False
 
 
 async def get_embedding(text: str, model: str = "text-embedding-3-small") -> Optional[List[float]]:
@@ -202,7 +204,9 @@ class LLMService:
                 next_action=llm_response.get("next_action", "ask"),
                 confidence=llm_response.get("confidence", 0.5),
                 safety_issues=safety_issues,
-                is_safe=is_safe
+                is_safe=is_safe,
+                intent=llm_response.get("intent"),
+                need_reask=llm_response.get("need_reask", False),
             )
 
         except Exception as e:
@@ -583,7 +587,8 @@ class LLMService:
 ПРОДАЖНАЯ МЕТОДОЛОГИЯ: {self.sales_methodology}
 ПОЛИТИКИ БЕЗОПАСНОСТИ: {self.safety_policies}
 
-ЗАДАЧА: Твой ответ ДОЛЖЕН быть в формате JSON со следующими полями: "reply_text" (string), "buttons" (list of dicts with "text" and "callback"), "next_action" (string), "confidence" (float).
+ЗАДАЧА: Твой ответ ДОЛЖЕН быть в формате JSON со следующими полями: "answer" (string), "intent" (string), "next_action" (string), "stage_transition" (string), "need_reask" (boolean), "confidence" (float).
+ПРАВИЛО Answer-First: Сначала ответь на смысл последней реплики. Не повторяй свой предыдущий вопрос, если пользователь пишет о другом.
 """
     
     def _escalation_response(self, issues: Optional[List[SafetyIssue]] = None) -> LLMResponse:

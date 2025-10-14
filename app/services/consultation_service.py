@@ -11,6 +11,7 @@ from dateutil.parser import parse as parse_datetime
 
 from app.services.scheduler_service import scheduler_service
 from app.models import Appointment, AppointmentStatus, User, AttendanceStatus
+from app.services.lead_service import LeadService
 
 
 class ConsultationRepository:
@@ -29,6 +30,7 @@ class ConsultationRepository:
     async def create_appointment(
         self,
         user_id: int,
+        user_name: str,
         appointment_date: date,
         slot: time,
         slot_utc: datetime,
@@ -38,6 +40,7 @@ class ConsultationRepository:
         """Create a new appointment."""
         appointment = Appointment(
             user_id=user_id,
+            user_name=user_name,
             date=appointment_date,
             slot=slot,
             tz=timezone,
@@ -235,6 +238,7 @@ class ConsultationService:
     async def book_consultation(
         self,
         user_id: int,
+        user_name: str,
         consultation_date: date,
         slot: time,
         source: str = "bot_consultation",
@@ -272,6 +276,7 @@ class ConsultationService:
             # Create appointment
             appointment = await self.repository.create_appointment(
                 user_id=user_id,
+                user_name=user_name,
                 appointment_date=consultation_date,
                 slot=slot,
                 slot_utc=dt_utc,
@@ -282,9 +287,16 @@ class ConsultationService:
             reminder_datetime_utc = dt_utc - timedelta(minutes=15)
             if reminder_datetime_utc > datetime.now(pytz.utc):
                 await scheduler_service.schedule_appointment_reminder(
-                    appointment.id,
-                    reminder_datetime_utc
+                    appointment, reminder_datetime_utc
                 )
+
+            # If booking is successful, complete the lead
+            lead_service = LeadService(self.session)
+            user_leads = await lead_service.repository.get_user_leads(user_id)
+            draft_lead = next((l for l in user_leads if l.status == LeadStatus.DRAFT), None)
+            if draft_lead:
+                summary = await lead_service._generate_lead_summary(appointment.user, "consultation_booked")
+                await lead_service.complete_lead(draft_lead, summary, LeadStatus.SCHEDULED)
 
             return True, appointment, "Консультация успешно запланирована"
             
@@ -407,8 +419,8 @@ class ConsultationService:
         """Parse free text input into a Moscow datetime object."""
         now_msk = self._get_now_msk()
         
-        # Replace common phrases
-        text = text.lower().replace("на ", "").replace("в ", "")
+        # Replace common phrases and clean up input
+        text = text.lower().replace("на ", "").replace(" в ", " ")
         if "сегодня" in text:
             text = text.replace("сегодня", now_msk.strftime("%d.%m.%Y"))
         elif "завтра" in text:
@@ -439,5 +451,10 @@ class ConsultationService:
 
             return parsed_dt, "Дата и время приняты."
 
-        except Exception:
+        except (ValueError, TypeError) as e:
+            self.logger.warning(
+                "datetime_parse_failed",
+                raw_text=text,
+                error=str(e),
+            )
             return None, "Не удалось распознать дату и время. Попробуйте формат 'ДД.ММ ЧЧ:ММ', например: '15.10 16:30'."

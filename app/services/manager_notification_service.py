@@ -24,7 +24,7 @@ class ManagerNotificationService:
 
     async def _format_message(self, appointment: Appointment, user: User, title: str) -> str:
         """Format the notification message."""
-        user_info = f"Пользователь: {user.first_name or ''} {user.last_name or ''}".strip()
+        user_info = f"Пользователь: {appointment.user_name or user.first_name or ''}".strip()
         if user.username:
             user_info += f" (@{user.username})"
         

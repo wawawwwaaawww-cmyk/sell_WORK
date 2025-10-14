@@ -6,9 +6,10 @@ from enum import Enum
 from uuid import uuid4
 from typing import Optional, List
 
+import sqlalchemy as sa
 from sqlalchemy import (
-    BigInteger, Integer, String, Text, Boolean, DateTime, Date, Time, 
-    Numeric, JSON, SmallInteger, ARRAY, ForeignKey, UniqueConstraint, Index, Float
+    BigInteger, Integer, String, Text, Boolean, DateTime, Date, Time,
+    Numeric, JSON, SmallInteger, ForeignKey, UniqueConstraint, Index, Float, ARRAY
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.ext.associationproxy import association_proxy
@@ -47,6 +48,10 @@ class MessageRole(str, Enum):
 
 class LeadStatus(str, Enum):
     """Lead status enum."""
+    DRAFT = "draft"
+    INCOMPLETE = "incomplete"
+    ASSIGNED = "assigned"
+    SCHEDULED = "scheduled"
     NEW = "new"
     TAKEN = "taken"
     DONE = "done"
@@ -68,6 +73,13 @@ class AppointmentStatus(str, Enum):
     RESCHEDULED = "rescheduled"
     CANCELED = "canceled"
     COMPLETED = "completed"
+
+
+class ProductMediaType(str, Enum):
+    """Product media type enum."""
+    PHOTO = "photo"
+    VIDEO = "video"
+    DOCUMENT = "document"
 
 
 class PaymentStatus(str, Enum):
@@ -92,23 +104,30 @@ class MaterialType(str, Enum):
 
 class ABTestStatus(str, Enum):
     """A/B test status enum."""
-    DRAFT = "draft"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FINISHED = "finished"  # Alias for legacy references
+    DRAFT = "DRAFT"
+    RUNNING = "RUNNING"
+    OBSERVE = "OBSERVE"
+    WINNER_PICKED = "WINNER_PICKED"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
 
     @classmethod
     def normalize(cls, value: str) -> "ABTestStatus":
         """Normalize stored string to enum member."""
         if not value:
             return cls.DRAFT
+        
+        upper_val = value.upper()
+        if upper_val == "FINISHED":
+            return cls.COMPLETED
+
         try:
-            return cls(value)
+            return cls(upper_val)
         except ValueError:
-            lowered = value.lower()
-            if lowered == "finished":
-                return cls.COMPLETED
-            return cls(value)  # will raise
+            # Fallback for old lowercase values
+            if upper_val.lower() in ('draft', 'running', 'completed'):
+                return cls(upper_val.upper())
+            return cls.DRAFT
 
 
 class ABTestMetric(str, Enum):
@@ -163,6 +182,22 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
+    # Follow-up related fields
+    last_user_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_followup_24_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_followup_72_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    mute_followups_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    followups_opted_out: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Survey Offer related fields
+    survey_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    survey_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    survey_skipped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    msgs_since_skip: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    offer_attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_offer_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    survey_offer_snooze_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     # Relationships
     events: Mapped[List["Event"]] = relationship("Event", back_populates="user")
     survey_answers: Mapped[List["SurveyAnswer"]] = relationship("SurveyAnswer", back_populates="user")
@@ -273,6 +308,8 @@ class Lead(Base):
     close_reason: Mapped[Optional[str]] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    incomplete_job_id: Mapped[Optional[str]] = mapped_column(String(255))
+    assignee_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="leads")
@@ -299,6 +336,7 @@ class Appointment(Base):
     
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_name: Mapped[Optional[str]] = mapped_column(String(255))
     date: Mapped[date] = mapped_column(Date, nullable=False)
     slot: Mapped[time] = mapped_column(Time, nullable=False)
     tz: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
@@ -321,7 +359,7 @@ class Product(Base):
     code: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
-    short_desc: Mapped[Optional[str]] = mapped_column(String(500))
+    short_desc: Mapped[Optional[str]] = mapped_column(Text)
     description: Mapped[Optional[str]] = mapped_column(Text)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(10), default="RUB")
@@ -346,6 +384,25 @@ class Product(Base):
         back_populates="product",
         cascade="all, delete-orphan",
     )
+    media: Mapped[List["ProductMedia"]] = relationship(
+        "ProductMedia",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class ProductMedia(Base):
+    """Product media model."""
+    __tablename__ = "product_media"
+    
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    file_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[ProductMediaType] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    
+    product: Mapped["Product"] = relationship("Product", back_populates="media")
 
 
 class ProductCriteria(Base):
@@ -639,12 +696,27 @@ class Broadcast(Base):
 class ABTest(Base):
     """A/B test model."""
     __tablename__ = "ab_tests"
-    
+    __table_args__ = (
+        Index("ix_ab_tests_status", "status"),
+        Index("ix_ab_tests_send_at", "send_at"),
+        Index("ix_ab_tests_winner_variant_id", "winner_variant_id"),
+    )
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    population: Mapped[int] = mapped_column(nullable=False)  # Percentage of users
-    metric: Mapped[ABTestMetric] = mapped_column(String(10), nullable=False)
-    status: Mapped[ABTestStatus] = mapped_column(String(20), default=ABTestStatus.DRAFT)
+    
+    sample_ratio: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False, server_default=sa.text("'0.1'"))
+    metric: Mapped[ABTestMetric] = mapped_column(String(10), nullable=False, server_default=sa.text("'CTR'"))
+    observation_hours: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa.text("'24'"))
+    segment_filter: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    status: Mapped[ABTestStatus] = mapped_column(String(20), default=ABTestStatus.DRAFT, server_default=ABTestStatus.DRAFT.value, nullable=False)
+    winner_variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("ab_variants.id"), nullable=True)
+    delivered_group_id: Mapped[Optional[uuid4]] = mapped_column(sa.UUID, nullable=True)
+    send_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_admin_id: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=sa.text("'0'"))
+
+    # Old fields for compatibility
+    population: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Percentage of users, now nullable
     creator_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -655,7 +727,7 @@ class ABTest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
-    variants: Mapped[List["ABVariant"]] = relationship("ABVariant", back_populates="ab_test")
+    variants: Mapped[List["ABVariant"]] = relationship("ABVariant", back_populates="ab_test", foreign_keys="ABVariant.ab_test_id")
     results: Mapped[List["ABResult"]] = relationship("ABResult", back_populates="ab_test")
     assignments: Mapped[List["ABAssignment"]] = relationship("ABAssignment", back_populates="ab_test")
     events: Mapped[List["ABEvent"]] = relationship("ABEvent", back_populates="ab_test")
@@ -680,14 +752,16 @@ class ABVariant(Base):
     variant_code: Mapped[str] = mapped_column(String(10), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
-    buttons: Mapped[Optional[dict]] = mapped_column(JSON)
+    buttons: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=sa.text("'[]'::jsonb"))
+    media: Mapped[List[dict]] = mapped_column(JSON, nullable=False, server_default=sa.text("'[]'::jsonb"))
+    parse_mode: Mapped[str] = mapped_column(String(10), nullable=False, server_default="HTML")
     content: Mapped[Optional[list]] = mapped_column(JSON)
     weight: Mapped[int] = mapped_column(default=50)  # Percentage weight
     order_index: Mapped[int] = mapped_column(SmallInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
-    ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="variants")
+    ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="variants", foreign_keys=[ab_test_id])
     assignments: Mapped[List["ABAssignment"]] = relationship("ABAssignment", back_populates="variant")
     events: Mapped[List["ABEvent"]] = relationship("ABEvent", back_populates="variant")
     result_snapshot: Mapped[Optional["ABResult"]] = relationship("ABResult", back_populates="variant", uselist=False)
@@ -708,6 +782,8 @@ class ABAssignment(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     hash_value: Mapped[Optional[float]] = mapped_column(Numeric(precision=12, scale=6))
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    first_delivery_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_status: Mapped[str] = mapped_column(String(10), server_default="PENDING", nullable=False)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -770,6 +846,28 @@ class ABResult(Base):
     # Relationships
     ab_test: Mapped["ABTest"] = relationship("ABTest", back_populates="results")
     variant: Mapped[Optional["ABVariant"]] = relationship("ABVariant", back_populates="result_snapshot")
+
+
+class ABMetricDaily(Base):
+    """Daily aggregated metrics for A/B test performance."""
+    __tablename__ = "ab_metrics_daily"
+    __table_args__ = (
+        UniqueConstraint("test_id", "variant_id", "metric_date", name="uq_ab_metrics_daily_unique"),
+        Index("ix_ab_metrics_daily_test_date", "test_id", "metric_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_tests.id", ondelete="CASCADE"), nullable=False)
+    variant_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ab_variants.id", ondelete="CASCADE"), nullable=False)
+    metric_date: Mapped[date] = mapped_column(Date, nullable=False)
+    delivered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicked: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    responded: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    converted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unsubscribed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    test: Mapped["ABTest"] = relationship("ABTest")
+    variant: Mapped["ABVariant"] = relationship("ABVariant")
 
 
 class Admin(Base):
@@ -903,3 +1001,47 @@ class SellScript(Base):
     __table_args__ = (
         Index("ix_sell_scripts_updated_at", "updated_at"),
     )
+
+
+class FollowupTemplate(Base):
+    """Follow-up templates for re-engaging users."""
+    __tablename__ = "followup_templates"
+    __table_args__ = (
+        UniqueConstraint("kind", name="followup_templates_kind_uq"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # '24h' or '72h'
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    text: Mapped[Optional[str]] = mapped_column(Text)
+    media: Mapped[List[dict]] = mapped_column(JSON, default=list, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class OpenQuestionStatus(str, Enum):
+    """Status of an open question."""
+    ASKED = "asked"
+    ANSWERED = "answered"
+    SKIPPED = "skipped"
+
+
+class OpenQuestionLog(Base):
+    """Log of open questions that were not immediately answered."""
+    __tablename__ = "open_question_log"
+    __table_args__ = (
+        Index("ix_open_question_log_user_id_status", "user_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    question_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[OpenQuestionStatus] = mapped_column(String(20), default=OpenQuestionStatus.ASKED, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    
+    asked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reasked_at: Mapped[Optional[List[datetime]]] = mapped_column(ARRAY(DateTime(timezone=True)))
+    answered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    skipped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped["User"] = relationship("User")
