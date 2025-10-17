@@ -310,10 +310,16 @@ class Lead(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     incomplete_job_id: Mapped[Optional[str]] = mapped_column(String(255))
     assignee_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    sales_script_md: Mapped[Optional[str]] = mapped_column(Text)
+    sales_script_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    sales_script_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sales_script_model: Mapped[Optional[str]] = mapped_column(String(120))
+    sales_script_inputs_hash: Mapped[Optional[str]] = mapped_column(String(128))
     
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="leads")
     notes: Mapped[List["LeadNote"]] = relationship("LeadNote", back_populates="lead", cascade="all, delete-orphan")
+    events: Mapped[List["LeadEvent"]] = relationship("LeadEvent", back_populates="lead", cascade="all, delete-orphan")
 
 
 class LeadNote(Base):
@@ -328,6 +334,23 @@ class LeadNote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     lead: Mapped["Lead"] = relationship("Lead", back_populates="notes")
+
+
+class LeadEvent(Base):
+    """Timeline event for a lead."""
+    __tablename__ = "lead_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("leads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    lead: Mapped["Lead"] = relationship("Lead", back_populates="events")
 
 
 class Appointment(Base):
@@ -710,7 +733,7 @@ class ABTest(Base):
     observation_hours: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa.text("'24'"))
     segment_filter: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=sa.text("'{}'::jsonb"))
     status: Mapped[ABTestStatus] = mapped_column(String(20), default=ABTestStatus.DRAFT, server_default=ABTestStatus.DRAFT.value, nullable=False)
-    winner_variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("ab_variants.id"), nullable=True)
+    winner_variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     delivered_group_id: Mapped[Optional[uuid4]] = mapped_column(sa.UUID, nullable=True)
     send_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_admin_id: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=sa.text("'0'"))

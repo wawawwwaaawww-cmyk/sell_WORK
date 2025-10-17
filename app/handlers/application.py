@@ -29,6 +29,7 @@ from app.services.lead_service import LeadService
 from app.services.manager_notification_service import ManagerNotificationService
 from app.services.survey_service import SurveyService
 from app.services.user_service import UserService
+from app.services.sales_script_service import SalesScriptService
 from app.utils.callbacks import Callbacks
 from app.repositories.user_repository import UserRepository
 from app.config import settings
@@ -36,6 +37,21 @@ from app.config import settings
 
 router = Router()
 logger = structlog.get_logger()
+
+
+async def _refresh_sales_script(session, bot, user: User, reason: str) -> None:
+    if not settings.sales_script_enabled or session is None:
+        return
+    try:
+        service = SalesScriptService(session, bot)
+        await service.refresh_for_user(user, reason=reason, bot=bot)
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "sales_script_refresh_failed",
+            user_id=user.id,
+            reason=reason,
+            error=str(exc),
+        )
 
 
 class ApplicationStates(StatesGroup):
@@ -332,6 +348,8 @@ async def handle_contact_phone(
     await state.update_data(phone=phone_normalized, phone_display=phone_display)
 
     await user_service.set_user_contact_info(user, phone=phone_normalized)
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_phone_manual")
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_phone_contact")
     await state.set_state(ApplicationStates.waiting_name)
 
     await message.answer(
@@ -417,6 +435,7 @@ async def handle_email_input(
         return
 
     await user_service.set_user_contact_info(user, email=email_candidate)
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_email")
 
     data = await state.get_data()
     name = data.get("name")

@@ -220,20 +220,8 @@ class ConsultationService:
     
     async def get_available_slots_for_date(self, consultation_date: date) -> List[time]:
         """Get available time slots for a specific date."""
-        available_slots = []
-        
-        for slot in self.available_slots:
-            # Check if slot is already booked
-            appointments = await self.repository.get_appointments_by_date_and_time(
-                consultation_date, slot
-            )
-            
-            # If no appointments or less than max capacity, slot is available
-            # For simplicity, we allow only 1 appointment per slot
-            if len(appointments) == 0:
-                available_slots.append(slot)
-        
-        return available_slots
+        # All slots remain available regardless of existing bookings
+        return list(self.available_slots)
     
     async def book_consultation(
         self,
@@ -259,14 +247,6 @@ class ConsultationService:
             # Validate time slot
             if slot not in self.available_slots:
                 return False, None, "Выбранное время недоступно"
-            
-            # Check if slot is available
-            existing_appointments = await self.repository.get_appointments_by_date_and_time(
-                consultation_date, slot
-            )
-            
-            if existing_appointments:
-                return False, None, "Это время уже занято"
             
             # Check if user already has an upcoming appointment
             user_upcoming = await self.repository.get_upcoming_appointments(user_id)
@@ -301,7 +281,7 @@ class ConsultationService:
             return True, appointment, "Консультация успешно запланирована"
             
         except Exception as e:
-            self.logger.error("Error booking consultation", error=str(e), user_id=user_id)
+            self.logger.error("Error booking consultation", error=str(e), user_id=user_id, exc_info=True)
             return False, None, "Произошла ошибка при записи"
     
     async def process_reminder_response(
@@ -354,14 +334,6 @@ class ConsultationService:
             
             if new_slot not in self.available_slots:
                 return False, "Выбранное время недоступно"
-            
-            # Check if new slot is available
-            existing_appointments = await self.repository.get_appointments_by_date_and_time(
-                new_date, new_slot
-            )
-            
-            if existing_appointments:
-                return False, "Это время уже занято"
             
             # Reschedule
             scheduler_service.cancel_job(appointment.reminder_job_id)

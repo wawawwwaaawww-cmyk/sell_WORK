@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 from sqlalchemy import select, func, and_
+from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -291,6 +292,9 @@ class AnalyticsService:
                 "tests": tests_payload,
             }
 
+        except (ProgrammingError, OperationalError) as exc:
+            logger.warning("A/B tables missing while preparing metrics", exc_info=exc)
+            return {"summary": {}, "tests": [], "error": "ab_tables_missing", "detail": str(exc)}
         except Exception as exc:
             logger.error("Error getting A/B test metrics", exc_info=exc)
             return {"summary": {}, "tests": [], "error": "ab_query_failed", "detail": str(exc)}

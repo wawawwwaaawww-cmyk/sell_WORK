@@ -13,7 +13,7 @@ from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 import random
 from app.services.excel_material_service import excel_material_service
 
@@ -791,7 +791,7 @@ async def start_pending_ab_tests():
             now = datetime.now(timezone.utc)
             stmt = select(ABTest).where(
                 ABTest.status == ABTestStatus.DRAFT,
-                ABTest.send_at <= now
+                or_(ABTest.send_at.is_(None), ABTest.send_at <= now)
             )
             result = await db.execute(stmt)
             tests_to_start = result.scalars().all()
@@ -1016,7 +1016,7 @@ async def check_incomplete_lead(lead_id: int):
                 return
 
             card_text = await lead_service.format_incomplete_lead_card(lead, user)
-            await notification_service.send_incomplete_lead_to_managers(lead, card_text)
+            await notification_service.send_incomplete_lead_to_managers(db, lead, user, card_text)
 
             event_service = EventService(db)
             await event_service.create_event(

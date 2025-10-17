@@ -395,12 +395,12 @@ class LeadService:
             )
 
             ab_service = ABTestingService(self.session)
-            await ab_service.record_event_for_latest_assignment(
-                user_id,
-                ABEventType.LEAD_CREATED,
-                {"lead_id": lead.id, "trigger": trigger},
-                within_hours=72,
-            )
+            # await ab_service.record_event_for_latest_assignment(
+            #     user_id,
+            #     ABEventType.LEAD_CREATED,
+            #     {"lead_id": lead.id, "trigger": trigger},
+            #     within_hours=72,
+            # )
 
             return lead
             

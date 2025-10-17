@@ -93,6 +93,28 @@ class Settings:
         self.judge_model: str = os.getenv("JUDGE_MODEL", self.llm_model)
         self.judge_max_candidates: int = int(os.getenv("JUDGE_MAX_CANDIDATES", "3"))
 
+        # Sales script settings
+        self.sales_script_enabled: bool = os.getenv("SALES_SCRIPT_ENABLED", "true").lower() == "true"
+        self.sales_script_prompt_path: str = os.getenv(
+            "SALES_SCRIPT_PROMPT_PATH",
+            "/home/botseller/sell/prompts/sell-skript.txt",
+        )
+        self.sales_script_model: str = os.getenv("SALES_SCRIPT_MODEL", "gpt-4o-mini")
+        self.sales_script_temperature: float = float(os.getenv("SALES_SCRIPT_TEMPERATURE", "0.3"))
+        self.sales_script_max_tokens: int = int(os.getenv("SALES_SCRIPT_MAX_TOKENS", "3000"))
+        self.sales_script_send_to_manager_on_assign: bool = (
+            os.getenv("SALES_SCRIPT_SEND_TO_MANAGER_ON_ASSIGN", "true").lower() == "true"
+        )
+        self.sales_script_thread_post_on_click: bool = (
+            os.getenv("SALES_SCRIPT_THREAD_POST_ON_CLICK", "true").lower() == "true"
+        )
+        self.sales_script_regen_on_lead_update: bool = (
+            os.getenv("SALES_SCRIPT_REGEN_ON_LEAD_UPDATE", "true").lower() == "true"
+        )
+        self.sales_script_split_long_messages: bool = (
+            os.getenv("SALES_SCRIPT_SPLIT_LONG_MESSAGES", "true").lower() == "true"
+        )
+
         # Re-ask functionality
         self.reask_enabled: bool = os.getenv("REASK_ENABLED", "true").lower() == "true"
         self.reask_first_cooldown_min: int = int(os.getenv("REASK_FIRST_COOLDOWN_MIN", "4"))

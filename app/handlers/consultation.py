@@ -22,6 +22,8 @@ from app.services.consultation_service import ConsultationService
 from app.services.event_service import EventService
 from app.services.manager_notification_service import ManagerNotificationService
 from app.services.lead_service import LeadService
+from app.services.sales_script_service import SalesScriptService
+from app.config import settings
 from app.utils.callbacks import Callbacks
 
 
@@ -133,6 +135,14 @@ async def handle_time_choice(callback: CallbackQuery, state: FSMContext, session
 
     selected_time = time.fromisoformat(choice)
     user_data = await state.get_data()
+    
+    if "selected_date" not in user_data:
+        await callback.message.edit_text(
+            "Похоже, произошла ошибка, и я не смог найти выбранную вами дату. Давайте попробуем еще раз."
+        )
+        await start_consultation_booking(callback.message, state, user, session)
+        return
+        
     selected_date = date.fromisoformat(user_data["selected_date"])
 
     await state.update_data(
@@ -247,8 +257,23 @@ async def handle_phone_contact(
     """Handles receiving the user's phone number."""
     user.phone = message.contact.phone_number
     await user_service.set_user_contact_info(user, phone=user.phone)
+    if settings.sales_script_enabled:
+        try:
+            script_service = SalesScriptService(session, bot)
+            await script_service.refresh_for_user(
+                user,
+                reason="consultation_phone",
+                bot=bot,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "sales_script_refresh_failed",
+                user_id=user.id,
+                reason="consultation_phone",
+                error=str(exc),
+            )
     await session.commit()
-    
+
     lead_service = LeadService(session)
     await lead_service.start_incomplete_lead_timer(user, "consultation_phone_sent")
 
@@ -281,6 +306,7 @@ async def create_appointment(
 ):
     """Creates the appointment and notifies the user and managers."""
     user_data = await state.get_data()
+    is_reschedule = bool(user_data.get("reschedule_from"))
     final_date = date.fromisoformat(user_data["final_date"])
     selected_time = time.fromisoformat(user_data["selected_time"])
 
@@ -316,9 +342,18 @@ async def create_appointment(
     # Notify managers
     try:
         manager_notifier = ManagerNotificationService(bot, session)
-        await manager_notifier.notify_new_consultation(appointment)
+        if is_reschedule:
+            await manager_notifier.notify_consultation_rescheduled(appointment)
+        else:
+            await manager_notifier.notify_new_consultation(appointment)
     except Exception as e:
-        logger.error("Failed to notify managers about new consultation", error=e, appointment_id=appointment.id)
+        action = "rescheduled" if is_reschedule else "new"
+        logger.error(
+            "Failed to notify managers about consultation",
+            action=action,
+            error=e,
+            appointment_id=appointment.id,
+        )
 
     await state.clear()
 
@@ -358,7 +393,7 @@ async def handle_reminder_response(
         await consultation_service.cancel_appointment(appointment)
         await callback.message.edit_text("Чтобы перенести консультацию, давайте выберем новую дату.")
         await start_consultation_booking(callback.message, state, user, session)
-        await manager_notifier.notify_consultation_rescheduled(appointment)
+        await state.update_data(reschedule_from=appointment.id)
     elif action == "cancel":
         await callback.message.edit_text("Жаль, что у вас не получается. Консультация отменена.")
         await manager_notifier.notify_consultation_cancelled(appointment)

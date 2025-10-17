@@ -115,3 +115,8 @@ class Callbacks:
     ADMIN_BROADCAST = "admin:broadcast"
     ADMIN_STATS = "admin:stats"
     ADMIN_LEADS = "admin:leads"
+
+    # Sales script actions
+    LEAD_SCRIPT_SHOW = "leadscript:show"
+    LEAD_SCRIPT_REFRESH = "leadscript:refresh"
+    LEAD_SCRIPT_COPY = "leadscript:copy"

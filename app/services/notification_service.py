@@ -2,23 +2,26 @@
 
 import logging
 from datetime import datetime
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..models import Lead, User, LeadStatus
+from ..utils.callbacks import Callbacks
+from .sales_script_service import SalesScriptService
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationService:
     """Service for sending notifications to users and managers."""
-    
+
     def __init__(self):
         self.bot = Bot(token=settings.telegram_bot_token)
-    
+
     async def send_lead_reminder(self, manager_id: int, leads: List[Tuple]):
         """Send daily lead reminder to manager."""
         try:
@@ -61,7 +64,7 @@ class NotificationService:
                     InlineKeyboardButton(text="✅ Да, буду", callback_data=f"consult_reminder:confirm:{appointment_id}"),
                 ],
                 [
-                    InlineKeyboardButton(text="📅 Перенести", callback_data=f"consult_reminder:reschedule:{appointment_id}"),
+                    InlineKeyboardButton(text="Перенести время", callback_data=f"consult_reminder:reschedule:{appointment_id}"),
                     InlineKeyboardButton(text="❌ Отменить", callback_data=f"consult_reminder:cancel:{appointment_id}"),
                 ]
             ])
@@ -223,20 +226,70 @@ class NotificationService:
         except Exception as e:
             logger.error(f"Error sending payment notification: {e}")
 
-    async def send_incomplete_lead_to_managers(self, lead: Lead, card_text: str):
+    async def send_incomplete_lead_to_managers(
+        self,
+        session: AsyncSession,
+        lead: Lead,
+        user: User,
+        card_text: str,
+    ):
         """Send notification about an incomplete lead to the admin channel."""
-        try:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Взять заявку", callback_data=f"lead:take:{lead.id}")],
-                # Optional buttons can be added here based on user data
-            ])
+        channel_id = settings.incomplete_leads_admin_channel_id
+        if not channel_id:
+            logger.warning("Incomplete leads channel is not configured.")
+            return
 
-            await self.bot.send_message(
-                chat_id=settings.incomplete_leads_admin_channel_id,
+        script_service: Optional[SalesScriptService] = None
+        if settings.sales_script_enabled:
+            script_service = SalesScriptService(session, self.bot)
+            try:
+                await script_service.ensure_script(
+                    lead,
+                    user,
+                    reason="incomplete_lead_card",
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "sales_script_prepare_failed",
+                    lead_id=lead.id,
+                    error=str(exc),
+                )
+
+        keyboard_rows = []
+        if settings.sales_script_enabled:
+            keyboard_rows.append(
+                [InlineKeyboardButton(text="🧾 Скрипт", callback_data=f"{Callbacks.LEAD_SCRIPT_SHOW}:{lead.id}")]
+            )
+        keyboard_rows.append(
+            [InlineKeyboardButton(text="✅ Взять заявку", callback_data=f"lead:take:{lead.id}")]
+        )
+        keyboard_rows.append(
+            [InlineKeyboardButton(text="✉️ Открыть диалог", callback_data=f"manual_dialog:start:{user.id}")]
+        )
+        keyboard_rows.append(
+            [InlineKeyboardButton(text="🔁 Перенести/Отменить", callback_data=f"{Callbacks.CONSULT_RESCHEDULE}:{user.id}")]
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+        try:
+            message = await self.bot.send_message(
+                chat_id=channel_id,
                 text=card_text,
                 reply_markup=keyboard,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
             logger.info("Sent incomplete lead notification to managers", lead_id=lead.id)
-        except Exception as e:
-            logger.error(f"Error sending incomplete lead notification for lead {lead.id}: {e}")
+
+            if script_service and message:
+                await script_service.log_lead_card_posted(
+                    lead.id,
+                    chat_id=channel_id,
+                    message_id=message.message_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "Error sending incomplete lead notification for lead %s: %s",
+                lead.id,
+                exc,
+            )

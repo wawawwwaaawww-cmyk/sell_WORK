@@ -17,6 +17,8 @@ from app.services.llm_service import LLMService, LLMContext
 from app.services.product_matching_service import ProductMatchingService
 from app.services.survey_offer_service import SurveyOfferService
 from app.services.logging_service import ConversationLoggingService
+from app.services.sales_script_service import SalesScriptService
+from app.config import settings
 from app.utils.callbacks import Callbacks, CallbackData
 from app.handlers.scene_dispatcher import try_process_callback
 from app.handlers.consultation import start_consultation_booking
@@ -263,6 +265,22 @@ async def handle_survey_answer(
             answer=answer_code,
             points=0  # Points calculated in service
         )
+
+        if settings.sales_script_enabled:
+            try:
+                script_service = SalesScriptService(session, callback.bot)
+                await script_service.refresh_for_user(
+                    user,
+                    reason=f"survey_answer_{question_code}",
+                    bot=callback.bot,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "sales_script_refresh_failed",
+                    user_id=user.id,
+                    question=question_code,
+                    error=str(exc),
+                )
         
         # Get confirmation text
         confirmation = await survey_service.get_confirmation_text(question_code, answer_code)

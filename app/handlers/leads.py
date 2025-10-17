@@ -1,19 +1,40 @@
 """Lead management handlers."""
 
+from typing import Optional, Tuple
+
 import structlog
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.models import User
+from app.models import Lead, User
 from app.services.lead_service import LeadService
 from app.services.manager_notification_service import ManagerNotificationService
 from app.services.event_service import EventService
 from app.repositories.admin_repository import AdminRepository
+from app.repositories.user_repository import UserRepository
+from app.services.sales_script_service import SalesScriptService
+from app.utils.callbacks import Callbacks
 
 
 router = Router()
 logger = structlog.get_logger()
+
+
+def _parse_lead_id(data: str) -> Optional[int]:
+    try:
+        return int(data.split(":")[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+async def _load_lead_context(session, lead_id: int) -> Tuple[Optional[Lead], Optional[User]]:
+    lead = await session.get(Lead, lead_id)
+    if not lead:
+        return None, None
+    user_repo = UserRepository(session)
+    user = await user_repo.get_by_id(lead.user_id)
+    return lead, user
 
 
 @router.callback_query(F.data.startswith("manager:request"))
@@ -92,6 +113,164 @@ async def handle_manager_request(callback: CallbackQuery, user: User, **kwargs):
         await callback.answer("Произошла ошибка при отправке запроса")
 
 
+@router.callback_query(F.data.startswith(f"{Callbacks.LEAD_SCRIPT_SHOW}:"))
+async def handle_lead_script_show(callback: CallbackQuery, **kwargs):
+    """Handle script reveal button from lead card."""
+    session = kwargs.get("session")
+    lead_id = _parse_lead_id(callback.data)
+    if not lead_id:
+        await callback.answer("Некорректный ID лида", show_alert=True)
+        return
+
+    lead, user = await _load_lead_context(session, lead_id)
+    if not lead or not user:
+        await callback.answer("Лид не найден", show_alert=True)
+        return
+
+    if callback.message is None:
+        await callback.answer("Сообщение недоступно", show_alert=True)
+        return
+
+    script_service = SalesScriptService(session, callback.bot)
+    bot = callback.bot
+    try:
+        result = await script_service.ensure_script(
+            lead,
+            user,
+            reason="button_show",
+            actor_id=callback.from_user.id,
+        )
+        sent = await script_service.post_script_to_thread(
+            lead,
+            result,
+            chat_id=callback.message.chat.id,
+            reply_to_message_id=callback.message.message_id,
+            manager_id=callback.from_user.id,
+            auto_update=False,
+        )
+        if sent is None:
+            await bot.send_message(
+                chat_id=callback.message.chat.id,
+                text="⚠️ Не удалось опубликовать скрипт (вероятно, сообщение устарело). Попробуйте ещё раз.",
+            )
+            await callback.answer("Скрипт временно недоступен", show_alert=True)
+        else:
+            await callback.answer("Скрипт опубликован в треде")
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "lead_script_show_failed",
+            lead_id=lead_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        await callback.answer("Скрипт временно недоступен", show_alert=True)
+        await bot.send_message(
+            chat_id=callback.message.chat.id,
+            text="⚠️ Скрипт временно недоступен. Попробуйте обновить позже.",
+        )
+
+
+@router.callback_query(F.data.startswith(f"{Callbacks.LEAD_SCRIPT_REFRESH}:"))
+async def handle_lead_script_refresh(callback: CallbackQuery, **kwargs):
+    """Force regeneration of the sales script."""
+    session = kwargs.get("session")
+    lead_id = _parse_lead_id(callback.data)
+    if not lead_id:
+        await callback.answer("Некорректный ID лида", show_alert=True)
+        return
+
+    lead, user = await _load_lead_context(session, lead_id)
+    if not lead or not user:
+        await callback.answer("Лид не найден", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Сообщение недоступно", show_alert=True)
+        return
+
+    script_service = SalesScriptService(session, callback.bot)
+    bot = callback.bot
+    try:
+        result = await script_service.ensure_script(
+            lead,
+            user,
+            force=True,
+            reason="manual_refresh",
+            actor_id=callback.from_user.id,
+        )
+        sent = await script_service.post_script_to_thread(
+            lead,
+            result,
+            chat_id=callback.message.chat.id,
+            reply_to_message_id=callback.message.message_id,
+            manager_id=callback.from_user.id,
+            auto_update=False,
+        )
+        if sent is None:
+            await bot.send_message(
+                chat_id=callback.message.chat.id,
+                text="⚠️ Не удалось обновить скрипт (сообщение устарело). Откройте карточку заново.",
+            )
+            await callback.answer("Скрипт временно недоступен", show_alert=True)
+        else:
+            await callback.answer("Скрипт обновлён")
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "lead_script_refresh_failed",
+            lead_id=lead_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        await callback.answer("Не удалось обновить скрипт", show_alert=True)
+
+
+@router.callback_query(F.data.startswith(f"{Callbacks.LEAD_SCRIPT_COPY}:"))
+async def handle_lead_script_copy(callback: CallbackQuery, **kwargs):
+    """Send script copy to manager's direct messages."""
+    session = kwargs.get("session")
+    lead_id = _parse_lead_id(callback.data)
+    if not lead_id:
+        await callback.answer("Некорректный ID лида", show_alert=True)
+        return
+
+    lead, user = await _load_lead_context(session, lead_id)
+    if not lead or not user:
+        await callback.answer("Лид не найден", show_alert=True)
+        return
+
+    script_service = SalesScriptService(session, callback.bot)
+    try:
+        result = await script_service.ensure_script(
+            lead,
+            user,
+            reason="manual_copy",
+            actor_id=callback.from_user.id,
+        )
+        await script_service.send_script_to_manager(
+            lead,
+            user,
+            result,
+            manager_telegram_id=callback.from_user.id,
+        )
+        await callback.answer("Скрипт отправлен в личные сообщения")
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "lead_script_copy_failed",
+            lead_id=lead_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        await callback.answer("Не удалось отправить скрипт", show_alert=True)
+
+
+@router.callback_query(F.data.startswith(f"{Callbacks.CONSULT_RESCHEDULE}:"))
+async def handle_lead_reschedule_request(callback: CallbackQuery, **kwargs):
+    """Provide quick hint for rescheduling from manager channel."""
+    await callback.answer(
+        "Для переноса договоритесь с клиентом и отметьте результат в CRM.",
+        show_alert=True,
+    )
+
+
 @router.callback_query(F.data.startswith("lead:take:"))
 async def handle_lead_take(callback: CallbackQuery, **kwargs):
     """Handle lead taking by manager."""
@@ -112,7 +291,6 @@ async def handle_lead_take(callback: CallbackQuery, **kwargs):
             lead = await lead_service.repository.get_lead_by_id(lead_id)
             user = None
             if lead:
-                from app.repositories.user_repository import UserRepository
                 user_repo = UserRepository(session)
                 user = await user_repo.get_by_id(lead.user_id)
 
