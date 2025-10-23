@@ -8,17 +8,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.config import settings
-from app.handlers.scene_dispatcher import send_scene_response
 from app.models import User
-from app.scenes.scene_manager import SceneManager
 from app.services.llm_service import LLMService
 from app.services.logging_service import ConversationLoggingService
-from app.services.script_service import ScriptService
+from app.services.manual_dialog_service import ManualDialogService
+# from app.services.script_service import ScriptService
 from app.services.stt_service import SttService
+from app.safety.validator import SafetyValidator
  
 router = Router()
 logger = structlog.get_logger()
 stt_service = SttService()
+safety_validator = SafetyValidator()
  
  
 async def _try_answer_from_script(
@@ -66,13 +67,14 @@ async def _process_text_payload(
     **kwargs: Dict[str, Any],
 ) -> None:
     """Process the text payload from any source (text, voice)."""
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     session = kwargs.get("session")
     if not session:
         logger.warning("process_text_missing_session", user_id=user.id)
         return
 
-    if await _try_answer_from_script(message, text_payload, user, session):
-        return
+    # if await _try_answer_from_script(message, text_payload, user, session):
+    #     return
 
     conversation_logger = ConversationLoggingService(session)
     await conversation_logger.log_user_message(
@@ -85,79 +87,93 @@ async def _process_text_payload(
         source_message=message,
     )
 
-    manager = SceneManager(session)
+    llm_service = LLMService(session=session)
+    response_text = await llm_service.get_response(text_payload, user.id)
+    
+    sanitized_text, _ = safety_validator.validate_response(response_text)
 
-    try:
-        response = await manager.process_user_message(user, text_payload)
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error(
-            "scene_processing_failed",
-            error=str(exc),
+    if sanitized_text:
+        sent_message = await message.answer(sanitized_text)
+        await conversation_logger.log_bot_message(
             user_id=user.id,
-            exc_info=True,
+            text=sanitized_text,
+            metadata={"source": "llm_dialog"},
+            bot=message.bot,
+            user=user,
+            telegram_user=message.from_user,
+            sent_message=sent_message,
         )
-        await message.answer("Пока не могу ответить, но уже подключаю менеджера. Напишите вопрос ещё раз чуть позже 🙏")
-        return
-
-    await send_scene_response(
-        message,
-        response,
-        session=session,
-        user=user,
-        default_event="user_message",
-        default_payload={"source": "text_input"},
-    )
 
     logger.info(
-        "text_message_processed",
+        "text_message_processed_by_llm",
         user_id=user.id,
-        scene=response.log_event.get("scene") if response.log_event else None,
-        escalate=response.escalate,
     )
 
 
 @router.message(F.text)
-async def handle_user_text_message(
+async def handle_text_message(
     message: Message,
     state: FSMContext,
     user: Optional[User] = None,
     **kwargs: Dict[str, Any],
 ) -> None:
-    """Handle arbitrary text messages and forward them to the scene manager."""
+    """Handle arbitrary text messages and forward them to the LLM."""
+    session = kwargs.get("session")
+    if not session or not user:
+        logger.warning("Text message handler missing session or user.", user_id=getattr(user, "id", None))
+        return
+
+    manual_dialog_service = ManualDialogService(session)
+    if await manual_dialog_service.is_manual_dialog_active(user.id):
+        logger.info("Manual dialog is active, skipping LLM handler.", user_id=user.id)
+        return
 
     if message.text is None:
-        logger.debug("text_message_empty", chat_id=message.chat.id if message.chat else None)
         return
 
     text_payload = message.text.strip()
-    if not text_payload:
-        logger.debug("text_message_whitespace", chat_id=message.chat.id if message.chat else None)
+    if not text_payload or text_payload.startswith("/"):
         return
 
-    if text_payload.startswith("/"):
-        logger.debug("text_message_command_like", command=text_payload, chat_id=message.chat.id if message.chat else None)
-        return
-
-    if state:
-        current_state = await state.get_state()
-        if current_state:
-            logger.info(
-                "text_message_skipped_due_to_state",
-                state=current_state,
-                user_id=getattr(user, "id", None),
-            )
-            return
-
-    if not user:
-        logger.warning(
-            "text_message_missing_user",
-            chat_id=message.chat.id if message.chat else None,
+    current_state = await state.get_state()
+    if current_state:
+        logger.info(
+            "Text message skipped due to active FSM state.",
+            state=current_state,
+            user_id=user.id,
         )
         return
- 
-    await _process_text_payload(message, text_payload, user, **kwargs)
- 
- 
+    
+    logging_service = ConversationLoggingService(session)
+    await logging_service.log_user_message(
+        user_id=user.id,
+        text=message.text,
+        metadata={"source": "llm_dialog_input"},
+        bot=message.bot,
+        user=user,
+        telegram_user=message.from_user,
+        source_message=message,
+    )
+
+    llm_service = LLMService(session=session)
+    response_text = await llm_service.get_response(message.text, user.id)
+
+    # The validation is now inside get_response, but we can double-check here if needed.
+    # For now, we trust the service layer.
+    
+    if response_text:
+        sent_message = await message.answer(response_text)
+        await logging_service.log_bot_message(
+            user_id=user.id,
+            text=response_text,
+            metadata={"source": "llm_dialog_output"},
+            bot=message.bot,
+            user=user,
+            telegram_user=message.from_user,
+            sent_message=sent_message,
+        )
+
+
 @router.message(F.voice)
 async def handle_user_voice_message(
     message: Message,
