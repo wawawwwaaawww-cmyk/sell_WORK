@@ -21,7 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Lead, LeadEvent, LeadStatus, Message, MessageRole, User
 from app.services.product_matching_service import ProductMatchingService
-from app.services.survey_service import SurveyService
 
 
 SCRIPT_HEADER_TEMPLATE = (
@@ -331,23 +330,7 @@ class SalesScriptService:
         )
 
     async def _build_fact_bundle(self, lead: Lead, user: User) -> Dict[str, Any]:
-        survey_service = SurveyService(self.session)
-        survey_answers = await survey_service.repository.get_user_answers(user.id)
-
         survey_pairs: List[Dict[str, str]] = []
-        for answer in survey_answers:
-            question = survey_service.questions.get(answer.question_code)
-            if not question:
-                continue
-            option = question["options"].get(answer.answer_code)
-            if not option:
-                continue
-            survey_pairs.append(
-                {
-                    "q": question["text"].replace("*", "").strip(),
-                    "a": option["text"].strip(),
-                }
-            )
 
         product_data: Dict[str, Any] = {
             "name": "не указано",

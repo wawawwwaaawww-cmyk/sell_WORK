@@ -14,6 +14,8 @@ from app.services.event_service import EventService
 from app.repositories.admin_repository import AdminRepository
 from app.repositories.user_repository import UserRepository
 from app.services.sales_script_service import SalesScriptService
+from app.models import AdminRole
+from app.services.script_service import ScriptService
 from app.utils.callbacks import Callbacks
 
 
@@ -520,6 +522,55 @@ async def handle_manual_lead_creation(callback: CallbackQuery, **kwargs):
         await callback.answer("❌ Неверный ID пользователя")
     except Exception as e:
         logger.error("Error creating manual lead", error=str(e), exc_info=True)
+
+@router.callback_query(F.data.startswith("lead:script:"))
+async def handle_lead_script_send(callback: CallbackQuery, user: User, **kwargs):
+    """Send sales script to the manager's private messages."""
+    session = kwargs.get("session")
+    lead_id = _parse_lead_id(callback.data)
+    if not lead_id:
+        await callback.answer("Некорректный ID лида", show_alert=True)
+        return
+
+    admin_repo = AdminRepository(session)
+    admin = await admin_repo.get_by_telegram_id(callback.from_user.id)
+    if not admin or admin.role not in [AdminRole.MANAGER, AdminRole.ADMIN, AdminRole.OWNER]:
+        await callback.answer("У вас нет прав.", show_alert=True)
+        return
+
+    lead, lead_user = await _load_lead_context(session, lead_id)
+    if not lead or not lead_user:
+        await callback.answer("Лид не найден", show_alert=True)
+        return
+
+    if not lead.summary:
+        await callback.answer("Для этого лида нет сводки для поиска скрипта.", show_alert=True)
+        return
+
+    script_service = ScriptService(session)
+    try:
+        scripts = await script_service.search_similar_scripts(lead.summary, top_k=1)
+        if not scripts:
+            await callback.bot.send_message(
+                callback.from_user.id,
+                f"Не удалось найти подходящий скрипт для лида #{lead.id}."
+            )
+            await callback.answer("Скрипт не найден.", show_alert=True)
+            return
+
+        script = scripts[0]
+        script_text = f"**Скрипт для лида #{lead.id}**\n\n**Вопрос/ситуация:**\n{script['message']}\n\n**Рекомендуемый ответ:**\n{script['answer']}"
+
+        await callback.bot.send_message(
+            callback.from_user.id,
+            script_text,
+            parse_mode="Markdown"
+        )
+        await callback.answer("Скрипт отправлен вам в личные сообщения.")
+
+    except Exception as e:
+        logger.error("Error sending lead script", error=str(e), lead_id=lead_id, exc_info=True)
+        await callback.answer("Произошла ошибка при получении скрипта.", show_alert=True)
         await callback.answer("❌ Произошла ошибка")
 
 

@@ -34,8 +34,6 @@ UNIQUE_EVENT_TYPES = {
     ABEventType.CLICKED,
     ABEventType.REPLIED,
     ABEventType.LEAD_CREATED,
-    ABEventType.PAYMENT_STARTED,
-    ABEventType.PAYMENT_CONFIRMED,
     ABEventType.UNSUBSCRIBED,
     ABEventType.BLOCKED,
     ABEventType.DELIVERED,

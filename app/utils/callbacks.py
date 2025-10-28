@@ -54,31 +54,6 @@ class Callbacks:
     # Bonus actions
     BONUS_GET = "bonus:get"
     
-    # Survey actions  
-    SURVEY_START = "survey:start"
-    SURVEY_START_FROM_OFFER = "survey:start_offer"
-    SURVEY_OFFER_LATER = "survey:offer_later"
-    SURVEY_OFFER_SNOOZE = "survey:offer_snooze"
-    SURVEY_Q1_BEGINNER = "survey:q1:beginner"
-    SURVEY_Q1_SOME_EXP = "survey:q1:some_exp"
-    SURVEY_Q1_ADVANCED = "survey:q1:advanced"
-    
-    SURVEY_Q2_LEARN = "survey:q2:learn"
-    SURVEY_Q2_INCOME = "survey:q2:income"
-    SURVEY_Q2_RETURNS = "survey:q2:returns"
-    
-    SURVEY_Q3_CONSERVATIVE = "survey:q3:conservative"
-    SURVEY_Q3_MODERATE = "survey:q3:moderate"
-    SURVEY_Q3_AGGRESSIVE = "survey:q3:aggressive"
-    
-    SURVEY_Q4_CASUAL = "survey:q4:casual"
-    SURVEY_Q4_PARTTIME = "survey:q4:parttime"
-    SURVEY_Q4_FULLTIME = "survey:q4:fulltime"
-    
-    SURVEY_Q5_SMALL = "survey:q5:small"
-    SURVEY_Q5_MEDIUM = "survey:q5:medium"
-    SURVEY_Q5_LARGE = "survey:q5:large"
-    
     # Strategy selection
     STRATEGY_SAFETY = "strategy:safety"
     STRATEGY_GROWTH = "strategy:growth"

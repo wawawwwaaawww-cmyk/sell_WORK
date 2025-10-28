@@ -21,7 +21,7 @@ async def _create_user(
         last_name="Tester",
         segment=segment,
         lead_score=lead_score,
-        funnel_stage="consultation",
+        funnel_stage="qualified",
     )
     db_session.add(user)
     await db_session.commit()
@@ -53,6 +53,12 @@ async def test_return_lead_to_queue(db_session):
     lead = await service.create_lead_from_user(user=user, trigger_event="manager_requested", conversation_summary="summary")
     await service.repository.assign_lead_to_manager(lead, manager_id=12345)
 
+    await service.repository.assign_lead_to_manager(lead, manager_id=12345)
+    await db_session.refresh(lead)
+    
+    await service.repository.assign_lead_to_manager(lead, manager_id=12345)
+    await db_session.refresh(lead)
+    
     success, message = await service.return_lead_to_queue(lead.id, 12345)
     await db_session.refresh(lead)
 

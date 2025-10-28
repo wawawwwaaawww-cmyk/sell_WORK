@@ -35,7 +35,7 @@ async def handle_reset_command(message: Message, user: User, **kwargs) -> None:
 
     prompt = (
         "Delete all saved data?\n\n"
-        "I will remove survey answers, conversation history, leads, payments, and other linked records. "
+        "I will remove conversation history, leads, and other linked records. "
         "You can start fresh with /start afterwards."
     )
 

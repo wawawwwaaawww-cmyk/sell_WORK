@@ -31,9 +31,6 @@ class StateResetMiddleware(BaseMiddleware):
         is_callback = isinstance(event, CallbackQuery)
         callback_data = event.data if is_callback else ""
         
-        # Do not reset state for consultation flow callbacks
-        if is_callback and event.data and event.data.startswith("consult_"):
-            return await handler(event, data)
 
         if is_command or is_callback:
             state: FSMContext = data.get("state")

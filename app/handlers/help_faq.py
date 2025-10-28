@@ -6,7 +6,6 @@ from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from typing import Optional
 
-from app.handlers.scene_dispatcher import try_process_command
 from app.models import User
 from app.services.logging_service import ConversationLoggingService
 

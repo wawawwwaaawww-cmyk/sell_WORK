@@ -135,9 +135,9 @@ class MaterialService:
             materials: List[Material] = []
             if funnel_stage in ["new", "welcomed"]:
                 materials = await self.repository.get_materials_for_newbies(limit)
-            elif funnel_stage in ["surveyed", "engaged"] and user_segment == UserSegment.WARM:
+            elif funnel_stage in ["engaged"] and user_segment == UserSegment.WARM:
                 materials = await self.repository.get_materials_for_traders(limit)
-            elif funnel_stage in ["qualified", "consultation"] and user_segment == UserSegment.HOT:
+            elif funnel_stage in ["qualified"] and user_segment == UserSegment.HOT:
                 materials = await self.repository.get_materials_for_investors(limit)
 
             if not materials:

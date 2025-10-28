@@ -7,7 +7,6 @@ import structlog
 from aiogram import BaseMiddleware
 from aiogram.types import Message
 
-from app.services.intent_router_service import IntentRouterService, UserIntent
 from app.services.reask_service import ReaskService
 from app.services.user_service import UserService
 from app.models import UserFunnelState

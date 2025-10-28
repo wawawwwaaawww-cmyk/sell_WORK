@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from ..db import get_db
-from ..models import Product, Payment, PaymentStatus, AdminRole
+from ..models import Product, AdminRole
 from .admin_full import role_required, AdminStates
 
 logger = logging.getLogger(__name__)
@@ -225,74 +225,6 @@ async def product_list_show(callback: CallbackQuery):
         await callback.answer("❌ Ошибка при загрузке продуктов", show_alert=True)
 
 
-@router.callback_query(F.data == "product_stats")
-@role_required(AdminRole.EDITOR)
-async def product_stats_show(callback: CallbackQuery):
-    """Show product sales statistics."""
-    try:
-        async with get_db() as session:
-            # Get total products
-            total_products_result = await session.execute(select(func.count(Product.id)))
-            total_products = total_products_result.scalar()
-            
-            active_products_result = await session.execute(
-                select(func.count(Product.id)).where(Product.is_active == True)
-            )
-            active_products = active_products_result.scalar()
-            
-            # Get sales statistics
-            total_sales_result = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == PaymentStatus.PAID)
-            )
-            total_sales = total_sales_result.scalar()
-            
-            total_revenue_result = await session.execute(
-                select(func.sum(Payment.amount)).where(Payment.status == PaymentStatus.PAID)
-            )
-            total_revenue = total_revenue_result.scalar() or 0
-            
-            # Get top selling products
-            top_products_stmt = select(
-                Product.name,
-                func.count(Payment.id).label('sales_count'),
-                func.sum(Payment.amount).label('revenue')
-            ).join(
-                Payment, Product.id == Payment.product_id
-            ).where(
-                Payment.status == PaymentStatus.PAID
-            ).group_by(
-                Product.id, Product.name
-            ).order_by(
-                func.count(Payment.id).desc()
-            ).limit(5)
-            
-            top_products_result = await session.execute(top_products_stmt)
-            top_products = top_products_result.all()
-            
-            text = "📊 <b>Статистика продаж</b>\n\n"
-            text += f"💰 Всего продуктов: {total_products}\n"
-            text += f"✅ Активных: {active_products}\n"
-            text += f"❌ Неактивных: {total_products - active_products}\n\n"
-            
-            text += f"💵 Всего продаж: {total_sales}\n"
-            text += f"💰 Общая выручка: ${total_revenue:.2f}\n\n"
-            
-            if top_products:
-                text += "<b>🏆 Топ-5 по продажам:</b>\n"
-                for i, (name, sales_count, revenue) in enumerate(top_products, 1):
-                    text += f"{i}. {name}: {sales_count} продаж (${revenue:.2f})\n"
-            else:
-                text += "📝 Продаж пока нет"
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_products")]
-            ])
-            
-            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-            
-    except Exception as e:
-        logger.error(f"Error getting product stats: {e}")
-        await callback.answer("❌ Ошибка при загрузке статистики", show_alert=True)
 
 
 def register_product_handlers(dp):

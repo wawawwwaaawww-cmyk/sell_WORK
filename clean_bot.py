@@ -54,7 +54,6 @@ async def start_handler(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Пройти анкету", callback_data="survey_start")],
         [InlineKeyboardButton(text="📚 Получить материалы", callback_data="get_materials")],
-        [InlineKeyboardButton(text="📞 Записаться на консультацию", callback_data="book_consultation")],
         [InlineKeyboardButton(text="💰 Посмотреть курсы", callback_data="view_courses")]
     ])
     
@@ -159,7 +158,6 @@ async def survey_complete(callback: CallbackQuery):
     """Complete survey"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📚 Получить материалы", callback_data="get_materials")],
-        [InlineKeyboardButton(text="📞 Записаться на консультацию", callback_data="book_consultation")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]
     ])
     
@@ -180,7 +178,6 @@ async def survey_complete(callback: CallbackQuery):
 async def get_materials(callback: CallbackQuery):
     """Send materials"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 Записаться на консультацию", callback_data="book_consultation")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]
     ])
     
@@ -200,29 +197,6 @@ async def get_materials(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
-@router.callback_query(lambda c: c.data == "book_consultation")
-async def book_consultation(callback: CallbackQuery):
-    """Book consultation"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🕐 Сегодня 15:00", callback_data="time_today_15")],
-        [InlineKeyboardButton(text="🕕 Сегодня 18:00", callback_data="time_today_18")],
-        [InlineKeyboardButton(text="📅 Завтра 10:00", callback_data="time_tomorrow_10")],
-        [InlineKeyboardButton(text="📅 Завтра 14:00", callback_data="time_tomorrow_14")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
-    ])
-    
-    await callback.message.edit_text(
-        "📞 <b>Запись на бесплатную консультацию</b>\n\n"
-        "🎯 <b>Что вас ждет на консультации:</b>\n"
-        "• Персональный разбор ваших целей\n"
-        "• Составление индивидуального плана обучения\n"
-        "• Ответы на все ваши вопросы\n"
-        "• Рекомендации по первым шагам\n"
-        "• Специальные предложения только для вас\n\n"
-        "⏰ <b>Выберите удобное время:</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
 
 @router.callback_query(lambda c: c.data.startswith("time_"))
 async def time_booked(callback: CallbackQuery):
@@ -320,7 +294,6 @@ async def main_menu(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Пройти анкету", callback_data="survey_start")],
         [InlineKeyboardButton(text="📚 Получить материалы", callback_data="get_materials")],
-        [InlineKeyboardButton(text="📞 Записаться на консультацию", callback_data="book_consultation")],
         [InlineKeyboardButton(text="💰 Посмотреть курсы", callback_data="view_courses")]
     ])
     

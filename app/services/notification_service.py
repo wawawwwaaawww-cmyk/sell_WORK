@@ -49,35 +49,6 @@ class NotificationService:
         except Exception as e:
             logger.error(f"Error sending lead reminder to manager {manager_id}: {e}")
     
-    async def send_consultation_reminder(self, user_id: int, appointment_id: int, consultation_time: datetime):
-        """Send an interactive consultation reminder to the user."""
-        try:
-            time_str = consultation_time.strftime("%d %B в %H:%M МСК")
-            
-            text = (
-                f"👋 Напоминание: ваша консультация начнется через 15 минут - {time_str}.\n\n"
-                "Вы будете на встрече?"
-            )
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Да, буду", callback_data=f"consult_reminder:confirm:{appointment_id}"),
-                ],
-                [
-                    InlineKeyboardButton(text="Перенести время", callback_data=f"consult_reminder:reschedule:{appointment_id}"),
-                    InlineKeyboardButton(text="❌ Отменить", callback_data=f"consult_reminder:cancel:{appointment_id}"),
-                ]
-            ])
-            
-            await self.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error sending interactive consultation reminder to user {user_id}: {e}")
     
     async def send_reengagement_message(self, user_id: int, segment: str):
         """Send re-engagement message to inactive user."""

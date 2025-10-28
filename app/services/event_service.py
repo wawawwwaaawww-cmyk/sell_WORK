@@ -145,49 +145,7 @@ class EventService:
             payload={"button_data": button_data}
         )
     
-    async def log_survey_answer(
-        self,
-        user_id: int,
-        question: str,
-        answer: str,
-        points: int
-    ) -> Event:
-        """Log survey answer event."""
-        return await self.log_event(
-            user_id=user_id,
-            event_type="survey_answer",
-            payload={
-                "question": question,
-                "answer": answer,
-                "points": points
-            }
-        )
     
-    async def log_consultation_booked(
-        self,
-        user_id: int,
-        date: str,
-        time: str
-    ) -> Event:
-        """Log consultation booking event."""
-        return await self.log_event(
-            user_id=user_id,
-            event_type="consultation_booked",
-            payload={
-                "date": date,
-                "time": time
-            }
-        )
-    
-    async def log_consultation_reminder_response(
-        self, user_id: int, appointment_id: int, response: str
-    ) -> Event:
-        """Log user's response to a consultation reminder."""
-        return await self.log_event(
-            user_id=user_id,
-            event_type="consultation_reminder_response",
-            payload={"appointment_id": appointment_id, "response": response},
-        )
 
     async def log_payment_initiated(
         self,
@@ -217,11 +175,8 @@ class EventService:
         score_map = {
             "start_command": 1,
             "bonus_received": 2,
-            "survey_answer": 3,
             "button_click": 1,
             "message_sent": 2,
-            "consultation_booked": 10,
-            "payment_initiated": 15,
         }
         
         total_score = 0

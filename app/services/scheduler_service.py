@@ -19,7 +19,7 @@ from app.services.excel_material_service import excel_material_service
 
 from app.config import settings
 from app.db import get_db
-from app.models import Appointment, Lead, User, ABTest, ABTestStatus, LeadStatus
+from app.models import Lead, User, ABTest, ABTestStatus, LeadStatus
 from app.services.notification_service import NotificationService
 from app.services.ab_testing_service import ABTestingService
 from app.services.sentiment_service import sentiment_service
@@ -91,12 +91,6 @@ class SchedulerService:
                 replace_existing=True,
             )
 
-            self.scheduler.add_job(
-                send_appointment_reminders,
-                IntervalTrigger(minutes=30, timezone=self.timezone),
-                id="appointment_reminders",
-                replace_existing=True,
-            )
 
             self.scheduler.add_job(
                 follow_up_inactive_users,
@@ -218,47 +212,6 @@ class SchedulerService:
         except Exception as exc:
             logger.error("Failed to purge legacy scheduler jobs", exc_info=exc)
 
-    async def schedule_appointment_reminder(
-        self, appointment: Appointment, reminder_time: datetime
-    ):
-        """Schedule an appointment reminder."""
-        appointment_id = appointment.id
-        try:
-            appointment_tz = pytz.timezone(
-                appointment.tz or settings.scheduler_timezone or "UTC"
-            )
-
-            if reminder_time.tzinfo is None:
-                localized_reminder = appointment_tz.localize(reminder_time)
-            else:
-                localized_reminder = reminder_time.astimezone(appointment_tz)
-
-            run_date = localized_reminder.astimezone(self.timezone)
-
-            job = self.scheduler.add_job(
-                send_appointment_reminder,
-                trigger=DateTrigger(run_date=run_date, timezone=self.timezone),
-                args=[appointment_id],
-                id=f"appointment_reminder_{appointment_id}",
-                replace_existing=True,
-            )
-
-            appointment.reminder_job_id = job.id
-
-            logger.info(
-                "Scheduled appointment reminder (appointment_id=%s, run_at=%s, job_id=%s)",
-                appointment_id,
-                run_date,
-                job.id,
-            )
-
-        except Exception as exc:
-            logger.error(
-                "Error scheduling appointment reminder (appointment_id=%s)",
-                appointment_id,
-                exc_info=exc,
-            )
-            raise
 
     async def schedule_lead_followup(self, lead_id: int, followup_time: datetime):
         """Schedule a lead follow-up."""
@@ -642,40 +595,6 @@ async def send_daily_lead_reminders() -> None:
         logger.error("Error sending daily lead reminders", exc_info=exc)
 
 
-async def send_appointment_reminders() -> None:
-    """Send appointment reminders to users."""
-    try:
-        notification_service = get_notification_service()
-        async for db in get_db():
-            now_utc = datetime.now(timezone.utc)
-
-            result = await db.execute(
-                select(Appointment, User.telegram_id)
-                .join(User)
-                .where(Appointment.status == "scheduled")
-            )
-            appointments = result.all()
-
-            for appointment, telegram_id in appointments:
-                appointment_tz = pytz.timezone(
-                    appointment.tz or settings.scheduler_timezone or "UTC"
-                )
-                scheduled_local = appointment_tz.localize(
-                    datetime.combine(appointment.date, appointment.slot)
-                )
-                time_until_hours = (
-                    scheduled_local - now_utc.astimezone(appointment_tz)
-                ).total_seconds() / 3600
-
-                if 0 < time_until_hours <= 2:
-                    await notification_service.send_consultation_reminder(
-                        telegram_id,
-                        scheduled_local,
-                    )
-            break
-
-    except Exception as exc:
-        logger.error("Error sending consultation reminders", exc_info=exc)
 
 
 async def follow_up_inactive_users() -> None:
@@ -709,40 +628,6 @@ async def follow_up_inactive_users() -> None:
         logger.error("Error following up inactive users", exc_info=exc)
 
 
-async def send_appointment_reminder(appointment_id: int) -> None:
-    """Send individual appointment reminder."""
-    try:
-        notification_service = get_notification_service()
-        async for db in get_db():
-            result = await db.execute(
-                select(Appointment, User.telegram_id)
-                .join(User)
-                .where(Appointment.id == appointment_id)
-            )
-            appointment_data = result.first()
-
-            if appointment_data:
-                appointment, telegram_id = appointment_data
-                appointment_tz = pytz.timezone(
-                    appointment.tz or settings.scheduler_timezone or "UTC"
-                )
-                reminder_datetime = appointment_tz.localize(
-                    datetime.combine(appointment.date, appointment.slot)
-                )
-                await notification_service.send_consultation_reminder(
-                    user_id=telegram_id,
-                    appointment_id=appointment.id,
-                    consultation_time=reminder_datetime,
-                )
-                appointment.reminder_job_id = None
-                await db.flush()
-                await db.commit()
-            break
-
-    except Exception as exc:
-        logger.error(
-            "Error sending appointment reminder", appointment_id=appointment_id, exc_info=exc
-        )
 
 
 async def send_lead_followup(lead_id: int) -> None:
@@ -781,7 +666,11 @@ async def send_lead_followup(lead_id: int) -> None:
 async def start_pending_ab_tests():
     """Start A/B tests that are scheduled to run."""
     from app.bot import bot
-    lock = redis_service.get_client().lock("scheduler:start_pending_ab_tests", timeout=60)
+    redis_client = redis_service.get_client()
+    if not redis_client:
+        logger.warning("Cannot run start_pending_ab_tests, Redis is not available.")
+        return
+    lock = redis_client.lock("scheduler:start_pending_ab_tests", timeout=60)
     if not await lock.acquire(blocking=False):
         logger.info("Could not acquire lock for start_pending_ab_tests")
         return
@@ -805,7 +694,11 @@ async def start_pending_ab_tests():
 
 async def select_ab_test_winners():
     """Select winners for A/B tests in observation."""
-    lock = redis_service.get_client().lock("scheduler:select_ab_test_winners", timeout=300)
+    redis_client = redis_service.get_client()
+    if not redis_client:
+        logger.warning("Cannot run select_ab_test_winners, Redis is not available.")
+        return
+    lock = redis_client.lock("scheduler:select_ab_test_winners", timeout=300)
     if not await lock.acquire(blocking=False):
         logger.info("Could not acquire lock for select_ab_test_winners")
         return
@@ -826,7 +719,11 @@ async def select_ab_test_winners():
 async def drip_ab_test_winners():
     """Drip winning variants to the rest of the audience."""
     from app.bot import bot
-    lock = redis_service.get_client().lock("scheduler:drip_ab_test_winners", timeout=600)
+    redis_client = redis_service.get_client()
+    if not redis_client:
+        logger.warning("Cannot run drip_ab_test_winners, Redis is not available.")
+        return
+    lock = redis_client.lock("scheduler:drip_ab_test_winners", timeout=600)
     if not await lock.acquire(blocking=False):
         logger.info("Could not acquire lock for drip_ab_test_winners")
         return

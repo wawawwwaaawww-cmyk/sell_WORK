@@ -140,8 +140,6 @@ async def admin_panel(message: Message):
             buttons.append([InlineKeyboardButton(text="👤 Пользователи", callback_data="admin_users")])
         
         # Payment management (admins and above)
-        if capabilities.get("can_manage_payments"):
-            buttons.append([InlineKeyboardButton(text="💳 Платежи", callback_data="admin_payments")])
         
         # Admin management (owners only)
         if capabilities.get("can_manage_admins"):
@@ -194,18 +192,9 @@ async def show_analytics(callback: CallbackQuery, **kwargs):
             hot_users = hot_users_result.scalar()
             
             # Payments stats
-            total_payments_result = await session.execute(select(func.count(Payment.id)))
-            total_payments = total_payments_result.scalar()
-            
-            successful_payments_result = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == "paid")
-            )
-            successful_payments = successful_payments_result.scalar()
-            
-            total_revenue_result = await session.execute(
-                select(func.sum(Payment.amount)).where(Payment.status == "paid")
-            )
-            total_revenue = total_revenue_result.scalar() or 0
+            total_payments = 0
+            successful_payments = 0
+            total_revenue = 0
             break
             
             stats_text = f"""📊 <b>Аналитика системы</b>
@@ -219,11 +208,7 @@ async def show_analytics(callback: CallbackQuery, **kwargs):
 • 🔥 Тёплые: {warm_users}
 • 🌶️ Горячие: {hot_users}
 
-💳 <b>Платежи:</b>
-• Всего: {total_payments}
-• Успешные: {successful_payments}
-• Конверсия: {(successful_payments/max(total_payments,1)*100):.1f}%
-• Выручка: {total_revenue:,.0f} ₽"""
+"""
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_analytics")],
