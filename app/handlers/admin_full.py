@@ -33,7 +33,6 @@ from sqlalchemy.orm import selectinload
 from ..db import get_db
 from ..models import (
     User,
-    Payment,
     AdminRole,
     UserSegment,
     Product,
@@ -64,7 +63,6 @@ from ..services.analytics_formatter import (
 from ..services.bonus_content_manager import BonusContentManager
 from ..services.scheduler_service import scheduler_service
 from ..services.sentiment_service import sentiment_service
-from ..services.survey_service import SurveyService
 from ..services.product_matching_service import ProductMatchingService
 from ..services.sendto_service import SendToService
 from ..services.followup_service import FollowupService
@@ -78,10 +76,6 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 class AdminStates(StatesGroup):
     """Admin FSM states."""
-    # Consultation settings
-    waiting_for_consultation_slots = State()
-    waiting_for_cutoff_time = State()
-    waiting_for_reminder_offset = State()
 
     # Broadcast states
     waiting_for_broadcast_content = State()
@@ -119,7 +113,6 @@ class AdminStates(StatesGroup):
     waiting_for_product_edit_short_desc = State()
     waiting_for_product_edit_value_props = State()
     waiting_for_product_edit_landing = State()
-    waiting_for_product_criteria = State()
     waiting_for_product_criteria_check_user = State()
 
     # Bonus management states
@@ -771,38 +764,6 @@ def _normalize_markdown(text: str) -> str:
     return cleaned.strip()
 
 
-def _build_survey_catalog(survey_service) -> Dict[int, Dict[str, Any]]:
-    """Return catalog of survey questions with answer indices."""
-    catalog: Dict[int, Dict[str, Any]] = {}
-    for idx, (code, question) in enumerate(survey_service.questions.items(), start=1):
-        answers = []
-        for answer_idx, (answer_code, option) in enumerate(question.get("options", {}).items(), start=1):
-            answers.append(
-                {
-                    "id": answer_idx,
-                    "question_code": code,
-                    "code": answer_code,
-                    "text": _normalize_markdown(option.get("text", "")),
-                }
-            )
-        catalog[idx] = {
-            "code": code,
-            "text": _normalize_markdown(question.get("text", "")),
-            "answers": answers,
-        }
-    return catalog
-
-
-def _format_survey_reference(catalog: Dict[int, Dict[str, Any]]) -> str:
-    """Format survey catalog for admin display."""
-    lines: list[str] = []
-    for q_idx in sorted(catalog):
-        entry = catalog[q_idx]
-        lines.append(f"Q{q_idx}. {entry['text']}")
-        for answer in entry["answers"]:
-            lines.append(f"  {answer['id']}) {answer['text']} ({answer['code']})")
-        lines.append("")
-    return "\n".join(lines).strip()
 
 
 _CRITERIA_ENTRY_SPLIT = re.compile(r"[;\n]+")
@@ -811,101 +772,6 @@ _GROUP_WEIGHT = re.compile(r"\(\s*(?:вес|weight|w)\s*=?\s*(?P<weight>[-+]?\d+
 _INLINE_NOTE = re.compile(r"(?:note|коммент|причина)\s*[:=]\s*(?P<note>.+)", re.IGNORECASE)
 
 
-def _parse_criteria_input(raw: str, catalog: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Parse admin input into structured criteria."""
-    entries: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    segments = [segment.strip() for segment in _CRITERIA_ENTRY_SPLIT.split(raw or "") if segment.strip()]
-    if not segments:
-        raise ValueError("Не найдено ни одного критерия. Используйте формат 'Q1: 2,4'.")
-
-    for segment in segments:
-        match = _QUESTION_HEADER.match(segment)
-        if not match:
-            errors.append(f"Не могу распознать строку: {segment}")
-            continue
-
-        question_id = int(match.group("question"))
-        body = match.group("body").strip()
-        catalog_entry = catalog.get(question_id)
-        if not catalog_entry:
-            errors.append(f"Вопрос Q{question_id} не найден в анкете.")
-            continue
-
-        group_weight: Optional[int] = None
-        # Extract group-level weight if present
-        group_match = _GROUP_WEIGHT.search(body)
-        if group_match:
-            group_weight = int(group_match.group("weight"))
-            body = _GROUP_WEIGHT.sub("", body).strip()
-
-        tokens = [token.strip() for token in body.split(",") if token.strip()]
-        if not tokens:
-            errors.append(f"Для Q{question_id} не указаны ответы.")
-            continue
-
-        for token in tokens:
-            answer_weight = group_weight if group_weight is not None else 1
-            note: Optional[str] = None
-            inner = None
-
-            # Extract inline data in parentheses
-            if "(" in token and token.endswith(")"):
-                token_body, inner_body = token.split("(", 1)
-                inner = inner_body[:-1]  # drop closing )
-                token = token_body.strip()
-            elif "[" in token and token.endswith("]"):
-                token_body, inner_body = token.split("[", 1)
-                inner = inner_body[:-1]
-                token = token_body.strip()
-
-            if not token.isdigit():
-                errors.append(f"Ответ '{token}' должен быть числом. См. Q{question_id}.")
-                continue
-
-            answer_id = int(token)
-            answers = catalog_entry["answers"]
-            if answer_id < 1 or answer_id > len(answers):
-                errors.append(f"Ответ {answer_id} отсутствует в Q{question_id}.")
-                continue
-
-            if inner:
-                parts = [part.strip() for part in re.split(r"[|;]", inner) if part.strip()]
-                for part in parts:
-                    if _GROUP_WEIGHT.match(f"(вес {part})"):
-                        answer_weight = int(part)
-                        continue
-                    if re.fullmatch(r"[-+]?\d+", part):
-                        answer_weight = int(part)
-                        continue
-                    inline_note = _INLINE_NOTE.search(part)
-                    if inline_note:
-                        note = inline_note.group("note")
-                        continue
-                    if part.lower().startswith("вес"):
-                        digits = re.findall(r"[-+]?\d+", part)
-                        if digits:
-                            answer_weight = int(digits[0])
-                        continue
-                    note = part.strip("\"' ")
-
-            answer_entry = answers[answer_id - 1]
-            entries.append(
-                {
-                    "question_id": question_id,
-                    "question_code": answer_entry.get("question_code") or catalog_entry["code"],
-                    "answer_id": answer_id,
-                    "answer_code": answer_entry["code"],
-                    "weight": answer_weight,
-                    "note": note,
-                }
-            )
-
-    if errors:
-        raise ValueError("\n".join(errors))
-
-    return entries
 
 
 def _format_criteria_table(criteria: List) -> str:
@@ -1020,7 +886,6 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton(text="🔗 Лендинг", callback_data=f"product_edit_landing:{product.id}"),
     )
     builder.row(
-        InlineKeyboardButton(text="🧠 Настроить критерии", callback_data=f"product_criteria:{product.id}"),
         InlineKeyboardButton(text="🖼️ Медиа", callback_data=f"product_edit_media:{product.id}"),
     )
     builder.row(
@@ -1063,8 +928,6 @@ async def admin_panel(message: Message):
         buttons.append([InlineKeyboardButton(text="👤 Пользователи", callback_data="admin_users")])
 
     # Payment management (admins and above)
-    if capabilities.get("can_manage_payments"):
-        buttons.append([InlineKeyboardButton(text="💳 Платежи", callback_data="admin_payments")])
 
     # Product management (admins and above)
     if capabilities.get("can_manage_products"):
@@ -1078,7 +941,6 @@ async def admin_panel(message: Message):
         buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
 
     buttons.append([InlineKeyboardButton(text="⚙️ Системные настройки", callback_data="admin_settings")])
-    buttons.append([InlineKeyboardButton(text="📅 Настройки консультаций", callback_data="admin_consult_settings")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
@@ -2490,144 +2352,6 @@ async def product_edit_landing_commit(message: Message, state: FSMContext):
     await state.clear()
 
 
-@router.callback_query(F.data.startswith("product_criteria:"))
-@role_required(AdminRole.ADMIN)
-async def product_criteria_menu(callback: CallbackQuery, state: FSMContext):
-    """Show current product criteria and instructions."""
-    product_id = int(callback.data.split(":", 1)[1])
-    try:
-        async for session in get_db():
-            product = await _get_product_by_id(session, product_id)
-            if not product:
-                await callback.answer("Продукт не найден", show_alert=True)
-                return
-
-            survey_service = SurveyService(session)
-            catalog = _build_survey_catalog(survey_service)
-            reference_text = _format_survey_reference(catalog)
-            current_rules = _format_criteria_table(product.criteria or [])
-
-            keyboard = InlineKeyboardBuilder()
-            keyboard.row(
-                InlineKeyboardButton(
-                    text="✏️ Редактировать",
-                    callback_data=f"product_criteria_edit:{product.id}",
-                )
-            )
-            keyboard.row(
-                InlineKeyboardButton(
-                    text="⬅️ К продукту",
-                    callback_data=f"product_detail:{product.id}",
-                )
-            )
-
-            message_text = (
-                f"🧠 <b>{escape(product.name)}</b> — критерии анкеты\n\n"
-                f"<b>Текущие правила:</b>\n<pre>{escape(current_rules)}</pre>\n"
-                "<b>Формат:</b>\n"
-                "Q1: 2,4\n"
-                "Q3: 3(-1) // отрицательный ответ\n\n"
-                "<b>Расшифровка вопросов:</b>\n"
-                f"<pre>{escape(reference_text)}</pre>"
-            )
-
-            await callback.message.answer(message_text, parse_mode="HTML", reply_markup=keyboard.as_markup())
-            break
-    except Exception as exc:
-        logger.exception("Error viewing product criteria", exc_info=exc)
-        await callback.answer("❌ Ошибка загрузки критериев", show_alert=True)
-        return
-
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("product_criteria_edit:"))
-@role_required(AdminRole.ADMIN)
-async def product_criteria_edit(callback: CallbackQuery, state: FSMContext):
-    """Prompt admin to send new criteria definition."""
-    product_id = int(callback.data.split(":", 1)[1])
-    await state.update_data(
-        product_edit_id=product_id,
-        product_detail_message_id=callback.message.message_id,
-        product_detail_chat_id=callback.message.chat.id,
-    )
-    await state.set_state(AdminStates.waiting_for_product_criteria)
-    await callback.message.answer(
-        "Отправьте критерии в формате:\n"
-        "Q1: 2,4\n"
-        "Q3: 3(-1)\n\n"
-        "Используйте запятую для нескольких ответов, (-1) для отрицательного веса.\n"
-        "Можно добавить комментарий: Q2: 1(-1|note=слишком мало)\n\n"
-        "Чтобы очистить все правила, отправьте '-'.",
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_for_product_criteria)
-@role_required(AdminRole.ADMIN)
-async def product_criteria_commit(message: Message, state: FSMContext):
-    """Persist new criteria set."""
-    data = await state.get_data()
-    product_id = data.get("product_edit_id")
-    payload = (message.text or "").strip()
-
-    try:
-        async for session in get_db():
-            product = await _get_product_by_id(session, product_id)
-            if not product:
-                await message.answer("❌ Продукт не найден")
-                await state.clear()
-                return
-
-            survey_service = SurveyService(session)
-            catalog = _build_survey_catalog(survey_service)
-
-            if payload in {"", "-"}:
-                repo = ProductCriteriaRepository(session)
-                await repo.delete_for_product(product.id)
-                await session.commit()
-                updated = await _get_product_by_id(session, product.id)
-                text, markup = _build_product_detail(updated)
-                await message.bot.edit_message_text(
-                    text,
-                    chat_id=data.get("product_detail_chat_id"),
-                    message_id=data.get("product_detail_message_id"),
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                )
-                await message.answer("✅ Критерии очищены")
-                break
-
-            try:
-                parsed_entries = _parse_criteria_input(payload, catalog)
-            except ValueError as parse_error:
-                await message.answer(f"❌ Ошибка разбора:\n{parse_error}")
-                return
-
-            repo = ProductCriteriaRepository(session)
-            await repo.replace_for_product(product.id, parsed_entries)
-            await session.commit()
-
-            updated = await _get_product_by_id(session, product.id)
-            text, markup = _build_product_detail(updated)
-            await message.bot.edit_message_text(
-                text,
-                chat_id=data.get("product_detail_chat_id"),
-                message_id=data.get("product_detail_message_id"),
-                reply_markup=markup,
-                parse_mode="HTML",
-            )
-            await message.answer(
-                "✅ Критерии сохранены\n\n"
-                f"<pre>{escape(_format_criteria_table(updated.criteria))}</pre>",
-                parse_mode="HTML",
-            )
-            break
-    except Exception as exc:
-        logger.exception("Error updating product criteria", exc_info=exc)
-        await message.answer("❌ Не удалось сохранить критерии.")
-
-    await state.clear()
 
 
 @router.callback_query(F.data.startswith("product_match_check:"))
@@ -3973,143 +3697,6 @@ async def users_recent(callback: CallbackQuery):
         await callback.answer("❌ Ошибка при загрузке", show_alert=True)
 
 
-# Payment Management
-@router.callback_query(F.data == "admin_payments")
-@role_required(AdminRole.ADMIN)
-async def payments_management(callback: CallbackQuery):
-    """Payment management menu."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Последние платежи", callback_data="payments_recent")],
-        [InlineKeyboardButton(text="📊 Статистика платежей", callback_data="payments_stats")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
-    ])
-    
-    await callback.message.edit_text(
-        "💳 <b>Управление платежами</b>\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-
-@router.callback_query(F.data == "payments_recent")
-@role_required(AdminRole.ADMIN)
-async def payments_recent(callback: CallbackQuery):
-    """Show recent payments."""
-    try:
-        async for session in get_db():
-            stmt = select(Payment, User.first_name, User.last_name, User.username).join(
-                User, Payment.user_id == User.id
-            ).order_by(Payment.created_at.desc()).limit(10)
-            
-            result = await session.execute(stmt)
-            payments_data = result.all()
-            break
-        
-        if not payments_data:
-            text = "💰 <b>Последние платежи</b>\n\n📭 Нет платежей."
-        else:
-            text = "💰 <b>Последние платежи</b>\n\n"
-            
-            for i, (payment, first_name, last_name, username) in enumerate(payments_data, 1):
-                name = f"{first_name or ''} {last_name or ''}" or f"@{username}" or f"ID {payment.user_id}"
-                created = payment.created_at.strftime('%d.%m %H:%M')
-                status_emoji = "✅" if payment.status == "paid" else "⏳" if payment.status == "pending" else "❌"
-                
-                text += f"{i}. {name}\n"
-                text += f"   💰 {payment.amount:,.0f} ₽ | {status_emoji} {payment.status} | 📅 {created}\n\n"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="payments_recent")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payments")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-        
-    except Exception as e:
-        logger.error(f"Error showing recent payments: {e}")
-        await callback.answer("❌ Ошибка при загрузке платежей", show_alert=True)
-
-
-@router.callback_query(F.data == "payments_stats")
-@role_required(AdminRole.ADMIN)
-async def payments_stats(callback: CallbackQuery):
-    """Show payment statistics."""
-    try:
-        async for session in get_db():
-            # Payment stats by period
-            today = datetime.now(timezone.utc).date()
-            week_ago = today - timedelta(days=7)
-            month_ago = today - timedelta(days=30)
-            
-            today_payments = await session.execute(
-                select(func.count(Payment.id), func.sum(Payment.amount)).where(
-                    func.date(Payment.created_at) == today,
-                    Payment.status == "paid"
-                )
-            )
-            today_count, today_amount = today_payments.first()
-            
-            week_payments = await session.execute(
-                select(func.count(Payment.id), func.sum(Payment.amount)).where(
-                    func.date(Payment.created_at) >= week_ago,
-                    Payment.status == "paid"
-                )
-            )
-            week_count, week_amount = week_payments.first()
-            
-            month_payments = await session.execute(
-                select(func.count(Payment.id), func.sum(Payment.amount)).where(
-                    func.date(Payment.created_at) >= month_ago,
-                    Payment.status == "paid"
-                )
-            )
-            month_count, month_amount = month_payments.first()
-            
-            # Payment status distribution
-            paid_count = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == "paid")
-            )
-            paid = paid_count.scalar()
-            
-            pending_count = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == "pending")
-            )
-            pending = pending_count.scalar()
-            
-            failed_count = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == "failed")
-            )
-            failed = failed_count.scalar()
-            
-            break
-        
-        stats_text = f"""📊 <b>Статистика платежей</b>
-
-📅 <b>Успешные платежи:</b>
-• Сегодня: {today_count or 0} шт., {today_amount or 0:,.0f} ₽
-• За неделю: {week_count or 0} шт., {week_amount or 0:,.0f} ₽
-• За месяц: {month_count or 0} шт., {month_amount or 0:,.0f} ₽
-
-📈 <b>Статусы платежей:</b>
-• ✅ Оплачено: {paid}
-• ⏳ В ожидании: {pending}
-• ❌ Отклонено: {failed}"""
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="payments_stats")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payments")]
-        ])
-        
-        await callback.message.edit_text(
-            stats_text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error showing payment stats: {e}")
-        await callback.answer("❌ Ошибка при загрузке статистики", show_alert=True)
 
 
 # Admin Management
@@ -4351,119 +3938,6 @@ def register_full_admin_handlers(dp):
     dp.include_router(router)
 
 
-# --- Consultation Settings ---
-
-CONSULTATION_SETTINGS_KEY = "consultation_settings"
-
-async def _render_consultation_settings(message: Message, session):
-    """Render the consultation settings panel."""
-    repo = SystemSettingsRepository(session)
-    settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
-    
-    slots = settings.get("slots", ["12:00", "14:00", "16:00", "18:00"])
-    cutoff_time = settings.get("cutoff_time", "17:45")
-    reminder_offset = settings.get("reminder_offset", 15)
-
-    text = (
-        "📅 <b>Настройки консультаций</b>\n\n"
-        f"<b>Текущие слоты (МСК):</b> {', '.join(slots)}\n"
-        f"<b>Время среза для 'сегодня':</b> {cutoff_time} МСК\n"
-        f"<b>Смещение напоминания:</b> за {reminder_offset} минут\n"
-    )
-
-    keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(text="✏️ Изменить слоты", callback_data="consult_set:slots"))
-    keyboard.add(InlineKeyboardButton(text="✏️ Изменить время среза", callback_data="consult_set:cutoff"))
-    keyboard.add(InlineKeyboardButton(text="✏️ Изменить смещение", callback_data="consult_set:reminder"))
-    keyboard.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back"))
-    keyboard.adjust(1)
-
-    if isinstance(message, CallbackQuery):
-        await message.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
-    else:
-        await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
-
-@router.callback_query(F.data == "admin_consult_settings")
-@role_required(AdminRole.ADMIN)
-async def admin_consultation_settings(callback: CallbackQuery, **kwargs):
-    """Show consultation settings."""
-    async for session in get_db():
-        await _render_consultation_settings(callback, session)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("consult_set:"))
-@role_required(AdminRole.ADMIN)
-async def edit_consultation_setting(callback: CallbackQuery, state: FSMContext):
-    """Handle editing of a consultation setting."""
-    setting = callback.data.split(":")[1]
-    prompts = {
-        "slots": ("Введите новые слоты времени через запятую (например, 12:00, 14:00, 18:00):", AdminStates.waiting_for_consultation_slots),
-        "cutoff": ("Введите новое время среза в формате ЧЧ:ММ (например, 17:45):", AdminStates.waiting_for_cutoff_time),
-        "reminder": ("Введите новое смещение для напоминания в минутах (например, 15):", AdminStates.waiting_for_reminder_offset),
-    }
-    if setting in prompts:
-        prompt, new_state = prompts[setting]
-        await state.set_state(new_state)
-        await callback.message.answer(prompt)
-        await callback.answer()
-
-@router.message(AdminStates.waiting_for_consultation_slots)
-@role_required(AdminRole.ADMIN)
-async def set_consultation_slots(message: Message, state: FSMContext):
-    """Set new consultation time slots."""
-    slots = [s.strip() for s in message.text.split(",")]
-    # Basic validation
-    if not all(re.match(r"^\d{2}:\d{2}$", s) for s in slots):
-        await message.answer("Неверный формат. Введите слоты через запятую, например: 12:00, 14:00")
-        return
-    
-    async for session in get_db():
-        repo = SystemSettingsRepository(session)
-        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
-        settings["slots"] = slots
-        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
-        await session.commit()
-        await _render_consultation_settings(message, session)
-    await state.clear()
-
-@router.message(AdminStates.waiting_for_cutoff_time)
-@role_required(AdminRole.ADMIN)
-async def set_cutoff_time(message: Message, state: FSMContext):
-    """Set new cutoff time."""
-    cutoff_time = message.text.strip()
-    if not re.match(r"^\d{2}:\d{2}$", cutoff_time):
-        await message.answer("Неверный формат. Введите время в формате ЧЧ:ММ, например: 17:45")
-        return
-
-    async for session in get_db():
-        repo = SystemSettingsRepository(session)
-        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
-        settings["cutoff_time"] = cutoff_time
-        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
-        await session.commit()
-        await _render_consultation_settings(message, session)
-    await state.clear()
-
-@router.message(AdminStates.waiting_for_reminder_offset)
-@role_required(AdminRole.ADMIN)
-async def set_reminder_offset(message: Message, state: FSMContext):
-    """Set new reminder offset."""
-    try:
-        reminder_offset = int(message.text.strip())
-        if reminder_offset <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("Неверный формат. Введите целое число минут (например, 15)")
-        return
-
-    async for session in get_db():
-        repo = SystemSettingsRepository(session)
-        settings = await repo.get_value(CONSULTATION_SETTINGS_KEY, default={})
-        settings["reminder_offset"] = reminder_offset
-        await repo.set_value(CONSULTATION_SETTINGS_KEY, settings)
-        await session.commit()
-        await _render_consultation_settings(message, session)
-    await state.clear()
 
 
 # --- SendTo Command ---

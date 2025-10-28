@@ -8,11 +8,10 @@ from typing import Dict, List, Optional, Tuple, Iterable, Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Product, ProductCriteria, User, SurveyAnswer
+from app.models import Product, ProductCriteria, User
 from app.repositories.product_repository import ProductRepository
 from app.repositories.product_criteria_repository import ProductCriteriaRepository
 from app.repositories.product_match_log_repository import ProductMatchLogRepository
-from app.services.survey_service import SurveyService
 
 
 @dataclass
@@ -68,8 +67,7 @@ class ProductMatchingService:
         self.session = session
         self.logger = structlog.get_logger()
         self.threshold = threshold or self.DEFAULT_THRESHOLD
-        self._survey_service = SurveyService(session)
-        self._catalog = self._build_catalog()
+        self._catalog = {}
 
     async def match_for_user(
         self,
@@ -84,7 +82,7 @@ class ProductMatchingService:
         products = await repository.get_active_with_criteria()
         criteria_repo = ProductCriteriaRepository(self.session)
         criteria_map = await criteria_repo.get_for_products([product.id for product in products])
-        answers = await self._survey_service.repository.get_user_answers(user.id)
+        answers = []
         candidates = self._evaluate_candidates(products, criteria_map, answers, user, limit=limit)
 
         best = candidates[0] if candidates else None
@@ -126,22 +124,6 @@ class ProductMatchingService:
 
     # Internal helpers -----------------------------------------------------------------
 
-    def _build_catalog(self) -> Dict[str, Dict[str, Any]]:
-        """Build question/answer reference for quick lookup."""
-        catalog: Dict[str, Dict[str, Any]] = {}
-        for index, (code, question) in enumerate(self._survey_service.questions.items(), start=1):
-            answers = {}
-            for answer_index, (answer_code, option) in enumerate(question.get("options", {}).items(), start=1):
-                answers[answer_code] = {
-                    "answer_id": answer_index,
-                    "text": self._normalize_markup(option.get("text", "")),
-                }
-            catalog[code] = {
-                "question_id": index,
-                "text": self._normalize_markup(question.get("text", "")),
-                "answers": answers,
-            }
-        return catalog
 
     @staticmethod
     def _normalize_markup(text: str) -> str:
@@ -152,7 +134,7 @@ class ProductMatchingService:
         self,
         products: Iterable[Product],
         criteria_map: Dict[int, List[ProductCriteria]],
-        answers: List[SurveyAnswer],
+        answers: List,
         user: User,
         *,
         limit: int,
@@ -242,24 +224,9 @@ class ProductMatchingService:
 
         return candidates[:limit]
 
-    def _map_user_answers(self, answers: List[SurveyAnswer]) -> Dict[str, Dict[str, Any]]:
+    def _map_user_answers(self, answers: List) -> Dict[str, Dict[str, Any]]:
         """Convert survey answers to mapping keyed by question code."""
-        mapping: Dict[str, Dict[str, Any]] = {}
-        for answer in answers:
-            record = self._catalog.get(answer.question_code)
-            if not record:
-                continue
-            answer_meta = record["answers"].get(answer.answer_code)
-            if not answer_meta:
-                continue
-            mapping[answer.question_code] = {
-                "question_id": record["question_id"],
-                "question_text": record["text"],
-                "answer_id": answer_meta["answer_id"],
-                "answer_code": answer.answer_code,
-                "answer_text": answer_meta["text"],
-            }
-        return mapping
+        return {}
 
     def _question_code_from_id(self, question_id: int) -> Optional[str]:
         for code, payload in self._catalog.items():
@@ -282,16 +249,10 @@ class ProductMatchingService:
             "note": note,
         }
 
-    def _extract_budget_level(self, answers: List[SurveyAnswer]) -> Optional[int]:
-        for answer in answers:
-            if answer.question_code == "q4":
-                return self.BUDGET_WEIGHT_MAP.get(answer.answer_code)
+    def _extract_budget_level(self, answers: List) -> Optional[int]:
         return None
 
-    def _extract_urgency_level(self, answers: List[SurveyAnswer]) -> Optional[int]:
-        for answer in answers:
-            if answer.question_code == "q3":
-                return self.URGENCY_LEVELS.get(answer.answer_code)
+    def _extract_urgency_level(self, answers: List) -> Optional[int]:
         return None
 
     def _price_to_usd(self, product: Product) -> float:
@@ -368,7 +329,7 @@ class ProductMatchingService:
             return ["warm"]
         return ["hot"]
 
-    def _build_explanation(self, candidate: Optional[MatchCandidate], answers: List[SurveyAnswer]) -> str:
+    def _build_explanation(self, candidate: Optional[MatchCandidate], answers: List) -> str:
         if not candidate:
             return "Совпадений с продуктами не найдено."
 

@@ -18,20 +18,16 @@ from app.middlewares.manual_dialog import ManualDialogMiddleware
 from app.middlewares.rate_limit import RateLimitMiddleware
 from app.middlewares.anti_spam import AntiSpamMiddleware
 from app.middlewares.dialog_mirror import DialogsMirrorMiddleware, DialogsChannelRequestMiddleware
-from app.middlewares.reask_middleware import ReaskMiddleware
+# from app.middlewares.reask_middleware import ReaskMiddleware
 from app.middlewares.state_reset_middleware import StateResetMiddleware
-from app.middlewares.survey_offer_middleware import SurveyOfferMiddleware
 from app.services.sentiment_service import sentiment_service
 from app.handlers import (
     start,
-    survey,
-    consultation,
     application,
-    payments,
     help_faq,
     admin_full as admin,
     materials,
-    leads,
+    # leads,
     product_handlers,
     user_settings,
     dialog,
@@ -55,39 +51,37 @@ bot.session.middleware(DialogsChannelRequestMiddleware(settings.dialogs_channel_
 dp = Dispatcher()
 
 # Register middlewares
-dp.update.middleware(IdempotencyMiddleware())
+# dp.update.middleware(IdempotencyMiddleware())
 dp.message.middleware(LoggingMiddleware())
 dp.callback_query.middleware(LoggingMiddleware())
 dp.message.middleware(UserContextMiddleware())
 dp.callback_query.middleware(UserContextMiddleware())
-dp.message.middleware(StateResetMiddleware())
-dp.callback_query.middleware(StateResetMiddleware())
-dp.message.middleware(ManualDialogMiddleware())
-dp.message.middleware(ReaskMiddleware())
-dp.message.middleware(SurveyOfferMiddleware())
-dp.message.middleware(AntiSpamMiddleware())
-dp.callback_query.middleware(AntiSpamMiddleware())
-dp.message.middleware(DialogsMirrorMiddleware())
-dp.message.middleware(RateLimitMiddleware())
-dp.callback_query.middleware(RateLimitMiddleware())
+# dp.message.middleware(StateResetMiddleware())
+# dp.callback_query.middleware(StateResetMiddleware())
+# dp.message.middleware(ManualDialogMiddleware())
+# # dp.message.middleware(ReaskMiddleware())
+# dp.message.middleware(AntiSpamMiddleware())
+# dp.callback_query.middleware(AntiSpamMiddleware())
+# dp.message.middleware(DialogsMirrorMiddleware())
+# dp.message.middleware(RateLimitMiddleware())
+# dp.callback_query.middleware(RateLimitMiddleware())
 
 # Register handlers
 # test_callbacks.register_test_handlers(dp)  # Disabled - buttons confirmed working
 start.register_handlers(dp)
-survey.register_handlers(dp)
-consultation.register_handlers(dp)
 application.register_handlers(dp)
-payments.register_handlers(dp)
 help_faq.register_handlers(dp)
 admin.register_full_admin_handlers(dp)
 materials.register_handlers(dp)
-leads.register_handlers(dp)
+# leads.register_handlers(dp)
 product_handlers.register_product_handlers(dp)
 user_settings.register_handlers(dp)
-dp.include_router(dialog.router)
 dp.include_router(manual_dialog.router)
 dp.include_router(admin_scripts.router)
 dp.include_router(admin_spam.router)
+
+# This router should be last to catch all other text messages
+dp.include_router(dialog.router)
 
 
 async def set_bot_commands() -> None:
@@ -95,7 +89,6 @@ async def set_bot_commands() -> None:
     commands = [
         BotCommand(command="start", description="Start working with the bot"),
         BotCommand(command="help", description="Show available help options"),
-        BotCommand(command="contact", description="Оставить заявку"),
     ]
     
     await bot.set_my_commands(commands, BotCommandScopeDefault())
@@ -129,7 +122,8 @@ async def on_startup() -> None:
         
         # Set webhook if not in debug mode
         if not settings.debug:
-            await set_webhook()
+            # await set_webhook()
+            pass
 
         await sentiment_service.start()
         

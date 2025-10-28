@@ -33,8 +33,6 @@ class FunnelStage(str, Enum):
     SURVEYED = "surveyed"
     ENGAGED = "engaged"
     QUALIFIED = "qualified"
-    CONSULTATION = "consultation"
-    PAYMENT = "payment"
     PAID = "paid"
     INACTIVE = "inactive"
 
@@ -59,36 +57,11 @@ class LeadStatus(str, Enum):
     CANCELED = "canceled"
 
 
-class AttendanceStatus(str, Enum):
-    """User attendance confirmation status."""
-    PENDING = "pending"
-    CONFIRMED = "confirmed"
-    CANCELED = "canceled"
-    NO_RESPONSE = "no_response"
-
-
-class AppointmentStatus(str, Enum):
-    """Appointment status enum."""
-    SCHEDULED = "scheduled"
-    RESCHEDULED = "rescheduled"
-    CANCELED = "canceled"
-    COMPLETED = "completed"
-
-
 class ProductMediaType(str, Enum):
     """Product media type enum."""
     PHOTO = "photo"
     VIDEO = "video"
     DOCUMENT = "document"
-
-
-class PaymentStatus(str, Enum):
-    """Payment status enum."""
-    CREATED = "created"
-    SENT = "sent"
-    PAID = "paid"
-    FAILED = "failed"
-    CANCELED = "canceled"
 
 
 class MaterialType(str, Enum):
@@ -142,8 +115,6 @@ class ABEventType(str, Enum):
     CLICKED = "clicked"
     REPLIED = "replied"
     LEAD_CREATED = "lead_created"
-    PAYMENT_STARTED = "payment_started"
-    PAYMENT_CONFIRMED = "payment_confirmed"
     UNSUBSCRIBED = "unsubscribed"
     BLOCKED = "blocked"
 
@@ -189,22 +160,10 @@ class User(Base):
     mute_followups_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     followups_opted_out: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    # Survey Offer related fields
-    survey_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    survey_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    survey_skipped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    msgs_since_skip: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    offer_attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    last_offer_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    survey_offer_snooze_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-
     # Relationships
     events: Mapped[List["Event"]] = relationship("Event", back_populates="user")
-    survey_answers: Mapped[List["SurveyAnswer"]] = relationship("SurveyAnswer", back_populates="user")
     messages: Mapped[List["Message"]] = relationship("Message", back_populates="user")
     leads: Mapped[List["Lead"]] = relationship("Lead", back_populates="user")
-    appointments: Mapped[List["Appointment"]] = relationship("Appointment", back_populates="user")
-    payments: Mapped[List["Payment"]] = relationship("Payment", back_populates="user")
     sentiment_scores: Mapped[List["UserMessageScore"]] = relationship(
         "UserMessageScore",
         back_populates="user",
@@ -236,21 +195,6 @@ class Event(Base):
         Index("ix_events_user_created", "user_id", "created_at"),
         Index("ix_events_type_created", "type", "created_at"),
     )
-
-
-class SurveyAnswer(Base):
-    """Survey answer model."""
-    __tablename__ = "survey_answers"
-    
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
-    question_code: Mapped[str] = mapped_column(String(50), nullable=False)
-    answer_code: Mapped[str] = mapped_column(String(50), nullable=False)
-    points: Mapped[int] = mapped_column(nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="survey_answers")
 
 
 class Message(Base):
@@ -310,10 +254,16 @@ class Lead(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     incomplete_job_id: Mapped[Optional[str]] = mapped_column(String(255))
     assignee_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    sales_script_md: Mapped[Optional[str]] = mapped_column(Text)
+    sales_script_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    sales_script_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sales_script_model: Mapped[Optional[str]] = mapped_column(String(120))
+    sales_script_inputs_hash: Mapped[Optional[str]] = mapped_column(String(128))
     
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="leads")
     notes: Mapped[List["LeadNote"]] = relationship("LeadNote", back_populates="lead", cascade="all, delete-orphan")
+    events: Mapped[List["LeadEvent"]] = relationship("LeadEvent", back_populates="lead", cascade="all, delete-orphan")
 
 
 class LeadNote(Base):
@@ -330,25 +280,21 @@ class LeadNote(Base):
     lead: Mapped["Lead"] = relationship("Lead", back_populates="notes")
 
 
-class Appointment(Base):
-    """Appointment model."""
-    __tablename__ = "appointments"
-    
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
-    user_name: Mapped[Optional[str]] = mapped_column(String(255))
-    date: Mapped[date] = mapped_column(Date, nullable=False)
-    slot: Mapped[time] = mapped_column(Time, nullable=False)
-    tz: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
-    status: Mapped[AppointmentStatus] = mapped_column(String(20), default=AppointmentStatus.SCHEDULED)
-    reminder_job_id: Mapped[Optional[str]] = mapped_column(String(255))
-    slot_utc: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    attendance: Mapped[AttendanceStatus] = mapped_column(String(20), server_default=AttendanceStatus.PENDING, nullable=False)
-    source: Mapped[Optional[str]] = mapped_column(String(50))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="appointments")
+class LeadEvent(Base):
+    """Timeline event for a lead."""
+    __tablename__ = "lead_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("leads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    lead: Mapped["Lead"] = relationship("Lead", back_populates="events")
 
 
 class Product(Base):
@@ -372,7 +318,6 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # Relationships
-    payments: Mapped[List["Payment"]] = relationship("Payment", back_populates="product")
     criteria: Mapped[List["ProductCriteria"]] = relationship(
         "ProductCriteria",
         back_populates="product",
@@ -457,32 +402,6 @@ class ProductMatchLog(Base):
 
     product: Mapped[Optional["Product"]] = relationship("Product", back_populates="match_logs")
     user: Mapped["User"] = relationship("User")
-
-
-class Payment(Base):
-    """Payment model."""
-    __tablename__ = "payments"
-    
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
-    product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"), nullable=False)
-    order_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    status: Mapped[PaymentStatus] = mapped_column(String(20), default=PaymentStatus.CREATED)
-    payload: Mapped[Optional[dict]] = mapped_column(JSON)
-    payment_type: Mapped[str] = mapped_column(String(20), default="full")
-    tariff_code: Mapped[Optional[str]] = mapped_column(String(40))
-    landing_url: Mapped[Optional[str]] = mapped_column(String(500))
-    discount_type: Mapped[Optional[str]] = mapped_column(String(20))
-    discount_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
-    manual_link: Mapped[bool] = mapped_column(Boolean, default=False)
-    conditions_note: Mapped[Optional[str]] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="payments")
-    product: Mapped["Product"] = relationship("Product", back_populates="payments")
 
 
 class MaterialContentType(str, Enum):
@@ -710,7 +629,7 @@ class ABTest(Base):
     observation_hours: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa.text("'24'"))
     segment_filter: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=sa.text("'{}'::jsonb"))
     status: Mapped[ABTestStatus] = mapped_column(String(20), default=ABTestStatus.DRAFT, server_default=ABTestStatus.DRAFT.value, nullable=False)
-    winner_variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("ab_variants.id"), nullable=True)
+    winner_variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     delivered_group_id: Mapped[Optional[uuid4]] = mapped_column(sa.UUID, nullable=True)
     send_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_admin_id: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=sa.text("'0'"))
@@ -838,8 +757,6 @@ class ABResult(Base):
     conversions: Mapped[int] = mapped_column(default=0)
     responses: Mapped[int] = mapped_column(default=0)
     unsub: Mapped[int] = mapped_column(default=0)
-    payment_started: Mapped[int] = mapped_column(default=0)
-    payment_confirmed: Mapped[int] = mapped_column(default=0)
     blocked: Mapped[int] = mapped_column(default=0)
     snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     

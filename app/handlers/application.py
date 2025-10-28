@@ -22,13 +22,12 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.models import Appointment, FunnelStage, User
-from app.services.consultation_service import ConsultationService
+from app.models import FunnelStage, User
 from app.services.event_service import EventService
 from app.services.lead_service import LeadService
 from app.services.manager_notification_service import ManagerNotificationService
-from app.services.survey_service import SurveyService
 from app.services.user_service import UserService
+from app.services.sales_script_service import SalesScriptService
 from app.utils.callbacks import Callbacks
 from app.repositories.user_repository import UserRepository
 from app.config import settings
@@ -36,6 +35,21 @@ from app.config import settings
 
 router = Router()
 logger = structlog.get_logger()
+
+
+async def _refresh_sales_script(session, bot, user: User, reason: str) -> None:
+    if not settings.sales_script_enabled or session is None:
+        return
+    try:
+        service = SalesScriptService(session, bot)
+        await service.refresh_for_user(user, reason=reason, bot=bot)
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "sales_script_refresh_failed",
+            user_id=user.id,
+            reason=reason,
+            error=str(exc),
+        )
 
 
 class ApplicationStates(StatesGroup):
@@ -57,11 +71,8 @@ _QUESTION_LABELS: Dict[str, str] = {
 _STAGE_LABELS: Dict[FunnelStage, str] = {
     FunnelStage.NEW: "новый контакт",
     FunnelStage.WELCOMED: "получил приветствие",
-    FunnelStage.SURVEYED: "анкета пройдена",
     FunnelStage.ENGAGED: "активно общается с ботом",
     FunnelStage.QUALIFIED: "готов к консультации",
-    FunnelStage.CONSULTATION: "назначена консультация",
-    FunnelStage.PAYMENT: "на этапе оплаты",
     FunnelStage.PAID: "оплата получена",
     FunnelStage.INACTIVE: "неактивен",
 }
@@ -89,37 +100,14 @@ def _normalize_phone(phone: str) -> Optional[Tuple[str, str]]:
 
 
 async def _collect_survey_data(
-    survey_service: SurveyService,
     user_id: int,
 ) -> List[Tuple[str, str]]:
     """Collect survey answers formatted for the notification card."""
-    answers = await survey_service.repository.get_user_answers(user_id)
-    answer_map: Dict[str, str] = {answer.question_code: answer.answer_code for answer in answers}
-
-    ordered_questions: Sequence[str] = ("q1", "q2", "q3", "q4", "q5")
-    results: List[Tuple[str, str]] = []
-
-    for code in ordered_questions:
-        answer_code = answer_map.get(code)
-        if not answer_code:
-            continue
-        question = survey_service.questions.get(code)
-        if not question:
-            continue
-        option = question["options"].get(answer_code)
-        if not option:
-            continue
-        label = _QUESTION_LABELS.get(code, question["text"])
-        results.append((label, option["text"]))
-
-    return results
+    return []
 
 
-def _build_status_text(user: User, appointment: Optional[Appointment]) -> str:
+def _build_status_text(user: User, appointment: Optional[object]) -> str:
     """Create status description for the manager card."""
-    if appointment:
-        dt = datetime.combine(appointment.date, appointment.slot)
-        return f"назначена консультация ({dt.strftime('%d.%m.%Y %H:%M')} МСК)"
     return _STAGE_LABELS.get(user.funnel_stage, "на связи с ботом")
 
 
@@ -200,16 +188,13 @@ async def _finalize_application(
     """Create lead, notify managers and thank the user."""
     survey_service = SurveyService(session)
     lead_service = LeadService(session)
-    consultation_service = ConsultationService(session)
     manager_service = ManagerNotificationService(message.bot, session)
     event_service = EventService(session)
 
     survey_data = await _collect_survey_data(survey_service, user.id)
     survey_lines_html = [f"{html.escape(label)}: {html.escape(answer)}" for label, answer in survey_data]
 
-    upcoming = await consultation_service.repository.get_upcoming_appointments(user.id)
-    appointment = upcoming[0] if upcoming else None
-    status_text = _build_status_text(user, appointment)
+    status_text = _build_status_text(user, None)
 
     lead_summary = _build_lead_summary(
         name=name,
@@ -251,7 +236,6 @@ async def _finalize_application(
             "name": name,
             "phone": phone_normalized,
             "email": email or "",
-            "survey_answers": survey_data,
             "status": status_text,
             "lead_id": getattr(lead, "id", None),
         },
@@ -332,6 +316,8 @@ async def handle_contact_phone(
     await state.update_data(phone=phone_normalized, phone_display=phone_display)
 
     await user_service.set_user_contact_info(user, phone=phone_normalized)
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_phone_manual")
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_phone_contact")
     await state.set_state(ApplicationStates.waiting_name)
 
     await message.answer(
@@ -417,6 +403,7 @@ async def handle_email_input(
         return
 
     await user_service.set_user_contact_info(user, email=email_candidate)
+    await _refresh_sales_script(kwargs.get("session"), message.bot, user, "application_email")
 
     data = await state.get_data()
     name = data.get("name")

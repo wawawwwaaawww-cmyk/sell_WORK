@@ -6,10 +6,12 @@ from __future__ import annotations
 from typing import List
 
 import structlog
+from aiogram.types import FSInputFile, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Material, MaterialType, MaterialVersion
 from app.repositories.material_repository import MaterialRepository
+from app.services.bonus_content_manager import BonusContentManager
 
 
 class BonusRepository:
@@ -44,6 +46,21 @@ class BonusService:
         self.session = session
         self.repository = BonusRepository(session)
         self.logger = structlog.get_logger()
+
+    async def send_bonus(self, message: Message) -> None:
+        """Send the bonus file to the user."""
+        try:
+            bonus_file_path, bonus_caption = BonusContentManager.load_published_bonus()
+            document = FSInputFile(bonus_file_path)
+
+            await message.answer_document(document, caption=bonus_caption)
+            self.logger.info("Bonus file sent successfully", user_id=message.from_user.id)
+        except FileNotFoundError:
+            self.logger.error("Bonus file not found.", path=BonusContentManager.get_bonus_path())
+            await message.answer("К сожалению, бонусный файл сейчас недоступен. Мы уже работаем над этим!")
+        except Exception as e:
+            self.logger.error("Failed to send bonus file", error=str(e), exc_info=True)
+            raise
 
     async def get_welcome_bonus_text(self) -> str:
         """Prepare formatted text with welcome bonuses."""

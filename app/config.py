@@ -70,9 +70,6 @@ class Settings:
         # Timings
         self.bonus_followup_delay: int = int(os.getenv("BONUS_FOLLOWUP_DELAY", "3"))
 
-        # Timings
-        self.bonus_followup_delay: int = int(os.getenv("BONUS_FOLLOWUP_DELAY", "3"))
-
         # Sendto command settings
         self.sendto_max_recipients: int = int(os.getenv("SENDTO_MAX_RECIPIENTS", "50"))
         self.sendto_throttle_rate: float = float(os.getenv("SENDTO_THROTTLE_RATE", "0.05"))
@@ -93,6 +90,28 @@ class Settings:
         self.judge_model: str = os.getenv("JUDGE_MODEL", self.llm_model)
         self.judge_max_candidates: int = int(os.getenv("JUDGE_MAX_CANDIDATES", "3"))
 
+        # Sales script settings
+        self.sales_script_enabled: bool = os.getenv("SALES_SCRIPT_ENABLED", "true").lower() == "true"
+        self.sales_script_prompt_path: str = os.getenv(
+            "SALES_SCRIPT_PROMPT_PATH",
+            "/home/botseller/sell/prompts/sell-skript.txt",
+        )
+        self.sales_script_model: str = os.getenv("SALES_SCRIPT_MODEL", "gpt-4o-mini")
+        self.sales_script_temperature: float = float(os.getenv("SALES_SCRIPT_TEMPERATURE", "0.3"))
+        self.sales_script_max_tokens: int = int(os.getenv("SALES_SCRIPT_MAX_TOKENS", "3000"))
+        self.sales_script_send_to_manager_on_assign: bool = (
+            os.getenv("SALES_SCRIPT_SEND_TO_MANAGER_ON_ASSIGN", "true").lower() == "true"
+        )
+        self.sales_script_thread_post_on_click: bool = (
+            os.getenv("SALES_SCRIPT_THREAD_POST_ON_CLICK", "true").lower() == "true"
+        )
+        self.sales_script_regen_on_lead_update: bool = (
+            os.getenv("SALES_SCRIPT_REGEN_ON_LEAD_UPDATE", "true").lower() == "true"
+        )
+        self.sales_script_split_long_messages: bool = (
+            os.getenv("SALES_SCRIPT_SPLIT_LONG_MESSAGES", "true").lower() == "true"
+        )
+
         # Re-ask functionality
         self.reask_enabled: bool = os.getenv("REASK_ENABLED", "true").lower() == "true"
         self.reask_first_cooldown_min: int = int(os.getenv("REASK_FIRST_COOLDOWN_MIN", "4"))
@@ -103,16 +122,6 @@ class Settings:
         # Anti-loop mechanism
         self.anti_loop_min_minutes_between_same_question: int = int(os.getenv("ANTI_LOOP_MIN_MINUTES_BETWEEN_SAME_QUESTION", "10"))
         self.anti_loop_min_user_msgs_between_same_question: int = int(os.getenv("ANTI_LOOP_MIN_USER_MSGS_BETWEEN_SAME_QUESTION", "3"))
-
-        # Survey Offer settings
-        self.survey_offer_enabled: bool = os.getenv("SURVEY_OFFER_ENABLED", "true").lower() == "true"
-        self.survey_offer_first_after_msgs: int = int(os.getenv("SURVEY_OFFER_FIRST_AFTER_MSGS", "5"))
-        self.survey_offer_repeat_every_msgs: int = int(os.getenv("SURVEY_OFFER_REPEAT_EVERY_MSGS", "6"))
-        self.survey_offer_min_interval_min: int = int(os.getenv("SURVEY_OFFER_MIN_INTERVAL_MIN", "3"))
-        self.survey_offer_skip_during_active_flows: bool = os.getenv("SURVEY_OFFER_SKIP_DURING_ACTIVE_FLOWS", "true").lower() == "true"
-        self.survey_offer_model: str = os.getenv("SURVEY_OFFER_MODEL", "gpt-4o-mini")
-        self.survey_offer_max_attempts_per_day: int = int(os.getenv("SURVEY_OFFER_MAX_ATTEMPTS_PER_DAY", "3"))
-        self.survey_offer_snooze_days: int = int(os.getenv("SURVEY_OFFER_SNOOZE_DAYS", "7"))
 
         # Incomplete Leads
         self.incomplete_leads_wait_minutes: int = int(os.getenv("INCOMPLETE_LEADS_WAIT_MINUTES", "10"))

@@ -99,8 +99,6 @@ async def check_imports() -> bool:
         from app.handlers import (
             start,
             survey,
-            consultation,
-            payments,
             help_faq,
             admin_enhanced,
             materials,
@@ -109,7 +107,6 @@ async def check_imports() -> bool:
         )
         from app.scenes import scene_manager
         from app.repositories import (
-            appointment_repository,
             product_repository,
             broadcast_repository,
             material_repository,
@@ -119,15 +116,12 @@ async def check_imports() -> bool:
         _ = (
             start,
             survey,
-            consultation,
-            payments,
             help_faq,
             admin_enhanced,
             materials,
             leads,
             product_handlers,
             scene_manager,
-            appointment_repository,
             product_repository,
             broadcast_repository,
             material_repository,

@@ -108,24 +108,30 @@ class BroadcastService:
     ) -> Tuple[bool, str, Optional[int]]:
         """Create A/B test broadcast."""
         try:
+            population_percent = population or DEFAULT_POPULATION_PERCENT
+            sample_ratio = max(0.0, min(population_percent / 100, 1.0))
+
+            buttons_a = variant_a_buttons or []
+            buttons_b = variant_b_buttons or []
+
             variant_defs = [
                 VariantDefinition(
                     title=variant_a_title,
                     body=variant_a_body,
-                    buttons=variant_a_buttons,
+                    buttons=buttons_a,
                 ),
                 VariantDefinition(
                     title=variant_b_title,
                     body=variant_b_body,
-                    buttons=variant_b_buttons,
+                    buttons=buttons_b,
                 ),
             ]
 
             ab_test = await self.ab_testing_service.create_test(
                 name=test_name,
-                creator_user_id=0,
+                created_by_admin_id=0,
                 variants=variant_defs,
-                population_percent=population or DEFAULT_POPULATION_PERCENT,
+                sample_ratio=sample_ratio,
                 start_immediately=False,
             )
 
@@ -222,6 +228,25 @@ class BroadcastService:
                                     if index == 0 and keyboard:
                                         kwargs["reply_markup"] = keyboard
                                     await self.bot.send_voice(**kwargs)
+                                elif item_type == "animation":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "animation": item.get("file_id"),
+                                    }
+                                    if item.get("caption"):
+                                        kwargs["caption"] = item.get("caption")
+                                        kwargs["parse_mode"] = item.get("parse_mode")
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_animation(**kwargs)
+                                elif item_type == "video_note":
+                                    kwargs = {
+                                        "chat_id": user.telegram_id,
+                                        "video_note": item.get("file_id"),
+                                    }
+                                    if index == 0 and keyboard:
+                                        kwargs["reply_markup"] = keyboard
+                                    await self.bot.send_video_note(**kwargs)
                                 else:
                                     self.logger.warning(
                                         "Unsupported broadcast content item",

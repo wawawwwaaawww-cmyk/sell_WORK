@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 from sqlalchemy import select, func, and_
+from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,13 +13,11 @@ from app.models import (
     User,
     Lead,
     Event,
-    Payment,
     Broadcast,
     BroadcastDelivery,
     ABTest,
     ABVariant,
     ABResult,
-    PaymentStatus,
     ABTestStatus,
     ABTestMetric,
 )
@@ -97,35 +96,11 @@ class AnalyticsService:
 
     async def get_sales_metrics(self, days: int = 30) -> Dict:
         """Get sales-related metrics."""
-        try:
-            period_start = datetime.now(timezone.utc) - timedelta(days=days)
-
-            paid_filter = and_(
-                Payment.status == PaymentStatus.PAID,
-                Payment.created_at >= period_start,
-            )
-
-            total_revenue = await self.db.scalar(
-                select(func.sum(Payment.amount)).where(paid_filter)
-            ) or 0
-
-            successful_payments = await self.db.scalar(
-                select(func.count(Payment.id)).where(paid_filter)
-            ) or 0
-
-            avg_order_value = (
-                float(total_revenue) / successful_payments if successful_payments else 0.0
-            )
-
-            return {
-                "total_revenue": float(total_revenue),
-                "successful_payments": successful_payments,
-                "avg_order_value": round(avg_order_value, 2),
-            }
-
-        except Exception as exc:
-            logger.error("Error getting sales metrics", exc_info=exc)
-            return {}
+        return {
+            "total_revenue": 0,
+            "successful_payments": 0,
+            "avg_order_value": 0,
+        }
 
 
     async def get_broadcast_metrics(self, days: int = 30) -> Dict[str, Any]:
@@ -291,6 +266,9 @@ class AnalyticsService:
                 "tests": tests_payload,
             }
 
+        except (ProgrammingError, OperationalError) as exc:
+            logger.warning("A/B tables missing while preparing metrics", exc_info=exc)
+            return {"summary": {}, "tests": [], "error": "ab_tables_missing", "detail": str(exc)}
         except Exception as exc:
             logger.error("Error getting A/B test metrics", exc_info=exc)
             return {"summary": {}, "tests": [], "error": "ab_query_failed", "detail": str(exc)}

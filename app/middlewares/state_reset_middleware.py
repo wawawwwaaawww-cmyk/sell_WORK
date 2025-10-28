@@ -29,10 +29,8 @@ class StateResetMiddleware(BaseMiddleware):
         """
         is_command = isinstance(event, Message) and event.text and event.text.startswith("/")
         is_callback = isinstance(event, CallbackQuery)
+        callback_data = event.data if is_callback else ""
         
-        # Do not reset state for consultation flow callbacks
-        if is_callback and event.data and event.data.startswith("consult_"):
-            return await handler(event, data)
 
         if is_command or is_callback:
             state: FSMContext = data.get("state")
@@ -41,6 +39,26 @@ class StateResetMiddleware(BaseMiddleware):
             if state:
                 current_state = await state.get_state()
                 if current_state is not None:
+                    # Preserve stateful admin/application flows handled via callbacks
+                    if is_callback and current_state.startswith(
+                        (
+                            "AdminStates:",
+                            "AdminEnhancedStates:",
+                            "ApplicationStates:",
+                            "ConsultationStates:",
+                            "DeclinedSurveyStates:",
+                        )
+                    ):
+                        return await handler(event, data)
+
+                    # Skip reset for explicitly whitelisted callbacks
+                    if (
+                        is_callback
+                        and callback_data
+                        and callback_data.startswith(("admin_", "product_", "leads_", "bonus:", "bonus_"))
+                    ):
+                        return await handler(event, data)
+
                     # Cancel any scheduled scene-specific jobs
                     state_data = await state.get_data()
 

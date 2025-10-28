@@ -1,4 +1,4 @@
-"""Repository for managing product survey criteria."""
+"""Repository for managing product criteria."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from app.models import ProductCriteria
 
 
 class ProductCriteriaRepository:
-    """Data access for product survey matching criteria."""
+    """Data access for product matching criteria."""
 
     def __init__(self, session: AsyncSession):
         self.session = session

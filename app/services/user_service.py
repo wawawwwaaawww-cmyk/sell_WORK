@@ -13,11 +13,8 @@ from app.models import (
     FunnelStage,
     Message,
     MessageRole,
-    SurveyAnswer,
     Event,
     Lead,
-    Appointment,
-    Payment,
     UserFunnelState,
     BroadcastDelivery,
 )
@@ -106,20 +103,6 @@ class UserService:
         self.logger.warning("Using deprecated UserService.update_user method", user_id=user.id)
         return await self.set_user_contact_info(user, phone, email)
     
-    async def is_user_ready_for_consultation(self, user: User) -> bool:
-        """Check if user is ready for consultation offer."""
-        # Hot segment users are always ready
-        if user.segment == UserSegment.HOT:
-            return True
-        
-        # Warm users need to have completed survey
-        if user.segment == UserSegment.WARM and user.funnel_stage in [
-            FunnelStage.SURVEYED, FunnelStage.ENGAGED, FunnelStage.QUALIFIED
-        ]:
-            return True
-        
-        return False
-    
     async def is_user_ready_for_payment(self, user: User) -> bool:
         """Check if user is ready for payment offer."""
         return (
@@ -134,12 +117,9 @@ class UserService:
             return {}
 
         tables = [
-            (SurveyAnswer, "survey_answers"),
             (Event, "events"),
             (Message, "messages"),
             (Lead, "leads"),
-            (Appointment, "appointments"),
-            (Payment, "payments"),
             (UserFunnelState, "funnel_state"),
             (BroadcastDelivery, "broadcast_deliveries"),
         ]

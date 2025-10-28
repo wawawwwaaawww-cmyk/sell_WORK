@@ -53,10 +53,10 @@ class AdminStates(StatesGroup):
     waiting_for_product_price = State()
     waiting_for_product_description = State()
 
-   # Excel materials states
-   waiting_for_excel_file = State()
-   waiting_for_media_files = State()
-   waiting_for_test_username = State()
+    # Excel materials states
+    waiting_for_excel_file = State()
+    waiting_for_media_files = State()
+    waiting_for_test_username = State()
 
 
 def admin_required(func):
@@ -140,8 +140,6 @@ async def admin_panel(message: Message):
             buttons.append([InlineKeyboardButton(text="👤 Пользователи", callback_data="admin_users")])
         
         # Payment management (admins and above)
-        if capabilities.get("can_manage_payments"):
-            buttons.append([InlineKeyboardButton(text="💳 Платежи", callback_data="admin_payments")])
         
         # Admin management (owners only)
         if capabilities.get("can_manage_admins"):
@@ -194,18 +192,9 @@ async def show_analytics(callback: CallbackQuery, **kwargs):
             hot_users = hot_users_result.scalar()
             
             # Payments stats
-            total_payments_result = await session.execute(select(func.count(Payment.id)))
-            total_payments = total_payments_result.scalar()
-            
-            successful_payments_result = await session.execute(
-                select(func.count(Payment.id)).where(Payment.status == "paid")
-            )
-            successful_payments = successful_payments_result.scalar()
-            
-            total_revenue_result = await session.execute(
-                select(func.sum(Payment.amount)).where(Payment.status == "paid")
-            )
-            total_revenue = total_revenue_result.scalar() or 0
+            total_payments = 0
+            successful_payments = 0
+            total_revenue = 0
             break
             
             stats_text = f"""📊 <b>Аналитика системы</b>
@@ -219,11 +208,7 @@ async def show_analytics(callback: CallbackQuery, **kwargs):
 • 🔥 Тёплые: {warm_users}
 • 🌶️ Горячие: {hot_users}
 
-💳 <b>Платежи:</b>
-• Всего: {total_payments}
-• Успешные: {successful_payments}
-• Конверсия: {(successful_payments/max(total_payments,1)*100):.1f}%
-• Выручка: {total_revenue:,.0f} ₽"""
+"""
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_analytics")],
@@ -367,70 +352,27 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext):
             target_users = await broadcast_repo.get_target_users_for_broadcast(segment_filter)
             
             await session.commit()
-            
-            # Implement actual sending logic
-            from ..bot import bot
+
             from ..services.broadcast_service import BroadcastService
-            
-            broadcast_service = BroadcastService(session)
-            
-            # Parse buttons if provided
-            buttons_markup = None
-            if broadcast.buttons:
-                try:
-                    import json
-                    buttons_data = json.loads(broadcast.buttons)
-                    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                    
-                    keyboard_buttons = []
-                    for button in buttons_data:
-                        if 'text' in button and 'url' in button:
-                            keyboard_buttons.append([
-                                InlineKeyboardButton(text=button['text'], url=button['url'])
-                            ])
-                    
-                    if keyboard_buttons:
-                        buttons_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-                except Exception as e:
-                    logger.error(f"Error parsing buttons: {e}")
-            
-            # Send broadcast to all target users
-            sent_count = 0
-            failed_count = 0
-            
-            for user in target_users:
-                try:
-                    await bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=broadcast.content,
-                        reply_markup=buttons_markup,
-                        parse_mode="HTML"
-                    )
-                    sent_count += 1
-                    
-                    # Update broadcast statistics
-                    await broadcast_repo.mark_as_sent(broadcast.id, user.id)
-                    
-                    # Rate limiting - Telegram allows 30 messages per second
-                    import asyncio
-                    await asyncio.sleep(0.04)  # ~25 messages per second to be safe
-                    
-                except Exception as e:
-                    logger.error(f"Failed to send broadcast to user {user.id}: {e}")
-                    failed_count += 1
-                    await broadcast_repo.mark_as_failed(broadcast.id, user.id)
-            
-            # Update broadcast status
-            broadcast.status = "completed"
-            broadcast.sent_count = sent_count
-            broadcast.failed_count = failed_count
+
+            broadcast_service = BroadcastService(callback.bot, session)
+            summary = await broadcast_service.send_simple_broadcast(
+                broadcast.id,
+                delay_between_messages=0.04,
+            )
+            await session.commit()
+
+            sent_count = summary.get("sent", 0)
+            failed_count = summary.get("failed", 0)
+            total_count = summary.get("total", len(target_users))
             
             await callback.message.edit_text(
                 f"✅ <b>Рассылка запущена!</b>\n\n"
                 f"🆔 ID: {broadcast.id}\n"
-                f"👥 Получателей: {len(target_users)}\n"
+                f"👥 Получателей: {total_count}\n"
+                f"📊 Статус: отправлено {sent_count}, ошибок {failed_count}\n"
                 f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             
             await state.clear()
@@ -1096,34 +1038,34 @@ async def excel_test_send_execute(message: Message, state: FSMContext, **kwargs)
 @router.callback_query(F.data == "material_excel_menu")
 @role_required(AdminRole.EDITOR)
 async def materials_excel_management(callback: CallbackQuery, **kwargs):
-   """Excel materials management menu."""
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="📥 Загрузить Excel", callback_data="excel_upload")],
-      [InlineKeyboardButton(text="🖼️ Загрузить медиа", callback_data="excel_media_upload")],
-      [InlineKeyboardButton(text="📋 Настройки расписания", callback_data="excel_schedule_settings")],
-      [InlineKeyboardButton(text="📲 Тестовая отправка", callback_data="excel_test_send")],
-      [InlineKeyboardButton(text="📊 Логи отправки", callback_data="excel_logs")],
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_materials")]
-  ])
-  
-  # Get current status
-  validation_result = excel_material_service.validate_excel_file()
-  status_text = "⚠️ Файл `materials.xlsx` не найден или поврежден."
-  if validation_result:
-      status_text = (
-          f"✅ Файл `materials.xlsx` загружен.\n"
-          f"Всего строк: {validation_result.total_rows}\n"
-          f"Готово к отправке: {validation_result.valid_rows}\n"
-          f"Пропущено: {validation_result.skipped_rows}"
-      )
+    """Excel materials management menu."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Загрузить Excel", callback_data="excel_upload")],
+        [InlineKeyboardButton(text="🖼️ Загрузить медиа", callback_data="excel_media_upload")],
+        [InlineKeyboardButton(text="📋 Настройки расписания", callback_data="excel_schedule_settings")],
+        [InlineKeyboardButton(text="📲 Тестовая отправка", callback_data="excel_test_send")],
+        [InlineKeyboardButton(text="📊 Логи отправки", callback_data="excel_logs")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_materials")]
+    ])
 
-  await callback.message.edit_text(
-      f"📄 <b>Материалы из Excel</b>\n\n"
-      f"<b>Статус:</b>\n{status_text}\n\n"
-      "Выберите действие:",
-      reply_markup=keyboard,
-      parse_mode="HTML"
-  )
+    # Get current status
+    validation_result = excel_material_service.validate_excel_file()
+    status_text = "⚠️ Файл `materials.xlsx` не найден или поврежден."
+    if validation_result:
+        status_text = (
+            f"✅ Файл `materials.xlsx` загружен.\n"
+            f"Всего строк: {validation_result.total_rows}\n"
+            f"Готово к отправке: {validation_result.valid_rows}\n"
+            f"Пропущено: {validation_result.skipped_rows}"
+        )
+
+    await callback.message.edit_text(
+        "📄 <b>Материалы из Excel</b>\n\n"
+        f"<b>Статус:</b>\n{status_text}\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "material_create")

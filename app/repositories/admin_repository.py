@@ -157,9 +157,6 @@ class AdminRepository:
         """Check if admin can view analytics."""
         return await self.has_permission(telegram_id, AdminRole.MANAGER)
     
-    async def can_manage_payments(self, telegram_id: int) -> bool:
-        """Check if admin can manage payments."""
-        return await self.has_permission(telegram_id, AdminRole.ADMIN)
     
     async def get_admin_capabilities(self, telegram_id: int) -> Dict[str, bool]:
         """Get all capabilities for an admin."""
@@ -181,7 +178,6 @@ class AdminRepository:
             "can_view_analytics": await self.can_view_analytics(telegram_id),
             "can_manage_broadcasts": await self.can_manage_broadcasts(telegram_id),
             "can_manage_users": await self.can_manage_users(telegram_id),
-            "can_manage_payments": await self.can_manage_payments(telegram_id),
             "can_manage_admins": await self.can_manage_admins(telegram_id),
             "can_manage_materials": await self.can_manage_materials(telegram_id),
             "can_manage_products": await self.can_manage_products(telegram_id),

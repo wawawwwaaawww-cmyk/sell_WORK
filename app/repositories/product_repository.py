@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any, Iterable
 from decimal import Decimal
 
 import structlog
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -17,6 +17,20 @@ class ProductRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.logger = structlog.get_logger()
+    
+    async def _ensure_unique(self, *, name: Optional[str], slug: Optional[str]) -> None:
+        """Ensure unique constraints before persisting a product."""
+        if name:
+            stmt = select(Product.id).where(func.lower(Product.name) == name.lower())
+            result = await self.session.execute(stmt)
+            if result.scalar_one_or_none():
+                raise ValueError("Продукт с таким названием уже существует. Выберите другое название.")
+
+        if slug:
+            stmt = select(Product.id).where(func.lower(Product.slug) == slug.lower())
+            result = await self.session.execute(stmt)
+            if result.scalar_one_or_none():
+                raise ValueError("Слаг продукта уже используется. Укажите другой код или слаг.")
     
     async def create_product(
         self,
@@ -35,6 +49,8 @@ class ProductRepository:
         is_active: bool = True,
     ) -> Product:
         """Create a new product."""
+        await self._ensure_unique(name=name, slug=slug or code)
+
         value_props_payload: list[str] | None = None
         if value_props is not None:
             value_props_payload = [str(item).strip() for item in value_props if str(item).strip()]

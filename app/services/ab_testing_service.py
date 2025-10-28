@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,7 +14,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMedia
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from app.models import (
@@ -35,12 +34,12 @@ UNIQUE_EVENT_TYPES = {
     ABEventType.CLICKED,
     ABEventType.REPLIED,
     ABEventType.LEAD_CREATED,
-    ABEventType.PAYMENT_STARTED,
-    ABEventType.PAYMENT_CONFIRMED,
     ABEventType.UNSUBSCRIBED,
     ABEventType.BLOCKED,
     ABEventType.DELIVERED,
 }
+
+DEFAULT_POPULATION_PERCENT = 20
 
 
 @dataclass(slots=True)
@@ -48,9 +47,9 @@ class VariantDefinition:
     """Data holder for variant configuration before persistence."""
     title: str
     body: str
-    media: List[Dict[str, Any]]
-    buttons: List[Dict[str, Any]]
-    parse_mode: str
+    media: List[Dict[str, Any]] = field(default_factory=list)
+    buttons: List[Dict[str, Any]] = field(default_factory=list)
+    parse_mode: str = "HTML"
     code: Optional[str] = None
 
 
@@ -64,26 +63,38 @@ class ABTestingService:
     async def create_test(
         self,
         name: str,
-        created_by_admin_id: int,
-        variants: Sequence[VariantDefinition],
+        created_by_admin_id: Optional[int] = None,
+        variants: Sequence[VariantDefinition] = (),
         *,
         metric: ABTestMetric = ABTestMetric.CTR,
         sample_ratio: float = 0.1,
         observation_hours: int = 24,
         segment_filter: Optional[Dict[str, Any]] = None,
         send_at: Optional[datetime] = None,
+        creator_user_id: Optional[int] = None,
+        start_immediately: Optional[bool] = None,
     ) -> ABTest:
         """Create A/B test with provided variants."""
         if not variants or len(variants) != 2:
             raise ValueError("A/B test must contain exactly 2 variants")
 
+        bounded_ratio = max(0.0, min(sample_ratio, 1.0))
+        if bounded_ratio == 0:
+            bounded_ratio = DEFAULT_POPULATION_PERCENT / 100
+
+        creator_id = (
+            created_by_admin_id
+            if created_by_admin_id is not None
+            else (creator_user_id if creator_user_id is not None else 0)
+        )
+
         ab_test = ABTest(
             name=name,
             metric=metric,
-            sample_ratio=sample_ratio,
+            sample_ratio=bounded_ratio,
             observation_hours=observation_hours,
             segment_filter=segment_filter or {},
-            created_by_admin_id=created_by_admin_id,
+            created_by_admin_id=creator_id,
             send_at=send_at,
             status=ABTestStatus.DRAFT,
             variants_count=len(variants),
@@ -117,7 +128,7 @@ class ABTestingService:
         )
         return ab_test
 
-    async def start_pilot_phase(self, test_id: int, bot: Bot) -> Dict[str, Any]:
+    async def start_pilot_phase(self, test_id: int, bot: Bot, throttle: float = 0.1) -> Dict[str, Any]:
         """Initiate the pilot sending phase for an A/B test."""
         test = await self.session.get(
             ABTest,
@@ -135,7 +146,12 @@ class ABTestingService:
         await self.session.flush()
 
         user_repo = UserRepository(self.session)
-        audience = await user_repo.find_users_by_criteria(test.segment_filter)
+        if hasattr(user_repo, "find_users_by_criteria"):
+            audience = await user_repo.find_users_by_criteria(test.segment_filter)
+        else:
+            stmt = select(User).order_by(User.id)
+            result = await self.session.execute(stmt)
+            audience = list(result.scalars().all())
         
         pilot_size = int(len(audience) * test.sample_ratio)
         pilot_audience = audience[:pilot_size]
@@ -158,7 +174,7 @@ class ABTestingService:
         self.session.add_all(assignments)
         await self.session.flush()
 
-        delivery_summary = await self.deliver_assignments(assignments, bot)
+        delivery_summary = await self.deliver_assignments(assignments, bot, throttle=throttle)
 
         test.status = ABTestStatus.OBSERVE
         await self.session.flush()
@@ -176,7 +192,25 @@ class ABTestingService:
             "status": "OBSERVE",
             "pilot_size": len(pilot_audience),
             "delivery": delivery_summary,
+            "assignments": len(assignments),
         }
+
+    async def start_test(
+        self,
+        test_id: int,
+        *,
+        bot: Bot,
+        send_messages: bool = True,
+        throttle: float = 0.1,
+    ) -> Dict[str, Any]:
+        """Backward-compatible entrypoint to launch pilot phase and deliver messages."""
+        if not send_messages:
+            summary = await self.start_pilot_phase(test_id, bot, throttle=0)
+            return summary
+
+        summary = await self.start_pilot_phase(test_id, bot, throttle=throttle)
+        summary.setdefault("assignments", summary.get("pilot_size", 0))
+        return summary
 
     async def deliver_assignments(self, assignments: List[ABAssignment], bot: Bot, throttle: float = 0.1) -> Dict[str, int]:
         """Deliver messages for a list of assignments."""
@@ -190,12 +224,13 @@ class ABTestingService:
                 if not variant or not user or user.is_blocked:
                     raise ValueError("Missing variant/user or user is blocked")
 
-                message_ids = await self._send_variant(bot, user.telegram_id, variant)
-                
+                await self._send_variant(bot, user.telegram_id, variant)
+
                 assignment.first_delivery_at = self._now()
                 assignment.delivery_status = "SENT"
-                assignment.message_id = message_ids[0] if message_ids else None
-                await self._ensure_event(assignment, ABEventType.DELIVERED, {"message_ids": message_ids})
+                assignment.delivered_at = assignment.first_delivery_at
+                assignment.message_id = None
+                await self._ensure_event(assignment, ABEventType.DELIVERED, {"message_ids": []})
                 sent += 1
             except Exception as exc:
                 self.logger.error("Failed to deliver assignment", assignment_id=assignment.id, error=str(exc))
@@ -317,16 +352,15 @@ class ABTestingService:
 
     async def analyze_test_results(self, test_id: int) -> Dict[str, Any]:
         """Calculate analytics for test without mutating snapshot."""
-        # This is a simplified version. A real implementation would aggregate from ab_events or a metrics table.
         stmt = text("""
             SELECT
                 v.id as variant_id,
                 v.variant_code,
                 COUNT(a.id) as intended,
-                SUM(CASE WHEN a.delivery_status = 'SENT' THEN 1 ELSE 0 END) as delivered,
+                SUM(CASE WHEN a.delivery_status = 'SENT' OR a.delivered_at IS NOT NULL THEN 1 ELSE 0 END) as delivered,
                 (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'clicked') as clicks,
-                (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'converted') as conversions,
-                (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'responded') as responses,
+                (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'lead_created') as conversions,
+                (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'replied') as responses,
                 (SELECT COUNT(DISTINCT e.user_id) FROM ab_events e WHERE e.variant_id = v.id AND e.event_type = 'unsubscribed') as unsubscribed
             FROM ab_variants v
             JOIN ab_assignments a ON a.variant_id = v.id
@@ -345,11 +379,11 @@ class ABTestingService:
             responses = row_dict.get('responses', 0)
             unsubscribed = row_dict.get('unsubscribed', 0)
 
-            ctr = (clicks / delivered * 100) if delivered else 0.0
-            cr = (conversions / clicks * 100) if clicks else 0.0
-            delivery_rate = (delivered / intended * 100) if intended else 0.0
-            response_rate = (responses / delivered * 100) if delivered else 0.0
-            unsubscribe_rate = (unsubscribed / delivered * 100) if delivered else 0.0
+            ctr = (clicks / delivered) if delivered else 0.0
+            cr = (conversions / delivered) if delivered else 0.0
+            delivery_rate = (delivered / intended) if intended else 0.0
+            response_rate = (responses / delivered) if delivered else 0.0
+            unsubscribe_rate = (unsubscribed / delivered) if delivered else 0.0
 
             variants_payload.append({
                 "variant_id": row_dict['variant_id'],
@@ -360,6 +394,8 @@ class ABTestingService:
                 "conversions": conversions,
                 "responses": responses,
                 "unsubscribed": unsubscribed,
+                "unique_clicks": clicks,
+                "leads": conversions,
                 "ctr": ctr,
                 "cr": cr,
                 "delivery_rate": delivery_rate,
@@ -368,12 +404,20 @@ class ABTestingService:
             })
 
         test = await self.session.get(ABTest, test_id)
+        winner_variant = None
+        if variants_payload:
+            winner_variant = max(
+                variants_payload,
+                key=lambda v: (v.get("leads", 0), v.get("ctr", 0), v.get("variant")),
+            )
+
         return {
             "test_id": test.id,
             "name": test.name,
-            "status": test.status.value,
-            "metric": test.metric.value,
+            "status": test.status.value if hasattr(test.status, "value") else str(test.status),
+            "metric": test.metric.value if hasattr(test.metric, "value") else str(test.metric),
             "variants": variants_payload,
+            "winner": winner_variant,
         }
 
     async def _ensure_event(

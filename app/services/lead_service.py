@@ -291,9 +291,6 @@ class LeadService:
         if user.segment == "hot" and user.lead_score >= 12:
             return True
         
-        # User has booked consultation
-        if context.get("consultation_booked"):
-            return True
         
         # User has initiated payment
         if context.get("payment_initiated"):
@@ -335,12 +332,12 @@ class LeadService:
         )
 
         ab_service = ABTestingService(self.session)
-        await ab_service.record_event_for_latest_assignment(
-            user.id,
-            ABEventType.LEAD_CREATED,
-            {"lead_id": lead.id, "trigger": trigger_event},
-            within_hours=72,
-        )
+        # await ab_service.record_event_for_latest_assignment(
+        #     user.id,
+        #     ABEventType.LEAD_CREATED,
+        #     {"lead_id": lead.id, "trigger": trigger_event},
+        #     within_hours=72,
+        # )
 
         return lead
     
@@ -395,12 +392,12 @@ class LeadService:
             )
 
             ab_service = ABTestingService(self.session)
-            await ab_service.record_event_for_latest_assignment(
-                user_id,
-                ABEventType.LEAD_CREATED,
-                {"lead_id": lead.id, "trigger": trigger},
-                within_hours=72,
-            )
+            # await ab_service.record_event_for_latest_assignment(
+            #     user_id,
+            #     ABEventType.LEAD_CREATED,
+            #     {"lead_id": lead.id, "trigger": trigger},
+            #     within_hours=72,
+            # )
 
             return lead
             
@@ -421,19 +418,19 @@ class LeadService:
         username = f"@{user.username}" if user.username else "Не указан"
         
         # Survey data summary
-        survey_info = "Анкета не пройдена"
+        survey_info = ""
         if user.segment:
             segment_names = {
                 "cold": "Новичок",
-                "warm": "Базовые знания", 
+                "warm": "Базовые знания",
                 "hot": "Продвинутый"
             }
             survey_info = f"Сегмент: {segment_names.get(user.segment, user.segment)} ({user.lead_score} баллов)"
+        else:
+            survey_info = "Анкета не пройдена"
         
         # Trigger event description
         trigger_descriptions = {
-            "consultation_booked": "Записался на консультацию",
-            "payment_initiated": "Инициировал оплату",
             "manager_requested": "Запросил связь с менеджером",
             "high_engagement": "Высокая активность в боте",
             "hot_segment": "Высокий балл готовности"
@@ -448,7 +445,6 @@ class LeadService:
 • Telegram: {username}
 • Телефон: {'указан' if user.phone else 'не указан'}
 • Email: {'указан' if user.email else 'не указан'}
-• {survey_info}
 • Этап воронки: {user.funnel_stage}
 """
 
@@ -588,8 +584,6 @@ class LeadService:
 
         # Funnel status
         status_map = {
-            "consultation": "📅 Назначена консультация",
-            "payment": "💳 Инициирован платеж",
             "engaged": "💬 Активный диалог",
         }
         status_info = status_map.get(user.funnel_stage, user.funnel_stage or "не указан")
@@ -741,7 +735,6 @@ class LeadService:
         trigger_boosts = {
             "payment_initiated": 90,
             "payment_with_discount": 85,
-            "consultation_booked": 80,
             "manager_requested": 70,
             "manual": 40,
         }

@@ -13,7 +13,9 @@ from app.models import User, UserSegment
 from app.utils.prompt_loader import prompt_loader
 from app.utils.callbacks import Callbacks
 from app.safety.validator import SafetyValidator, SafetyIssue
-
+from app.services.logging_service import ConversationLoggingService
+from app.repositories.user_repository import UserRepository
+ 
 LOW_CONFIDENCE_THRESHOLD = 0.35
 
 
@@ -23,7 +25,6 @@ class LLMContext:
     """Context data for LLM requests."""
     user: User
     messages_history: List[Dict[str, str]]
-    survey_summary: Optional[str] = None
     candidate_materials: List[Dict[str, Any]] = None
     relevant_products: List[Dict[str, Any]] = None
     funnel_stage: str = "new"
@@ -213,6 +214,33 @@ class LLMService:
             self.logger.error("LLM service error", error=str(e), exc_info=True)
             return self._fallback_response()
 
+    async def get_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        purpose: str = "generic",
+        max_tokens: int = 200,
+        expect_json: bool = False,
+    ) -> str:
+        """
+        Generates a text completion for a given list of messages using the most suitable model.
+        This is a simplified public method for direct LLM calls without full context.
+        """
+        self.logger.info("Generating completion", purpose=purpose)
+        try:
+            # For specific, controlled tasks, a smaller and faster model might be sufficient.
+            model = settings.openai_model
+            if purpose in ("onboarding_followup", "summarizer"):
+                model = "gpt-4o-mini"
+
+            return await self._call_chat_completion(
+                messages,
+                model=model,
+                max_tokens=max_tokens,
+                expect_json=expect_json,
+            )
+        except Exception:
+            self.logger.exception("Failed to get completion", purpose=purpose)
+            return ""
 
     async def _call_chat_completion(
         self,
@@ -498,8 +526,6 @@ class LLMService:
         
         # Survey summary
         survey_info = ""
-        if context.survey_summary:
-            survey_info = f"\nРЕЗУЛЬТАТЫ АНКЕТЫ:\n{context.survey_summary}"
         
         # Available materials
         materials_info = ""
@@ -619,9 +645,9 @@ class LLMService:
         return LLMResponse(
             reply_text=fallback_text,
             buttons=[
-                {"text": "🎯 Пройти тест", "callback": Callbacks.SURVEY_START},
+                {"text": "🎯 Пройти тест", "callback": "survey_start"},
                 {"text": "📚 Получить материалы", "callback": "materials:educational"},
-                {"text": "📞 Консультация", "callback": Callbacks.CONSULT_OFFER},
+                {"text": "📞 Консультация", "callback": "consult_offer"},
             ],
             next_action="fallback_flow",
             confidence=0.0,
@@ -684,7 +710,7 @@ class LLMService:
 Сегмент: {user.segment} ({user.lead_score} баллов)
 Этап: {user.funnel_stage}
 
-Анкета: {context.survey_summary or 'не пройдена'}
+Анкета: не пройдена
 
 Последние сообщения:
 """
@@ -758,4 +784,41 @@ class LLMService:
         )
         return prompt
 
+    async def get_response(self, text: str, user_id: int) -> str:
+        """
+        Generates a response from the LLM for a given text message and user.
+        This is a simplified method for direct dialog handling.
+        """
+        if not self.session:
+            self.logger.error("LLMService.get_response called without a session.")
+            return "Не могу сейчас ответить, технические неполадки."
 
+        try:
+            user_repo = UserRepository(self.session)
+            user = await user_repo.get_user_by_id(user_id)
+            if not user:
+                self.logger.error("User not found for LLM response.", user_id=user_id)
+                return "Произошла ошибка, пользователь не найден."
+
+            logging_service = ConversationLoggingService(self.session)
+            history = await logging_service.get_last_messages(user_id, limit=10)
+            
+            # Add current user message to history for context
+            history.append({"role": "user", "text": text})
+
+            context = LLMContext(user=user, messages_history=history)
+            
+            messages = self._build_messages(context)
+            
+            # We expect a simple text response here, not a JSON object
+            raw_response = await self._call_chat_completion(
+                messages, max_tokens=1000, expect_json=False
+            )
+
+            sanitized_text, _ = self.safety_validator.validate_response(raw_response)
+
+            return sanitized_text or "Не могу сейчас ответить."
+
+        except Exception as e:
+            self.logger.error("Failed to get LLM response in get_response", exc_info=True, user_id=user_id)
+            return "Возникла проблема при обработке вашего запроса. Попробуйте позже."

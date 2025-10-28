@@ -87,17 +87,6 @@ class BroadcastRepository:
                 target_stages = segment_filter["funnel_stages"]
                 stmt = stmt.where(User.funnel_stage.in_(target_stages))
             
-            if "exclude_recent_buyers" in segment_filter and segment_filter["exclude_recent_buyers"]:
-                # Complex query to exclude users with recent payments
-                from app.models import Payment, PaymentStatus
-                recent_buyers_subquery = select(Payment.user_id).where(
-                    and_(
-                        Payment.status == PaymentStatus.PAID,
-                        Payment.created_at >= datetime.utcnow() - timedelta(days=30)
-                    )
-                )
-                stmt = stmt.where(User.id.not_in(recent_buyers_subquery))
-        
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
