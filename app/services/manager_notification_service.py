@@ -485,7 +485,7 @@ class ManagerNotificationService:
         if settings.sales_script_enabled:
             builder.button(
                 text="📜 Скрипт",
-                callback_data=f"lead:script:{lead_id}",
+                callback_data=f"lead:sales_script:{lead_id}",
             )
 
         builder.button(
@@ -513,7 +513,7 @@ class ManagerNotificationService:
         if settings.sales_script_enabled:
             builder.button(
                 text="📜 Скрипт",
-                callback_data=f"lead:script:{lead_id}",
+                callback_data=f"lead:sales_script:{lead_id}",
             )
 
         builder.button(

@@ -20,10 +20,11 @@ class PromptLoader:
 
         self.logger = structlog.get_logger()
         self._cache: Dict[str, str] = {}
-
+        funnel_path = base_path.parent / "voronka"
         self._search_paths: List[Path] = self._build_search_paths(
             project_prompts,
             custom_path,
+            funnel_path,
         )
     
     def load_prompt(self, filename: str, use_cache: bool = True) -> Optional[str]:
@@ -55,7 +56,12 @@ class PromptLoader:
             self.logger.error("Error loading prompt", filename=filename, error=str(e))
             return None
 
-    def _build_search_paths(self, project_prompts: Path, custom_path: Optional[str]) -> List[Path]:
+    def _build_search_paths(
+        self,
+        project_prompts: Path,
+        custom_path: Optional[str],
+        funnel_path: Path,
+    ) -> List[Path]:
         """Assemble search paths for prompts with logging for observability."""
 
         paths: List[Path] = []
@@ -71,6 +77,12 @@ class PromptLoader:
             local_override = base / "local"
             if local_override not in paths:
                 paths.append(local_override)
+
+        if funnel_path not in paths:
+            paths.append(funnel_path)
+            funnel_local = funnel_path / "local"
+            if funnel_local not in paths:
+                paths.append(funnel_local)
 
         existing = [path for path in paths if path.exists()]
         if not existing:

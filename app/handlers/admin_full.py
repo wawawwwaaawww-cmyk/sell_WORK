@@ -67,6 +67,8 @@ from ..services.product_matching_service import ProductMatchingService
 from ..services.sendto_service import SendToService
 from ..services.followup_service import FollowupService
 from ..config import settings
+from ..constants.start_messages import DEFAULT_START_MESSAGE, START_MESSAGE_SETTING_KEY
+from ..utils.callbacks import Callbacks
 
 logger = logging.getLogger(__name__)
 seller_logger = structlog.get_logger("seller_krypto")
@@ -127,13 +129,30 @@ class AdminStates(StatesGroup):
     waiting_for_followup_edit_text = State()
     waiting_for_followup_media = State()
 
+    # Start message editing
+    waiting_for_start_message_text = State()
+    waiting_for_start_message_confirmation = State()
+
 
 def admin_required(func):
     """Decorator to check if user is admin."""
 
     @wraps(func)
     async def wrapper(message_or_query, *args, **kwargs):
-        user_id = message_or_query.from_user.id
+        user_id = kwargs.get("admin_user_id")
+        if user_id is None:
+            if isinstance(message_or_query, CallbackQuery):
+                user = message_or_query.from_user
+                user_id = user.id if user else None
+            elif isinstance(message_or_query, Message):
+                from_user = message_or_query.from_user
+                if from_user and not from_user.is_bot:
+                    user_id = from_user.id
+                elif message_or_query.chat and message_or_query.chat.type == "private":
+                    user_id = message_or_query.chat.id
+
+        if user_id is None and getattr(message_or_query, "from_user", None):
+            user_id = message_or_query.from_user.id
 
         async for session in get_db():
             admin_repo = AdminRepository(session)
@@ -896,11 +915,23 @@ def _build_product_detail(product: Product) -> Tuple[str, InlineKeyboardMarkup]:
     return text, builder.as_markup()
 @router.message(Command("admin"))
 @admin_required
-async def admin_panel(message: Message):
+async def admin_panel(message: Message, *, admin_user_id: Optional[int] = None):
     """Show full admin panel."""
+    user_id = admin_user_id
+    if user_id is None:
+        from_user = message.from_user
+        if from_user and not from_user.is_bot:
+            user_id = from_user.id
+        elif message.chat and message.chat.type == "private":
+            user_id = message.chat.id
+        elif from_user:
+            user_id = from_user.id
+        else:  # Fallback: should rarely happen
+            raise ValueError("Unable to determine admin user id")
+
     async for session in get_db():
         admin_repo = AdminRepository(session)
-        capabilities = await admin_repo.get_admin_capabilities(message.from_user.id)
+        capabilities = await admin_repo.get_admin_capabilities(user_id)
         break
         
     buttons = []
@@ -940,19 +971,39 @@ async def admin_panel(message: Message):
     if capabilities.get("can_manage_admins"):
         buttons.append([InlineKeyboardButton(text="⚙️ Админы", callback_data="admin_admins")])
 
+    buttons.append([InlineKeyboardButton(text="💬 Приветствие /start", callback_data="admin_start_message")])
     buttons.append([InlineKeyboardButton(text="⚙️ Системные настройки", callback_data="admin_settings")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     role = capabilities.get("role", "unknown")
     
-    await message.answer(
-        f"🔧 <b>Панель администратора</b>\n\n"
+    panel_text = (
+        "🔧 <b>Панель администратора</b>\n\n"
         f"👤 Ваша роль: <b>{role}</b>\n\n"
-        "Выберите нужный раздел:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        "Выберите нужный раздел:"
     )
+
+    from_user = message.from_user
+    if from_user and not from_user.is_bot:
+        await message.answer(
+            panel_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    else:
+        try:
+            await message.edit_text(
+                panel_text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except TelegramBadRequest:
+            await message.answer(
+                panel_text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
 
 
 async def _render_settings_panel(callback: CallbackQuery, session) -> None:
@@ -1002,6 +1053,113 @@ async def admin_settings_menu(callback: CallbackQuery, **kwargs):
     """Show system settings panel."""
     session = kwargs.get("session")
     await _render_settings_panel(callback, session)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_start_message")
+@admin_required
+async def admin_start_message(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Entry point for editing the /start welcome message."""
+    session = kwargs.get("session")
+    repo = SystemSettingsRepository(session)
+    current_text = await repo.get_value(START_MESSAGE_SETTING_KEY, default=DEFAULT_START_MESSAGE)
+    current_text = current_text or DEFAULT_START_MESSAGE
+
+    instructions = (
+        "📝 <b>Редактор приветствия /start</b>\n\n"
+        "Текущее сообщение:\n"
+        f"<pre>{escape(current_text)}</pre>\n\n"
+        "Отправьте новый текст одним сообщением. Поддерживается HTML-разметка." 
+        "\nЕсли необходимо вернуться назад, нажмите кнопку ниже."
+    )
+
+    back_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]
+    )
+
+    await callback.message.edit_text(instructions, reply_markup=back_keyboard, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_for_start_message_text)
+    await state.update_data(start_message_current=current_text)
+    await callback.answer()
+
+
+@router.message(StateFilter(AdminStates.waiting_for_start_message_text))
+@admin_required
+async def receive_start_message_text(message: Message, state: FSMContext):
+    """Handle new start message text from admin and show preview."""
+    if not message.text:
+        await message.answer("❌ Пожалуйста, отправьте текстовое сообщение.")
+        return
+
+    new_text = message.text
+
+    try:
+        preview_keyboard = InlineKeyboardBuilder()
+        preview_keyboard.add(InlineKeyboardButton(text="Получить бонус", callback_data=Callbacks.BONUS_GET))
+        preview_keyboard.add(InlineKeyboardButton(text="Оставить заявку", callback_data=Callbacks.APPLICATION_START))
+        preview_keyboard.adjust(1)
+
+        await message.answer(
+            new_text,
+            reply_markup=preview_keyboard.as_markup(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "❌ Не удалось отправить сообщение. Проверьте корректность HTML-разметки и попробуйте снова."
+        )
+        return
+
+    control_keyboard = InlineKeyboardBuilder()
+    control_keyboard.add(InlineKeyboardButton(text="✅ Сохранить", callback_data="start_message:save"))
+    control_keyboard.add(InlineKeyboardButton(text="✏️ Изменить", callback_data="start_message:edit"))
+    control_keyboard.add(InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_back"))
+    control_keyboard.adjust(1)
+
+    await message.answer(
+        "Предпросмотр выше. Сохранить этот текст?",
+        reply_markup=control_keyboard.as_markup(),
+    )
+
+    await state.update_data(start_message_candidate=new_text)
+    await state.set_state(AdminStates.waiting_for_start_message_confirmation)
+
+
+@router.callback_query(
+    StateFilter(AdminStates.waiting_for_start_message_confirmation),
+    F.data == "start_message:save",
+)
+@admin_required
+async def save_start_message(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Persist new /start message text."""
+    data = await state.get_data()
+    candidate = data.get("start_message_candidate")
+    if not candidate:
+        await callback.answer("Нет текста для сохранения", show_alert=True)
+        return
+
+    session = kwargs.get("session")
+    repo = SystemSettingsRepository(session)
+    await repo.set_value(START_MESSAGE_SETTING_KEY, candidate, description="Start command welcome text")
+    await callback.answer("Сохранено")
+    await state.clear()
+    await admin_panel(callback.message)
+
+
+@router.callback_query(
+    StateFilter(AdminStates.waiting_for_start_message_confirmation),
+    F.data == "start_message:edit",
+)
+@admin_required
+async def edit_start_message_again(callback: CallbackQuery, state: FSMContext):
+    """Ask admin to send another variant of start message text."""
+    await callback.message.edit_text(
+        "✏️ Отправьте новый текст приветствия в следующем сообщении.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]
+        ),
+    )
+    await state.set_state(AdminStates.waiting_for_start_message_text)
     await callback.answer()
 
 
@@ -3801,7 +3959,8 @@ async def admins_add(callback: CallbackQuery):
 async def admin_back(callback: CallbackQuery, state: FSMContext):
     """Go back to admin panel."""
     await state.clear()
-    await admin_panel(callback)
+    await admin_panel(callback.message, admin_user_id=callback.from_user.id)
+    await callback.answer()
 
 
 # Admin management commands

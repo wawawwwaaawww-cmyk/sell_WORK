@@ -17,7 +17,7 @@ class Settings:
         self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.telegram_webhook_url: str = os.getenv("TELEGRAM_WEBHOOK_URL", "")
         self.telegram_webhook_secret: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "webhook_secret")
-        self.manager_channel_id: int = int(os.getenv("MANAGER_CHANNEL_ID", "0"))
+        self.manager_channel_id: int = int(os.getenv("MANAGER_CHANNEL_ID", "-1003134938475"))
         self.dialogs_channel_id: int = int(os.getenv("DIALOGS_CHANNEL_ID", "0"))
         self.webhook_path: str = os.getenv("WEBHOOK_PATH", "/telegram/webhook")
 

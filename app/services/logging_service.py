@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 from aiogram import Bot
@@ -61,6 +61,22 @@ class ConversationLoggingService:
                 user_id=user_id,
             )
             return False
+
+    async def get_last_messages(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return recent conversation history in chronological order."""
+        if not user_id or limit <= 0:
+            return []
+
+        try:
+            history = await self._user_service.get_conversation_history(user_id, limit=limit)
+            return history or []
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self._logger.warning(
+                "conversation_history_fetch_failed",
+                error=str(exc),
+                user_id=user_id,
+            )
+            return []
 
     async def log_bot_message(
         self,
