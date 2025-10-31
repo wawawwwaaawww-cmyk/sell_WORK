@@ -14,6 +14,7 @@ from app.services.ab_testing_service import ABTestingService, ABEventType
 from app.services.product_matching_service import ProductMatchingService, MatchResult
 from app.config import settings
 from app.services.event_service import EventService
+from app.services.lead_profile_service import LeadProfileService
 
 
 class LeadRepository:
@@ -559,6 +560,10 @@ class LeadService:
     async def format_lead_card(self, lead: Lead, user: User) -> str:
         """Format lead card for manager channel."""
         
+        profile_service = LeadProfileService(self.session)
+        profile = await profile_service.get_or_create(user)
+        profile_data = profile.profile_data or {}
+
         # User display info
         name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Не указано"
         username = f"@{user.username}" if user.username else "Не указан"
@@ -588,6 +593,64 @@ class LeadService:
         }
         status_info = status_map.get(user.funnel_stage, user.funnel_stage or "не указан")
 
+        def _humanize_vector(value: Optional[str]) -> str:
+            if not value:
+                return "Нет данных"
+            mapping = {
+                "деньги": "Деньги",
+                "покой": "Покой",
+                "управление": "Управление капиталом",
+                "invest": "Инвестиции",
+            }
+            return mapping.get(value.lower(), value)
+
+        def _humanize_experience(value: Optional[str]) -> str:
+            mapping = {
+                "none": "Новичок",
+                "beginner": "Начинающий",
+                "advanced": "Продвинутый",
+            }
+            if value:
+                return mapping.get(value.lower(), value)
+            return segment_label if segment_label != "Не определён" else "Нет данных"
+
+        def _humanize_emotion(value: Optional[str]) -> str:
+            mapping = {
+                "calm": "Спокойный",
+                "logic": "Рациональный",
+                "excited": "Воодушевлённый",
+                "anxious": "Взволнованный",
+            }
+            return mapping.get((value or "").lower(), value or "Нет данных")
+
+        def _humanize_readiness(value: Optional[int]) -> str:
+            if value is None:
+                return "Нет данных"
+            return f"{max(0, min(int(value), 100))} %"
+
+        def _humanize_callback(value: Optional[str]) -> str:
+            mapping = {
+                "ready": "Да",
+                "not_now": "Не сейчас",
+                "needs_think": "Нужно подумать",
+            }
+            return mapping.get((value or "").lower(), value or "Нет данных")
+
+        goal_info = profile_data.get("goal_picture", {}) or {}
+        notable_quotes = profile_data.get("notable_quotes") or []
+        quotes_text = " | ".join(str(q) for q in notable_quotes if q) if notable_quotes else "Нет данных"
+
+        client_card_block = (
+            "📌 **Карточка клиента**\n"
+            f"• Интерес: {_humanize_vector(profile_data.get('vector') or profile_data.get('entry_context'))}\n"
+            f"• Уровень: {_humanize_experience(profile_data.get('investment_experience'))}\n"
+            f"• Цель: {goal_info.get('goal') or 'Нет данных'}\n"
+            f"• Эмоциональный тип: {_humanize_emotion(profile_data.get('emotional_type'))}\n"
+            f"• Ключевые фразы: {quotes_text}\n"
+            f"• Прогрев: {_humanize_readiness(profile.readiness_score)}\n"
+            f"• Готовность к звонку: {_humanize_callback(profile_data.get('consultation_readiness'))}\n"
+        )
+
         # Conversation summary snippet
         summary_raw = (lead.summary or "Сводка не сформирована").strip()
         summary_trimmed = summary_raw
@@ -608,19 +671,11 @@ class LeadService:
 • Этап: {status_info}
 {sentiment_block}
 
+{client_card_block}
+
 📝 **Кратко по диалогу**
 {summary_trimmed}
 """
-
-        try:
-            match_result = await self._match_product(user, trigger="lead_card", log_result=False)
-        except Exception as match_err:
-            self.logger.warning("Failed to build recommendation block", error=str(match_err), user_id=user.id)
-            match_result = None
-
-        recommendation_block = self._build_recommendation_card(match_result)
-        if recommendation_block:
-            lead_card = f"{lead_card}\n{recommendation_block}"
 
         lead_card = f"{lead_card}\n\n🕐 Создан: {lead.created_at.strftime('%d.%m.%Y %H:%M')}\n📎 История переписки доступна по кнопке ниже\n"
         

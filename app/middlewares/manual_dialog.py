@@ -76,11 +76,18 @@ class ManualDialogMiddleware(BaseMiddleware):
             return True
 
         try:
-            await message.bot.copy_message(
-                chat_id=dialog_session.manager_telegram_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
+            if message.text and not message.photo and not message.document and not message.audio and not message.video:
+                await message.bot.send_message(
+                    chat_id=dialog_session.manager_telegram_id,
+                    text=message.text,
+                    entities=message.entities,
+                )
+            else:
+                await message.bot.copy_message(
+                    chat_id=dialog_session.manager_telegram_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
         except TelegramForbiddenError:
             self._logger.warning(
                 "manual_manager_chat_forbidden",
@@ -105,11 +112,18 @@ class ManualDialogMiddleware(BaseMiddleware):
         """Forward manager messages to the user they currently handle."""
         target_chat_id = dialog_session.user_telegram_id
         try:
-            await message.bot.copy_message(
-                chat_id=target_chat_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
+            if message.text and not message.photo and not message.document and not message.audio and not message.video:
+                await message.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=message.text,
+                    entities=message.entities,
+                )
+            else:
+                await message.bot.copy_message(
+                    chat_id=target_chat_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
         except TelegramForbiddenError:
             self._logger.warning(
                 "manual_user_chat_forbidden",

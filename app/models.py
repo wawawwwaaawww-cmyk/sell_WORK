@@ -164,6 +164,12 @@ class User(Base):
     events: Mapped[List["Event"]] = relationship("Event", back_populates="user")
     messages: Mapped[List["Message"]] = relationship("Message", back_populates="user")
     leads: Mapped[List["Lead"]] = relationship("Lead", back_populates="user")
+    lead_profile: Mapped[Optional["LeadProfile"]] = relationship(
+        "LeadProfile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
     sentiment_scores: Mapped[List["UserMessageScore"]] = relationship(
         "UserMessageScore",
         back_populates="user",
@@ -264,6 +270,27 @@ class Lead(Base):
     user: Mapped["User"] = relationship("User", back_populates="leads")
     notes: Mapped[List["LeadNote"]] = relationship("LeadNote", back_populates="lead", cascade="all, delete-orphan")
     events: Mapped[List["LeadEvent"]] = relationship("LeadEvent", back_populates="lead", cascade="all, delete-orphan")
+
+
+class LeadProfile(Base):
+    """Structured lead profile filled during AI conversation."""
+    __tablename__ = "lead_profiles"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    scenario: Mapped[Optional[str]] = mapped_column(String(32))
+    current_stage: Mapped[str] = mapped_column(String(64), default="opening")
+    summary_text: Mapped[Optional[str]] = mapped_column(Text)
+    profile_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    readiness_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    client_label: Mapped[Optional[str]] = mapped_column(String(120))
+    handoff_ready: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    handoff_trigger: Mapped[Optional[str]] = mapped_column(String(120))
+    last_agent_notes: Mapped[Optional[str]] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    user: Mapped["User"] = relationship("User", back_populates="lead_profile")
 
 
 class LeadNote(Base):
